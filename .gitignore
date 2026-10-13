@@ -1,0 +1,6 @@
+/build/
+/limer
+*.o
+*.d
+/tests/tmp/
+/bench/backend

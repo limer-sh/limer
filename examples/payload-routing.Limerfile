@@ -1,0 +1,33 @@
+# Minimal payload-based distribution example.
+#
+# Run three backends, e.g. with the test helper:
+#   python3 tests/backend.py 9001 shard-a &
+#   python3 tests/backend.py 9002 shard-b &
+#   python3 tests/backend.py 9003 shard-c &
+# then:
+#   ./limer run -c examples/payload-routing.Limerfile
+#   curl -X POST localhost:8080/echo -d '{"tenant":"acme","event":"signup"}'
+#
+# Every request with the same tenant id lands on the same shard. Requests
+# without a tenant field fall back to round robin across the pool.
+
+{
+    admin 127.0.0.1:2019
+}
+
+:8080 {
+    log
+
+    route events {
+        match path /events /events/*
+        match json event == signup login purchase
+        to 127.0.0.1:9001 127.0.0.1:9002 127.0.0.1:9003
+        lb_policy hash json tenant
+    }
+
+    reverse_proxy 127.0.0.1:9001 127.0.0.1:9002 127.0.0.1:9003 {
+        lb_policy hash json tenant
+        health_uri /healthz
+        health_interval 5s
+    }
+}
