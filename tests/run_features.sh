@@ -697,6 +697,92 @@ expect_eq "8 concurrent 20 MB uploads intact" "$okc" "11111111"
 expect_eq "no errors logged" "$(grep -c "error" $TMP/stream.log)" "0"
 kill -TERM $SP; wait $SP 2>/dev/null
 
+echo "# dynamic upstreams (dns a / srv, re-resolution)"
+cat > "$TMP/zone.json" <<ZONE
+{"backends.test": {"A": ["127.0.0.1", "127.0.0.2"]},
+ "_http._tcp.svc.test": {"SRV": [[10, 1, 9701, "a.test"], [10, 3, 9702, "b.test"]]},
+ "a.test": {"A": ["127.0.0.1"]}, "b.test": {"A": ["127.0.0.1"]},
+ "moving.test": {"A": ["127.0.0.1"]}}
+ZONE
+python3 tests/dns_server.py 5354 "$TMP/zone.json" & DNSP=$!; PIDS+=($DNSP)
+python3 tests/backend.py 9701 c --bind 127.0.0.2 & PIDS+=($!)
+sleep 0.3
+cat > "$TMP/dyn.conf" <<CFG
+{
+    log_level info
+    admin 127.0.0.1:9791
+    resolvers 127.0.0.1:5354
+}
+:9802 {
+    reverse_proxy {
+        dynamic a backends.test 9701 {
+            refresh 1s
+        }
+    }
+}
+:9803 {
+    reverse_proxy {
+        dynamic srv _http._tcp.svc.test {
+            refresh 1s
+        }
+    }
+}
+:9804 {
+    reverse_proxy moving.test:9701 {
+        refresh 1s
+    }
+}
+CFG
+$BIN run -c "$TMP/dyn.conf" >/dev/null 2>"$TMP/dyn.log" & DYP=$!; PIDS+=($DYP)
+wait_port 9802; wait_port 9791
+cat > "$TMP/ups.py" <<'PY'
+import json, sys
+d = json.load(sys.stdin)
+print(" ".join(u["address"] + "/" + str(u["weight"]) for u in d["pools"][int(sys.argv[1])]["upstreams"]))
+PY
+ups() { curl -s http://127.0.0.1:9791/upstreams | python3 "$TMP/ups.py" "$1"; }
+expect_eq "dynamic a resolves to both addresses" "$(ups 0)" "127.0.0.1:9701/1 127.0.0.2:9701/1"
+r=$(for i in 1 2 3 4; do curl -s http://127.0.0.1:9802/; done)
+expect_contains "requests reach the first address" "$r" "hello from a"
+expect_contains "requests reach the second address" "$r" "hello from c"
+expect_eq "dynamic srv gives targets, ports and weights" "$(ups 1)" "127.0.0.1:9701/1 127.0.0.1:9702/3"
+r=$(for i in $(seq 1 8); do curl -s http://127.0.0.1:9803/; echo; done | sort | uniq -c | tr -s ' ' | tr '\n' ';')
+expect_contains "srv weights steer traffic 1:3" "$r" "2 hello from a;"
+expect_contains "srv weights steer traffic 1:3 (b)" "$r" "6 hello from b;"
+expect_eq "named static upstream resolved through resolvers" "$(curl -s http://127.0.0.1:9804/)" "hello from a"
+expect_contains "admin shows the dynamic source" "$(curl -s http://127.0.0.1:9791/upstreams)" '"dynamic":{"type":"srv","name":"_http._tcp.svc.test","refresh":1}'
+# change the records: one address leaves, another joins, the srv set shrinks, the static name moves
+cat > "$TMP/zone.json" <<ZONE
+{"backends.test": {"A": ["127.0.0.1", "127.0.0.3"]},
+ "_http._tcp.svc.test": {"SRV": [[10, 5, 9702, "b.test"]]},
+ "a.test": {"A": ["127.0.0.1"]}, "b.test": {"A": ["127.0.0.1"]},
+ "moving.test": {"A": ["127.0.0.2"]}}
+ZONE
+sleep 2.5
+expect_eq "address change applied on refresh" "$(ups 0)" "127.0.0.1:9701/1 127.0.0.3:9701/1"
+expect_eq "srv member removed and weight updated" "$(ups 1)" "127.0.0.1:9702/5"
+expect_eq "static name follows its new address" "$(curl -s http://127.0.0.1:9804/)" "hello from c"
+r=$(for i in 1 2 3; do curl -s http://127.0.0.1:9803/; echo; done | sort -u)
+expect_eq "removed srv member gets no traffic" "$r" "hello from b"
+# runtime overrides apply to dynamic members too, and survive the next refresh
+curl -s -X POST http://127.0.0.1:9791/upstreams/127.0.0.1:9702/weight/9 >/dev/null
+sleep 1.5
+expect_eq "weight override sticks across refreshes" "$(ups 1)" "127.0.0.1:9702/9"
+curl -s -X DELETE http://127.0.0.1:9791/overrides >/dev/null
+# a failing lookup keeps the last known set
+kill $DNSP; wait $DNSP 2>/dev/null
+sleep 2.5
+expect_eq "lookup failure keeps the pool" "$(ups 0)" "127.0.0.1:9701/1 127.0.0.3:9701/1"
+expect_contains "lookup failure is logged" "$(cat $TMP/dyn.log)" "keeping 2 upstreams"
+python3 tests/dns_server.py 5354 "$TMP/zone.json" & DNSP=$!; PIDS+=($DNSP)
+sleep 1
+# reload keeps the resolved members (no gap) and the schedule
+kill -HUP $DYP; sleep 0.5
+expect_eq "reload keeps dynamic members" "$(ups 0)" "127.0.0.1:9701/1 127.0.0.3:9701/1"
+expect_eq "reload keeps the re-resolved static address" "$(curl -s http://127.0.0.1:9804/)" "hello from c"
+expect_eq "no errors logged" "$(grep -c " error " $TMP/dyn.log)" "0"
+kill -TERM $DYP; wait $DYP 2>/dev/null
+
 echo "# reload keeps virtual hosts"
 sed -i 's/respond "two"/respond "two-v2"/' "$TMP/Limerfile"
 kill -HUP $LIMER; sleep 0.5

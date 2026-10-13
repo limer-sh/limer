@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Small test upstream: identifies itself and echoes request details as JSON.
 
-Usage: backend.py PORT NAME [--slow SECONDS] [--fail-health]
+Usage: backend.py PORT NAME [--bind IP] [--slow SECONDS] [--fail-health] [--tls CERT KEY]
 Endpoints:
   /healthz      -> 200 "ok" (or 503 with --fail-health)
   /echo         -> JSON with name, method, path, headers, body
@@ -24,10 +24,13 @@ NAME = sys.argv[2]
 SLOW = 0.0
 FAIL_HEALTH = False
 TLS = None
+BIND = "127.0.0.1"
 args = sys.argv[3:]
 while args:
     a = args.pop(0)
-    if a == "--slow":
+    if a == "--bind":
+        BIND = args.pop(0)
+    elif a == "--slow":
         SLOW = float(args.pop(0))
     elif a == "--fail-health":
         FAIL_HEALTH = True
@@ -167,7 +170,7 @@ class Server(ThreadingHTTPServer):
 
 
 if __name__ == "__main__":
-    srv = Server(("127.0.0.1", PORT), Handler)
+    srv = Server((BIND, PORT), Handler)
     if TLS:
         import ssl
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

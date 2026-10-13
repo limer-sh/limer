@@ -168,7 +168,9 @@ static int run_master(config_t *cfg, const char *cfg_path, int nworkers)
             m_got_hup = 0;
             if (!stopping) {
                 char err[512];
+                config_lenient_resolve = 1; /* workers keep known addresses for names DNS cannot answer right now */
                 config_t *test = config_load(cfg_path, err, sizeof err);
+                config_lenient_resolve = 0;
                 if (!test) {
                     LOGE("reload: configuration invalid, not reloading workers: %s", err);
                 } else {

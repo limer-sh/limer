@@ -621,12 +621,13 @@ static void pool_free(pool_t *p)
 {
     if (!p)
         return;
-    for (int i = 0; i < p->nups; i++) {
-        free(p->ups[i]->hostport);
-        free(p->ups[i]->host);
-        free(p->ups[i]);
-    }
+    for (int i = 0; i < p->nups; i++)
+        upstream_free(p->ups[i]);
     free(p->ups);
+    for (int i = 0; i < p->nretired; i++)
+        upstream_free(p->retired[i]);
+    free(p->retired);
+    free(p->dyn_name);
     free(p->name);
     free(p->key.name);
     free(p->health_uri);
@@ -703,6 +704,9 @@ static void config_free(config_t *c)
     free(c->acme_ca_root);
     free(c->acme_email);
     free(c->acme_dns_script);
+    for (int i = 0; i < c->nresolvers; i++)
+        free(c->resolvers[i]);
+    free(c->resolvers);
     free(c);
 }
 
@@ -723,8 +727,57 @@ void config_unref(config_t *c)
 /* Upstreams and pools                                                 */
 /* ------------------------------------------------------------------ */
 
+static const config_t *g_loading_cfg; /* set while config_parse_in runs */
+int config_lenient_resolve;
+
+static int resolve_failed(upstream_t *u, int line, const char *detail, char *err, size_t errlen)
+{
+    if (config_lenient_resolve) {
+        LOGW("line %d: cannot resolve upstream '%s' (%s); keeping its previous address", line, u->hostport, detail);
+        u->resolved = 0;
+        u->addrlen = 0;
+        return 0;
+    }
+    snprintf(err, errlen, "line %d: cannot resolve upstream '%s': %s", line, u->hostport, detail);
+    return -1;
+}
+
+void resolve_job_init(resolve_job_t *job, const config_t *cfg, int kind, const char *name, int port)
+{
+    memset(job, 0, sizeof *job);
+    job->kind = kind;
+    snprintf(job->name, sizeof job->name, "%s", name);
+    job->port = port;
+    for (int i = 0; cfg && i < cfg->nresolvers && i < 4; i++) {
+        snprintf(job->resolvers[i], sizeof job->resolvers[i], "%s", cfg->resolvers[i]);
+        job->nresolvers++;
+    }
+}
+
 static int resolve_upstream(upstream_t *u, int line, char *err, size_t errlen)
 {
+    if (g_loading_cfg && g_loading_cfg->nresolvers && !is_ip_literal(u->host)) {
+        /* named upstreams go through the configured resolvers */
+        resolve_job_t *job = xcalloc(1, sizeof *job);
+        resolve_job_init(job, g_loading_cfg, RESOLVE_ADDR, u->host, u->port);
+        resolve_sync(job);
+        if (job->nres == 0) {
+            int rc = resolve_failed(u, line, job->err[0] ? job->err : "no address", err, errlen);
+            free(job);
+            return rc;
+        }
+        int pick = 0;
+        for (int i = 0; i < job->nres; i++)
+            if (job->res[i].addr.ss_family == AF_INET) {
+                pick = i;
+                break;
+            }
+        memcpy(&u->addr, &job->res[pick].addr, job->res[pick].len);
+        u->addrlen = job->res[pick].len;
+        u->resolved = 1;
+        free(job);
+        return 0;
+    }
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -736,7 +789,7 @@ static int resolve_upstream(upstream_t *u, int line, char *err, size_t errlen)
     if (rc != 0 || !res) {
         if (res)
             freeaddrinfo(res);
-        FAIL("line %d: cannot resolve upstream '%s': %s", line, u->hostport, rc ? gai_strerror(rc) : "no address");
+        return resolve_failed(u, line, rc ? gai_strerror(rc) : "no address", err, errlen);
     }
     struct addrinfo *pick = res;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next)
@@ -938,6 +991,7 @@ static pool_t *pool_new(const char *name)
     p->keepalive_idle = 256;
     p->keepalive_timeout = 60;
     p->preserve_host = 1;
+    p->refresh = 30;
     return p;
 }
 
@@ -1027,7 +1081,44 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
             FAIL("line %d: 'tls' takes no arguments here", d->line);
         for (int i = 0; i < p->nups; i++)
             p->ups[i]->tls = 1;
-        p->total_weight = -1; /* flag for pool_finalize: upstreams added later are TLS too */
+        p->tls_all = 1;
+    } else if (strcaseeq(k, "dynamic")) {
+        /* dynamic a <name> <port> [{ refresh <dur> }]  |  dynamic srv <name> [{ refresh <dur> }] */
+        if (d->nargs < 3)
+            FAIL("line %d: dynamic needs 'a <name> <port>' or 'srv <name>'", d->line);
+        if (p->dyn_kind)
+            FAIL("line %d: only one 'dynamic' source per pool", d->line);
+        if (strcaseeq(d->args[1], "a") || strcaseeq(d->args[1], "aaaa")) {
+            if (d->nargs != 4)
+                FAIL("line %d: dynamic a needs a name and a port", d->line);
+            if (arg_int(d, 3, &p->dyn_port, 1, 65535, err, errlen) < 0)
+                return -1;
+            p->dyn_kind = 1;
+        } else if (strcaseeq(d->args[1], "srv")) {
+            if (d->nargs != 3)
+                FAIL("line %d: dynamic srv needs a name like _http._tcp.example.com", d->line);
+            p->dyn_kind = 2;
+        } else {
+            FAIL("line %d: dynamic accepts 'a' or 'srv'", d->line);
+        }
+        free(p->dyn_name);
+        p->dyn_name = xstrdup(d->args[2]);
+        for (int i = 0; i < d->nkids; i++) {
+            node_t *kk = d->kids[i];
+            if (strcaseeq(kk->args[0], "refresh")) {
+                if (want_args(kk, 1, 1, err, errlen) < 0 || arg_duration(kk, 1, &p->refresh, err, errlen) < 0)
+                    return -1;
+            } else {
+                FAIL("line %d: unknown dynamic option '%s'", kk->line, kk->args[0]);
+            }
+        }
+    } else if (strcaseeq(k, "refresh") || strcaseeq(k, "resolve_interval")) {
+        if (want_args(d, 1, 1, err, errlen) < 0)
+            return -1;
+        if (strcaseeq(d->args[1], "off") || strcmp(d->args[1], "0") == 0)
+            p->refresh = 0;
+        else if (arg_duration(d, 1, &p->refresh, err, errlen) < 0)
+            return -1;
     } else if (strcaseeq(k, "versions")) {
         /* transport http { versions h2 | h2c | 1.1 } */
         if (want_args(d, 1, -1, err, errlen) < 0)
@@ -1078,10 +1169,10 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
 
 static int pool_finalize(pool_t *p, int line, char *err, size_t errlen)
 {
-    if (p->nups == 0)
+    if (p->nups == 0 && !p->dyn_kind)
         FAIL("line %d: '%s' has no upstreams (use 'to host:port ...')", line, p->name);
-    int pool_tls = p->total_weight == -1;
-    int any_tls = 0, any_h2 = 0;
+    int pool_tls = p->tls_all;
+    int any_tls = pool_tls, any_h2 = p->upstream_h2 != 0;
     for (int i = 0; i < p->nups; i++) {
         if (pool_tls)
             p->ups[i]->tls = 1;
@@ -1106,11 +1197,127 @@ static int pool_finalize(pool_t *p, int line, char *err, size_t errlen)
     p->total_weight = 0;
     for (int i = 0; i < p->nups; i++)
         p->total_weight += p->ups[i]->weight;
-    if (p->total_weight <= 0)
+    if (p->total_weight <= 0 && p->nups > 0)
         FAIL("line %d: '%s': all upstreams have weight 0", line, p->name);
-    if (p->retries > p->nups - 1)
+    if (!p->dyn_kind && p->retries > p->nups - 1)
         p->retries = p->nups - 1;
     return 0;
+}
+
+/* ---- upstreams that come and go at runtime (dynamic lookups, re-resolution) ---- */
+
+upstream_t *upstream_new_resolved(pool_t *p, const char *host, const struct sockaddr *sa, socklen_t len, int port, int weight)
+{
+    upstream_t *u = xcalloc(1, sizeof *u);
+    u->weight = weight > 0 ? weight : 1;
+    u->host = xstrdup(host);
+    u->port = port;
+    u->tls = p->tls_all || p->upstream_h2 == 1;
+    u->h2 = p->upstream_h2 != 0;
+    memcpy(&u->addr, sa, len);
+    u->addrlen = len;
+    if (u->addr.ss_family == AF_INET)
+        ((struct sockaddr_in *)&u->addr)->sin_port = htons((uint16_t)port);
+    else if (u->addr.ss_family == AF_INET6)
+        ((struct sockaddr_in6 *)&u->addr)->sin6_port = htons((uint16_t)port);
+    u->resolved = 1;
+    u->dynamic = 1;
+    char ip[INET6_ADDRSTRLEN] = "?";
+    if (sa->sa_family == AF_INET)
+        inet_ntop(AF_INET, &((const struct sockaddr_in *)sa)->sin_addr, ip, sizeof ip);
+    else if (sa->sa_family == AF_INET6)
+        inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)sa)->sin6_addr, ip, sizeof ip);
+    char hp[300];
+    if (sa->sa_family == AF_INET6)
+        snprintf(hp, sizeof hp, "[%s]:%d", ip, port);
+    else
+        snprintf(hp, sizeof hp, "%s:%d", ip, port);
+    u->hostport = xstrdup(hp);
+    snprintf(u->sticky_id, sizeof u->sticky_id, "%016llx", (unsigned long long)hash64(hp, strlen(hp)));
+    return u;
+}
+
+void upstream_free(upstream_t *u)
+{
+    if (!u)
+        return;
+    free(u->hostport);
+    free(u->host);
+    free(u);
+}
+
+void pool_recompute(pool_t *p)
+{
+    p->total_weight = 0;
+    for (int i = 0; i < p->nups; i++)
+        p->total_weight += p->ups[i]->weight;
+    if (p->rr_index >= p->nups)
+        p->rr_index = 0;
+}
+
+int pool_add_runtime(pool_t *p, upstream_t *u)
+{
+    if (p->nups >= 64)
+        return -1;
+    p->ups = xrealloc(p->ups, sizeof(upstream_t *) * (size_t)(p->nups + 1));
+    p->ups[p->nups++] = u;
+    pool_recompute(p);
+    return 0;
+}
+
+void pool_retire_upstream(pool_t *p, int idx)
+{
+    upstream_t *u = p->ups[idx];
+    memmove(p->ups + idx, p->ups + idx + 1, sizeof(upstream_t *) * (size_t)(p->nups - idx - 1));
+    p->nups--;
+    u->gone = 1;
+    p->retired = xrealloc(p->retired, sizeof(upstream_t *) * (size_t)(p->nretired + 1));
+    p->retired[p->nretired++] = u;
+    pool_recompute(p);
+}
+
+void pool_reap_retired(pool_t *p)
+{
+    for (int i = 0; i < p->nretired;) {
+        upstream_t *u = p->retired[i];
+        if (u->active == 0 && u->nidle == 0 && !u->hc && !u->h2u) {
+            upstream_free(u);
+            memmove(p->retired + i, p->retired + i + 1, sizeof(upstream_t *) * (size_t)(p->nretired - i - 1));
+            p->nretired--;
+        } else {
+            i++;
+        }
+    }
+}
+
+/* first-time lookup of dynamic pools while loading (blocking; failures only warn) */
+static void config_resolve_dynamic(config_t *cfg)
+{
+    for (int i = 0; i < cfg->nservers; i++) {
+        server_t *s = cfg->servers[i];
+        for (int r = 0; r < s->nroutes; r++) {
+            pool_t *p = s->routes[r]->pool;
+            if (!p || !p->dyn_kind)
+                continue;
+            resolve_job_t *job = xcalloc(1, sizeof *job);
+            resolve_job_init(job, cfg, p->dyn_kind == 2 ? RESOLVE_SRV : RESOLVE_ADDR, p->dyn_name, p->dyn_port);
+            resolve_sync(job);
+            for (int k = 0; k < job->nres; k++) {
+                resolve_result_t *rr = &job->res[k];
+                upstream_t *u = upstream_new_resolved(p, rr->target, (struct sockaddr *)&rr->addr, rr->len, rr->port, rr->weight);
+                int dup = 0;
+                for (int m = 0; m < p->nups && !dup; m++)
+                    dup = strcmp(p->ups[m]->hostport, u->hostport) == 0;
+                if (dup || pool_add_runtime(p, u) < 0)
+                    upstream_free(u);
+            }
+            if (job->nres == 0)
+                LOGW("pool %s: dynamic %s %s: %s (pool starts empty)", p->name, p->dyn_kind == 2 ? "srv" : "a", p->dyn_name, job->err);
+            else
+                LOGI("pool %s: dynamic %s %s resolved to %d upstream(s)", p->name, p->dyn_kind == 2 ? "srv" : "a", p->dyn_name, job->nres);
+            free(job);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -2227,6 +2434,21 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
         } else if (strcaseeq(k, "acme_dns_propagation")) {
             if (want_args(c, 1, 1, err, errlen) < 0 || arg_duration(c, 1, &cfg->acme_dns_propagation, err, errlen) < 0)
                 return -1;
+        } else if (strcaseeq(k, "resolvers")) {
+            if (want_args(c, 1, 4, err, errlen) < 0)
+                return -1;
+            for (int i = 1; i < c->nargs; i++) {
+                char host[64];
+                snprintf(host, sizeof host, "%s", c->args[i]);
+                char *colon = strchr(host, ':');
+                if (colon)
+                    *colon = 0;
+                struct in_addr a4;
+                if (inet_pton(AF_INET, host, &a4) != 1)
+                    FAIL("line %d: resolvers takes IPv4 addresses like 10.0.0.2 or 10.0.0.2:5353", c->line);
+                cfg->resolvers = xrealloc(cfg->resolvers, sizeof(char *) * (size_t)(cfg->nresolvers + 1));
+                cfg->resolvers[cfg->nresolvers++] = xstrdup(c->args[i]);
+            }
         } else if (strcaseeq(k, "auto_https")) {
             if (want_args(c, 1, 1, err, errlen) < 0)
                 return -1;
@@ -2402,6 +2624,7 @@ static config_t *config_parse_in(const char *text, const char *path, const char 
     cfg->acme_dns_propagation = 10;
     cfg->path = xstrdup(path ? path : "<inline>");
     cfg->text = xstrdup(text);
+    g_loading_cfg = cfg;
 
     for (int k = 0; k < root->nkids; k++) {
         node_t *d = root->kids[k];
@@ -2418,11 +2641,13 @@ static config_t *config_parse_in(const char *text, const char *path, const char 
         }
         if (r < 0) {
             node_free(root);
+            g_loading_cfg = NULL;
             config_unref(cfg);
             return NULL;
         }
     }
     node_free(root);
+    g_loading_cfg = NULL;
     if (cfg->nservers == 0) {
         snprintf(err, errlen, "no server blocks defined");
         config_unref(cfg);
@@ -2442,6 +2667,8 @@ static config_t *config_parse_in(const char *text, const char *path, const char 
     if (!cfg->acme_ca)
         cfg->acme_ca = xstrdup("https://acme-v02.api.letsencrypt.org/directory");
     config_add_redirect_servers(cfg);
+    config_resolve_dynamic(cfg);
+    g_loading_cfg = NULL;
     overrides_apply(cfg);
     if (config_finish_tls(cfg, err, errlen) < 0) {
         config_unref(cfg);
@@ -2579,6 +2806,24 @@ int overrides_apply(config_t *cfg)
     }
     free(list);
     return n;
+}
+
+int overrides_apply_upstream(const config_t *cfg, upstream_t *u)
+{
+    override_t *list;
+    int n = overrides_read(cfg, &list);
+    int hit = 0;
+    for (int o = 0; o < n; o++) {
+        if (strcmp(u->hostport, list[o].hostport) != 0)
+            continue;
+        if (list[o].drained >= 0)
+            u->drained = list[o].drained;
+        if (list[o].weight > 0)
+            u->weight = list[o].weight;
+        hit = 1;
+    }
+    free(list);
+    return hit;
 }
 
 int overrides_set(const config_t *cfg, const char *hostport, int drained, int weight, char *err, size_t errlen)
