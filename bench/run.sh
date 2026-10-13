@@ -30,6 +30,18 @@ echo "# wrk -> backend directly (baseline, $CONNS connections, $DUR)"
 run "direct GET" http://127.0.0.1:9001/
 run "direct POST (120 B JSON)" http://127.0.0.1:9001/ -s bench/post.lua
 
+if command -v caddy >/dev/null; then
+    for c in 1 "$(nproc)"; do
+        echo "# wrk -> caddy $(caddy version | cut -d' ' -f1) (GOMAXPROCS=$c) -> backends, same backends and settings"
+        GOMAXPROCS=$c caddy run --config bench/Caddyfile --adapter caddyfile >/dev/null 2>&1 & CP=$!
+        sleep 1
+        run "caddy GET, round robin" http://127.0.0.1:8081/
+        run "caddy POST (120 B JSON, no inspection)" http://127.0.0.1:8081/ -s bench/post.lua
+        run "caddy GET, 1000 connections" http://127.0.0.1:8081/ -c1000
+        kill $CP; wait $CP 2>/dev/null
+    done
+fi
+
 for w in 1 "$(nproc)"; do
     echo "# wrk -> limer ($w worker(s)) -> backends"
     ./limer run -c bench/Limerfile -w "$w" 2>/dev/null & LP=$!

@@ -317,6 +317,29 @@ VM with wrk using 2 threads, 8-second runs, keep-alive on:
 | Limer, 4 workers, POST with JSON match + payload hash | 98,000 | 0.83 ms | 5.4 ms |
 | Limer, 4 workers, GET, 1000 connections | 116,000 | 7.4 ms | 19 ms |
 
+### Compared with Caddy
+
+`bench/run.sh` also benchmarks Caddy when a `caddy` binary is on the PATH,
+using `bench/Caddyfile` (the same two backends, `lb_policy round_robin`,
+and an enlarged upstream keep-alive pool so Caddy is not limited by its
+default of 32 idle connections per host). Same VM, same wrk settings,
+Caddy v2.10.0:
+
+| Scenario | Caddy | Limer | Ratio |
+|---|---|---|---|
+| 1 core, GET round robin, 100 connections | 9,200 req/s, p50 9.7 ms | 32,000 req/s, p50 2.9 ms | 3.5x |
+| 1 core, POST 120 B JSON | 8,600 req/s, p50 10 ms | 31,000 req/s, p50 3.0 ms (with JSON match + hash) | 3.6x |
+| 1 core, GET, 1000 connections | 7,400 req/s, p99 329 ms | 26,000 req/s, p99 72 ms | 3.5x |
+| 4 cores, GET round robin, 100 connections | 23,500 req/s, p50 3.9 ms | 103,000 req/s, p50 0.80 ms | 4.4x |
+| 4 cores, POST 120 B JSON | 20,500 req/s, p50 4.5 ms | 90,000 req/s, p50 0.91 ms (with JSON match + hash) | 4.4x |
+| 4 cores, GET, 1000 connections | 22,500 req/s, p99 103 ms | 115,000 req/s, p99 20 ms | 5.1x |
+
+Caddy was run with `auto_https off` and `admin off`, GOMAXPROCS pinned to
+the core count, and HTTP/1.1 clients only (wrk does not speak HTTP/2).
+Caddy does far more than Limer (HTTP/2 and HTTP/3, automatic certificates,
+a plugin ecosystem), so this compares only the HTTP/1.1 reverse-proxy
+data path.
+
 Observations:
 
 - Inspecting the body (JSON field match plus rendezvous hashing on a JSON
