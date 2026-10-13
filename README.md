@@ -1,9 +1,9 @@
-# Limer
+# limer.sh
 
-**A small, fast HTTP server and load balancer, written in C, that routes on
+**An ultra-fast HTTP server and load balancer, written in C, that routes on
 what's *inside* the request.**
 
-Most proxies only see the method and the path. Limer routes and balances on
+Most proxies only see the method and the path. limer.sh routes and balances on
 JSON fields, form fields, body regexes, headers, cookies, the query, the path,
 or the client address. It works like [Caddy](https://caddyserver.com): one
 binary, a readable `Limerfile`, automatic HTTPS, HTTP/2 and gRPC, zero-downtime
@@ -33,7 +33,7 @@ example.com {
 That site gets a certificate from Let's Encrypt automatically, serves HTTPS
 with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
 
-## Why Limer
+## Why limer.sh
 
 - **Payload-based routing & balancing** — pick a handler or an upstream from
   the request body, with weighted rendezvous hashing so a key always lands on

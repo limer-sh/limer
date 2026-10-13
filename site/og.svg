@@ -21,7 +21,7 @@
   <g transform="translate(90,86)">
     <rect width="64" height="64" rx="16" fill="#12170d" stroke="#2b3420" stroke-width="2"/>
     <text x="32" y="47" font-family="monospace" font-size="42" font-weight="800" fill="#a3e635" text-anchor="middle">L</text>
-    <text x="84" y="46" font-family="-apple-system,Segoe UI,Roboto,sans-serif" font-size="38" font-weight="800" fill="#e8ede1">limer</text>
+    <text x="84" y="46" font-family="-apple-system,Segoe UI,Roboto,sans-serif" font-size="38" font-weight="800" fill="#e8ede1">limer.sh</text>
   </g>
 
   <!-- headline -->
@@ -32,9 +32,6 @@
   </g>
 
   <!-- subline -->
-  <text x="90" y="540" font-family="monospace" font-size="27" fill="#9aa58c">Payload-aware HTTP server &amp; load balancer &#183; one binary &#183; C</text>
-
-  <!-- footer tag -->
-  <text x="90" y="590" font-family="monospace" font-size="23" fill="#84cc16">limer.sh</text>
+  <text x="90" y="540" font-family="monospace" font-size="27" fill="#9aa58c">Ultra-fast, payload-aware HTTP server &amp; load balancer &#183; C</text>
 
 </svg>

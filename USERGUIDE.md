@@ -1,6 +1,6 @@
-# Limer
+# limer.sh
 
-Limer is a small, fast HTTP server and load balancer written in C with
+limer.sh is an ultra-fast HTTP server and load balancer written in C with
 **payload-based request distribution**. It routes and balances requests on
 what is *inside* them: JSON fields, form fields, regexes over the body,
 headers, cookies, the path, or the client address. It works like
@@ -320,7 +320,7 @@ When the hash key is missing from a request, that request falls back to round
 robin. Unhealthy upstreams are skipped, so their keys spill over to the
 next-best upstream and return when the upstream recovers.
 
-Limer always forwards `X-Forwarded-For` (appending), `X-Forwarded-Proto`,
+limer.sh always forwards `X-Forwarded-For` (appending), `X-Forwarded-Proto`,
 `X-Forwarded-Host` and `X-Real-IP`, strips hop-by-hop headers, and keeps
 `Upgrade` requests working (WebSockets are tunnelled after a `101`).
 
@@ -437,7 +437,7 @@ verifies a presented certificate against `trusted_ca_cert_file`;
 sites sharing a listener each enforce their own. What the client presented is
 available as the `tls_client` matcher and the `{tls_client_*}` placeholders
 (subject, issuer, serial, fingerprint, verified, present). `tls_client_auth`
-makes Limer present a client certificate when proxying to an upstream.
+makes limer.sh present a client certificate when proxying to an upstream.
 
 ### Traffic splitting and mirroring
 
@@ -498,7 +498,7 @@ stored variant replaces it.
 A site whose address is a public hostname gets a certificate without any
 TLS configuration:
 
-1. Limer starts with a temporary self-signed certificate so the listener is
+1. limer.sh starts with a temporary self-signed certificate so the listener is
    up immediately, plus an http listener on `http_port` that redirects to
    https and answers ACME http-01 challenges.
 2. A certificate manager process registers an ACME account (`email`),
@@ -522,7 +522,7 @@ Challenge types (`acme_challenge` in the global block):
 |---|---|---|
 | `http-01` (default) | port 80 reachable | Answered by the http listener. |
 | `tls-alpn-01` | port 443 reachable | Answered on the https listener itself with the `acme-tls/1` ALPN protocol; use it when port 80 is closed. |
-| `dns-01` | `acme_dns_script` | Limer runs the script as `script present <domain> <txt-value>` before validation and `script cleanup <domain> <txt-value>` after, waits `acme_dns_propagation` (`30s`) in between, and the script creates or removes `_acme-challenge.<domain>` TXT records with your DNS provider's API. Required for wildcard names, which are always validated over dns-01 when a script is set. |
+| `dns-01` | `acme_dns_script` | limer.sh runs the script as `script present <domain> <txt-value>` before validation and `script cleanup <domain> <txt-value>` after, waits `acme_dns_propagation` (`30s`) in between, and the script creates or removes `_acme-challenge.<domain>` TXT records with your DNS provider's API. Required for wildcard names, which are always validated over dns-01 when a script is set. |
 
 ## Admin API
 
@@ -573,7 +573,7 @@ GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 
 ## Security
 
-Limer sits in front of your application, so it is strict about HTTP framing
+limer.sh sits in front of your application, so it is strict about HTTP framing
 and defensive about everything a client or upstream can send. The security
 suite exercises each of these against a running instance, including a
 scripted hostile upstream and a wire-level fuzz round, and verifies the
@@ -613,7 +613,7 @@ proxy keeps serving after every attack.
 ## Performance
 
 `bench/run.sh` reproduces these numbers. It builds a minimal epoll backend
-(`bench/backend.c`), starts two of them, and drives Limer with
+(`bench/backend.c`), starts two of them, and drives limer.sh with
 [wrk](https://github.com/wg/wrk) (and h2load when installed) over loopback.
 Measured on a 4-vCPU Linux VM with wrk using 2 threads, 8-second runs,
 keep-alive on:
@@ -621,12 +621,12 @@ keep-alive on:
 | Scenario | Requests/s | p50 | p99 |
 |---|---|---|---|
 | wrk to backend directly (no proxy) | 152,000 | 0.58 ms | 2.0 ms |
-| Limer, 1 worker, GET round robin, 100 connections | 33,000 | 2.8 ms | 6.3 ms |
-| Limer, 1 worker, POST with JSON match + payload hash | 34,000 | 2.7 ms | 5.6 ms |
-| Limer, 1 worker, GET, 1000 connections | 27,000 | 36 ms | 66 ms |
-| Limer, 4 workers, GET round robin, 100 connections | 102,000 | 0.80 ms | 4.3 ms |
-| Limer, 4 workers, POST with JSON match + payload hash | 98,000 | 0.83 ms | 5.4 ms |
-| Limer, 4 workers, GET, 1000 connections | 116,000 | 7.4 ms | 19 ms |
+| limer.sh, 1 worker, GET round robin, 100 connections | 33,000 | 2.8 ms | 6.3 ms |
+| limer.sh, 1 worker, POST with JSON match + payload hash | 34,000 | 2.7 ms | 5.6 ms |
+| limer.sh, 1 worker, GET, 1000 connections | 27,000 | 36 ms | 66 ms |
+| limer.sh, 4 workers, GET round robin, 100 connections | 102,000 | 0.80 ms | 4.3 ms |
+| limer.sh, 4 workers, POST with JSON match + payload hash | 98,000 | 0.83 ms | 5.4 ms |
+| limer.sh, 4 workers, GET, 1000 connections | 116,000 | 7.4 ms | 19 ms |
 
 Over TLS with h2load (10 connections, 10 streams each): HTTP/2 serves about
 22,000 req/s per worker and 61,000 req/s with 4 workers; HTTP/1.1 over TLS
@@ -640,7 +640,7 @@ and an enlarged upstream keep-alive pool so Caddy is not limited by its
 default of 32 idle connections per host). Same VM, same wrk settings,
 Caddy v2.10.0:
 
-| Scenario | Caddy | Limer | Ratio |
+| Scenario | Caddy | limer.sh | Ratio |
 |---|---|---|---|
 | 1 core, GET round robin, 100 connections | 9,200 req/s, p50 9.7 ms | 32,000 req/s, p50 2.9 ms | 3.5x |
 | 1 core, POST 120 B JSON | 8,600 req/s, p50 10 ms | 31,000 req/s, p50 3.0 ms (with JSON match + hash) | 3.6x |

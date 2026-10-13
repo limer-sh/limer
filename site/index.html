@@ -3,33 +3,33 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Limer — payload-aware HTTP server &amp; load balancer</title>
-<meta name="description" content="Limer is a small, fast HTTP server and load balancer in C that routes and balances on what is inside the request — JSON fields, form fields, headers, cookies, the body. One binary, a readable Limerfile, automatic HTTPS, HTTP/2 and gRPC.">
-<meta name="keywords" content="reverse proxy, load balancer, HTTP server, payload routing, JSON routing, Caddy alternative, automatic HTTPS, HTTP/2, gRPC proxy, rate limiting, C">
-<meta name="author" content="limer">
+<title>limer.sh — ultra-fast, payload-aware HTTP server &amp; load balancer</title>
+<meta name="description" content="limer.sh is an ultra-fast HTTP server and load balancer in C that routes and balances on what is inside the request — JSON fields, form fields, headers, cookies, the body. One binary, a readable Limerfile, automatic HTTPS, HTTP/2 and gRPC.">
+<meta name="keywords" content="ultra-fast HTTP server, reverse proxy, load balancer, payload routing, JSON routing, Caddy alternative, automatic HTTPS, HTTP/2, gRPC proxy, rate limiting, C">
+<meta name="author" content="limer.sh">
 <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
 <meta name="theme-color" content="#0b0d09">
 <link rel="canonical" href="https://limer.sh/">
 
 <!-- Open Graph -->
-<meta property="og:site_name" content="Limer">
-<meta property="og:title" content="Limer — the reverse proxy that routes on what's inside the request">
-<meta property="og:description" content="A small, fast HTTP server and load balancer that distributes traffic by JSON fields, form fields, headers, cookies or the body. One binary, automatic HTTPS, HTTP/2 and gRPC.">
+<meta property="og:site_name" content="limer.sh">
+<meta property="og:title" content="limer.sh — the reverse proxy that routes on what's inside the request">
+<meta property="og:description" content="An ultra-fast HTTP server and load balancer that distributes traffic by JSON fields, form fields, headers, cookies or the body. One binary, automatic HTTPS, HTTP/2 and gRPC.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://limer.sh/">
 <meta property="og:image" content="https://limer.sh/og.png">
 <meta property="og:image:type" content="image/png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="Limer — payload-aware HTTP server and load balancer">
+<meta property="og:image:alt" content="limer.sh — payload-aware HTTP server and load balancer">
 <meta property="og:locale" content="en_US">
 
 <!-- Twitter -->
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Limer — routes on what's inside the request">
-<meta name="twitter:description" content="A small, fast, payload-aware HTTP server and load balancer in C. One binary, automatic HTTPS, HTTP/2 and gRPC.">
+<meta name="twitter:title" content="limer.sh — routes on what's inside the request">
+<meta name="twitter:description" content="An ultra-fast, payload-aware HTTP server and load balancer in C. One binary, automatic HTTPS, HTTP/2 and gRPC.">
 <meta name="twitter:image" content="https://limer.sh/og.png">
-<meta name="twitter:image:alt" content="Limer — payload-aware HTTP server and load balancer">
+<meta name="twitter:image:alt" content="limer.sh — payload-aware HTTP server and load balancer">
 
 <!-- Structured data -->
 <script type="application/ld+json">
@@ -38,10 +38,10 @@
   "@graph": [
     {
       "@type": "SoftwareApplication",
-      "name": "Limer",
+      "name": "limer.sh",
       "applicationCategory": "DeveloperApplication",
       "operatingSystem": "Linux",
-      "description": "A small, fast HTTP server and load balancer written in C with payload-based request distribution: it routes and balances on JSON fields, form fields, body regexes, headers, cookies, the path or the client address. One binary, a readable Limerfile, automatic HTTPS, HTTP/2 and gRPC.",
+      "description": "An ultra-fast HTTP server and load balancer written in C with payload-based request distribution: it routes and balances on JSON fields, form fields, body regexes, headers, cookies, the path or the client address. One binary, a readable Limerfile, automatic HTTPS, HTTP/2 and gRPC.",
       "url": "https://limer.sh/",
       "image": "https://limer.sh/og.png",
       "softwareVersion": "0.1.0",
@@ -52,9 +52,9 @@
     },
     {
       "@type": "WebSite",
-      "name": "Limer",
+      "name": "limer.sh",
       "url": "https://limer.sh/",
-      "publisher": { "@type": "Organization", "name": "Limer", "url": "https://limer.sh/" }
+      "publisher": { "@type": "Organization", "name": "limer.sh", "url": "https://limer.sh/" }
     }
   ]
 }
@@ -237,7 +237,7 @@
 
 <nav>
   <div class="wrap nav-inner">
-    <a class="brand" href="#top"><span class="mark">L</span>limer</a>
+    <a class="brand" href="#top"><span class="mark">L</span>limer.sh</a>
     <div class="nav-links">
       <a class="nav-hide" href="#routing">Routing</a>
       <a class="nav-hide" href="#features">Features</a>
@@ -252,7 +252,7 @@
   <div class="wrap">
     <span class="eyebrow"><span class="dot"></span>One binary · written in C · Caddy-style config</span>
     <h1>The reverse proxy that<br>routes on <span class="accent">what&rsquo;s inside</span><br>the request.</h1>
-    <p class="lede">Limer is a small, fast HTTP server and load balancer that distributes traffic by
+    <p class="lede">limer.sh is an ultra-fast HTTP server and load balancer that distributes traffic by
       <b>JSON fields, form fields, body regexes, headers, cookies, the path, or the client address</b> —
       not just the URL. One binary, a readable <b>Limerfile</b>, automatic HTTPS, HTTP/2 and gRPC.</p>
 
@@ -295,7 +295,7 @@
     <div class="prose">
       <div class="kicker">Payload-based distribution</div>
       <h2>Balance on the request, not just the URL.</h2>
-      <p>Most proxies can only see the method and path. Limer looks <b>inside</b> the request and
+      <p>Most proxies can only see the method and path. limer.sh looks <b>inside</b> the request and
         picks a handler or an upstream from its contents. <code style="font-family:var(--mono);font-size:.85em;color:var(--lime-soft)">lb_policy hash json customer.id</code>
         sends every request for a customer to the same backend with weighted rendezvous hashing — so
         when an upstream leaves, only <em>its</em> keys get remapped.</p>
@@ -337,7 +337,7 @@
     <div class="sec-head">
       <div class="kicker">Everything in one binary</div>
       <h2>A full edge, nothing to assemble.</h2>
-      <p>Limer works like Caddy: automatic certificates, zero-downtime reloads, an admin API —
+      <p>limer.sh works like Caddy: automatic certificates, zero-downtime reloads, an admin API —
         plus the payload routing and balancing that Caddy lacks.</p>
     </div>
     <div class="grid">
@@ -383,7 +383,7 @@
     </div>
     <div class="tablewrap">
       <table>
-        <thead><tr><th>Scenario</th><th>Caddy v2.10</th><th>Limer</th><th>Ratio</th></tr></thead>
+        <thead><tr><th>Scenario</th><th>Caddy v2.10</th><th>limer.sh</th><th>Ratio</th></tr></thead>
         <tbody>
           <tr><td>1 core · GET round robin · 100 conns</td><td class="n caddy-v">9,200 req/s</td><td class="n limer-v">32,000 req/s</td><td class="ratio">3.5×</td></tr>
           <tr><td>1 core · POST 120 B JSON</td><td class="n caddy-v">8,600 req/s</td><td class="n limer-v">31,000 req/s</td><td class="ratio">3.6×</td></tr>
@@ -439,9 +439,9 @@ curl -X POST localhost:8080/echo \
   <div class="wrap">
     <div class="foot-inner">
       <div>
-        <a class="brand" href="#top"><span class="mark">L</span>limer</a>
-        <p style="margin-top:10px">A small, fast, payload-aware HTTP server &amp; load balancer in C.</p>
-        <p class="served">Served by <b>limer</b> itself · automatic HTTPS from Let&rsquo;s Encrypt</p>
+        <a class="brand" href="#top"><span class="mark">L</span>limer.sh</a>
+        <p style="margin-top:10px">An ultra-fast, payload-aware HTTP server &amp; load balancer in C.</p>
+        <p class="served">Served by <b>limer.sh</b> itself · automatic HTTPS from Let&rsquo;s Encrypt</p>
       </div>
       <div class="foot-links">
         <a href="https://github.com/limer-sh/limer">GitHub</a>
