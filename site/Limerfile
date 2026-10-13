@@ -1,0 +1,18 @@
+{
+    admin 127.0.0.1:2019
+    storage /var/lib/limer
+    pidfile /run/limer.pid
+    log_level info
+}
+
+limer.sh {
+    encode gzip zstd br
+
+    header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    header X-Content-Type-Options nosniff
+    header X-Frame-Options DENY
+    header Referrer-Policy strict-origin-when-cross-origin
+
+    root /srv/www/limer.sh
+    file_server
+}
