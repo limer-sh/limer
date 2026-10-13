@@ -199,6 +199,7 @@ typedef struct conn {
     route_t *route;
     pool_t *pool;
     upstream_t *up;
+    char log_up[128];           /* hostport of the last upstream used, kept for the access log after `up` is released */
     uint64_t tried;
     int attempts;
     uconn_t *uc;
@@ -809,6 +810,7 @@ static void conn_reset_request(conn_t *c)
     c->route = NULL;
     c->pool = NULL;
     c->up = NULL;
+    c->log_up[0] = 0;
     c->tried = 0;
     c->attempts = 0;
     c->uc = NULL;
@@ -901,6 +903,8 @@ static void conn_log_access(conn_t *c)
     buf_t b;
     buf_init(&b);
     const char *host = http_hdr_get(c->req.hdrs, c->req.nhdr, "Host");
+    /* the upstream is usually released before the log line is written: use the saved address */
+    const char *up = c->up ? c->up->hostport : c->log_up;
     if (srv->log_json) {
         buf_printf(&b, "{\"ts\":%.3f,\"remote\":", now_wall());
         log_json_escape(&b, c->peer_str);
@@ -915,7 +919,7 @@ static void conn_log_access(conn_t *c)
                    c->ctx.tls ? "true" : "false", c->resp_status, (unsigned long long)c->resp_bytes, ms);
         log_json_escape(&b, c->route ? c->route->name : "");
         buf_puts(&b, ",\"upstream\":");
-        log_json_escape(&b, c->up ? c->up->hostport : "");
+        log_json_escape(&b, up);
         if (c->lb_why[0]) {
             buf_puts(&b, ",\"lb\":");
             log_json_escape(&b, c->lb_why);
@@ -932,7 +936,7 @@ static void conn_log_access(conn_t *c)
                    c->h2_parent ? "HTTP/2.0" : c->req.minor ? "HTTP/1.1" : "HTTP/1.0", c->resp_status,
                    (unsigned long long)c->resp_bytes, ms,
                    c->route ? c->route->name : "-",
-                   c->up ? c->up->hostport : "-",
+                   up[0] ? up : "-",
                    c->lb_why[0] ? " via=" : "", c->lb_why);
     }
     log_access_to(srv->log_fd, b.data, b.len);
@@ -1683,6 +1687,7 @@ static void conn_try_upstream(conn_t *c)
     c->tried |= (uint64_t)1 << idx;
     c->attempts++;
     c->up = u;
+    snprintf(c->log_up, sizeof c->log_up, "%s", u->hostport);
     u->active++;
     u->requests++;
     if (p->policy == LB_STICKY) {

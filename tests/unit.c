@@ -593,7 +593,8 @@ TEST(test_config)
     /* policy spellings */
     const char *pols[][2] = {
         { "round_robin", "0" }, { "least_conn", "1" }, { "random", "2" }, { "first", "3" },
-        { "ip_hash", "4" }, { "uri_hash", "4" }, { "header X", "4" }, { "cookie c", "4" },
+        { "ip_hash", "4" }, { "uri_hash", "4" }, { "header X", "4" }, { "hash cookie c", "4" },
+        { "cookie", "5" }, { "cookie lb", "5" }, { "cookie lb secret", "5" }, { "sticky_cookie s", "5" },
         { "query q", "4" }, { "json a.b", "4" }, { "form f", "4" }, { "body", "4" },
         { "hash json a", "4" }, { "payload form f", "4" }, { "hash client_ip", "4" },
         { NULL, NULL }

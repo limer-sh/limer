@@ -314,6 +314,7 @@ connections) `{tls_client_subject}`, `{tls_client_issuer}`,
 | `uri_hash` | Hash of the request URI. |
 | `hash <source> [name]` | Rendezvous hash of an extracted key: `hash json customer.id`, `hash form cart_id`, `hash header X-Session`, `hash cookie sid`, `hash query user`, `hash body`, `hash path`, `hash client_ip`. `payload` is an alias for `hash`. |
 | `sticky_cookie [name]` | Cookie-based sticky sessions: the first request is balanced round robin and the response sets `name` (`limer_sticky`) to an opaque upstream id; later requests carrying it go to the same upstream while it is healthy. |
+| `cookie [name [secret]]` | Caddy's spelling of the same sticky sessions, with Caddy's default cookie name `lb`; a secret is accepted and ignored. To balance on a cookie the application already sets, use `hash cookie <name>`. |
 
 When the hash key is missing from a request, that request falls back to round
 robin. Unhealthy upstreams are skipped, so their keys spill over to the
