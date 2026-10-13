@@ -760,6 +760,13 @@ static int pool_add_upstream(pool_t *p, const char *spec, int line, char *err, s
     if (str_has_prefix(spec, "https://")) {
         u->tls = 1;
         spec += 8;
+    } else if (str_has_prefix(spec, "h2c://")) {
+        u->h2 = 1;
+        spec += 6;
+    } else if (str_has_prefix(spec, "h2://")) {
+        u->h2 = 1;
+        u->tls = 1;
+        spec += 5;
     }
     if (parse_hostport(spec, &u->host, &u->port, u->tls ? 443 : 80) < 0) {
         free(u);
@@ -1021,6 +1028,21 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
         for (int i = 0; i < p->nups; i++)
             p->ups[i]->tls = 1;
         p->total_weight = -1; /* flag for pool_finalize: upstreams added later are TLS too */
+    } else if (strcaseeq(k, "versions")) {
+        /* transport http { versions h2 | h2c | 1.1 } */
+        if (want_args(d, 1, -1, err, errlen) < 0)
+            return -1;
+        p->upstream_h2 = 0;
+        for (int i = 1; i < d->nargs; i++) {
+            if (strcaseeq(d->args[i], "h2") || strcmp(d->args[i], "2") == 0)
+                p->upstream_h2 = 1;
+            else if (strcaseeq(d->args[i], "h2c"))
+                p->upstream_h2 = 2;
+            else if (strcaseeq(d->args[i], "1.1") || strcaseeq(d->args[i], "h1"))
+                ;
+            else
+                FAIL("line %d: versions accepts h2, h2c or 1.1", d->line);
+        }
     } else if (strcaseeq(k, "tls_insecure_skip_verify")) {
         p->tls_insecure = 1;
     } else if (strcaseeq(k, "tls_server_name")) {
@@ -1059,13 +1081,26 @@ static int pool_finalize(pool_t *p, int line, char *err, size_t errlen)
     if (p->nups == 0)
         FAIL("line %d: '%s' has no upstreams (use 'to host:port ...')", line, p->name);
     int pool_tls = p->total_weight == -1;
-    int any_tls = 0;
+    int any_tls = 0, any_h2 = 0;
     for (int i = 0; i < p->nups; i++) {
         if (pool_tls)
             p->ups[i]->tls = 1;
+        if (p->upstream_h2 == 1) {
+            p->ups[i]->h2 = 1;
+            p->ups[i]->tls = 1;
+        } else if (p->upstream_h2 == 2) {
+            p->ups[i]->h2 = 1;
+        }
         if (p->ups[i]->tls)
             any_tls = 1;
+        if (p->ups[i]->h2)
+            any_h2 = 1;
     }
+#ifndef LIMER_H2
+    if (any_h2)
+        FAIL("line %d: '%s': HTTP/2 upstreams need a build with nghttp2", line, p->name);
+#endif
+    (void)any_h2;
     if (any_tls && tls_init_pool_client(p, err, errlen) < 0)
         return -1;
     p->total_weight = 0;

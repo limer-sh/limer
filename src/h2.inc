@@ -24,6 +24,7 @@ typedef struct h2_session {
 } h2_session_t;
 
 static void h2_session_send(conn_t *c);
+static void h2_lower(char *s);
 
 static void h2_streams_add(h2_session_t *s, conn_t *st)
 {
@@ -45,10 +46,43 @@ static void h2_streams_del(h2_session_t *s, conn_t *st)
 
 /* ---- data provider: response body from the stream's wbuf ---- */
 
+/* Turn captured chunked trailer lines into HTTP/2 trailers (gRPC status lives here). */
+static int h2_submit_trailers(nghttp2_session *ng, int32_t stream_id, buf_t *raw)
+{
+    if (buf_readable(raw) == 0)
+        return 0;
+    buf_append(raw, "", 1);
+    char *text = buf_rptr(raw);
+    nghttp2_nv nva[32];
+    int n = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(text, "\r\n", &save); line && n < 32; line = strtok_r(NULL, "\r\n", &save)) {
+        char *colon = strchr(line, ':');
+        if (!colon || colon == line)
+            continue;
+        *colon = 0;
+        char *v = colon + 1;
+        while (*v == ' ' || *v == '\t')
+            v++;
+        if (http_hdr_is_hop_by_hop(line))
+            continue;
+        h2_lower(line);
+        nva[n].name = (uint8_t *)line;
+        nva[n].namelen = strlen(line);
+        nva[n].value = (uint8_t *)v;
+        nva[n].valuelen = strlen(v);
+        nva[n].flags = NGHTTP2_NV_FLAG_NONE;
+        n++;
+    }
+    int rc = n ? nghttp2_submit_trailer(ng, stream_id, nva, (size_t)n) : -1;
+    buf_reset(raw);
+    return rc == 0 ? 1 : 0;
+}
+
 static ssize_t h2_data_read(nghttp2_session *ng, int32_t stream_id, uint8_t *buf, size_t length,
                             uint32_t *flags, nghttp2_data_source *source, void *user_data)
 {
-    (void)ng; (void)stream_id; (void)user_data;
+    (void)user_data;
     conn_t *st = source->ptr;
     size_t n = 0;
     int eof = 0;
@@ -56,6 +90,7 @@ static ssize_t h2_data_read(nghttp2_session *ng, int32_t stream_id, uint8_t *buf
         /* decode our own chunked framing into h2_body first */
         if (buf_readable(&st->wbuf) > 0 && !st->h2_cs.done) {
             size_t consumed = 0;
+            st->h2_cs.trailers = &st->h2_trailers;
             if (http_chunk_scan(&st->h2_cs, buf_rptr(&st->wbuf), buf_readable(&st->wbuf), &consumed, &st->h2_body) < 0)
                 return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
             buf_consume(&st->wbuf, consumed);
@@ -76,8 +111,11 @@ static ssize_t h2_data_read(nghttp2_session *ng, int32_t stream_id, uint8_t *buf
         buf_consume(&st->wbuf, n);
         eof = st->h2_eof && buf_readable(&st->wbuf) == 0;
     }
-    if (eof)
+    if (eof) {
         *flags |= NGHTTP2_DATA_FLAG_EOF;
+        if (st->h2_chunked && buf_readable(&st->h2_trailers) > 0 && h2_submit_trailers(ng, stream_id, &st->h2_trailers))
+            *flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM; /* the trailer HEADERS frame ends the stream */
+    }
     if (n == 0 && !eof) {
         st->h2_deferred = 1;
         return NGHTTP2_ERR_DEFERRED;
@@ -137,6 +175,14 @@ static void h2_stream_flush(conn_t *st)
         }
         int bodiless = resp.status / 100 == 1 || resp.status == 204 || resp.status == 304 ||
                        (st->req.method && strcmp(st->req.method, "HEAD") == 0);
+        if (!bodiless && !resp.chunked && resp.content_length == 0)
+            bodiless = 1; /* nothing to send: end the stream on the HEADERS frame */
+        if (!bodiless && resp.chunked && buf_readable(&st->wbuf) == 5 && memcmp(buf_rptr(&st->wbuf), "0\r\n\r\n", 5) == 0) {
+            /* an already-complete empty chunked body without trailers (e.g. a gRPC trailers-only
+             * response from an HTTP/2 upstream): keep it trailers-only for the client too */
+            buf_consume(&st->wbuf, 5);
+            bodiless = 1;
+        }
         nghttp2_data_provider prd;
         prd.source.ptr = st;
         prd.read_callback = h2_data_read;
@@ -188,6 +234,7 @@ static int h2_on_begin_headers(nghttp2_session *ng, const nghttp2_frame *frame, 
     buf_init(&st->enc_out);
     buf_init(&st->dechunk);
     buf_init(&st->h2_body);
+    buf_init(&st->h2_trailers);
     buf_init(&st->h2_hdrs);
     buf_init(&st->h2_reqbody);
     st->file_fd = -1;
@@ -370,10 +417,8 @@ static void h2_session_send(conn_t *c)
         conn_t *st = s->streams[i];
         if (st->dead)
             continue;
-        if (st->upstream_paused && st->uc && buf_readable(&st->wbuf) < WBUF_LOW_WATER) {
-            st->upstream_paused = 0;
-            ev_mod(&st->uc->ev, EPOLLIN | EPOLLRDHUP | (buf_readable(&st->uc->wbuf) ? EPOLLOUT : 0));
-        }
+        if (st->upstream_paused && st->uc && buf_readable(&st->wbuf) < WBUF_LOW_WATER)
+            conn_resume_upstream(st);
         if (st->file_fd >= 0 && buf_readable(&st->wbuf) < WBUF_LOW_WATER)
             file_pump(st);
     }

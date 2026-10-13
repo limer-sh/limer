@@ -644,6 +644,28 @@ TEST(test_config)
         config_unref(c);
     }
     cfg_bad(":1 {\n reverse_proxy https://no.such.host.invalid:9\n}\n", "cannot resolve");
+#ifdef LIMER_H2
+    /* http/2 upstreams: h2c:// (cleartext), h2:// (tls + alpn) and transport versions */
+    c = cfg_ok(":1 {\n reverse_proxy h2c://127.0.0.1:1 h2://127.0.0.1:2 127.0.0.1:3\n"
+               " route {\n  match path /a\n  reverse_proxy 127.0.0.1:4 {\n   transport http {\n    versions h2c\n   }\n  }\n }\n"
+               " route {\n  match path /b\n  reverse_proxy 127.0.0.1:5 {\n   transport http {\n    versions h2\n   }\n  }\n }\n"
+               " route {\n  match path /c\n  reverse_proxy h2c://127.0.0.1:6 {\n   transport http {\n    versions 1.1\n   }\n  }\n }\n}\n");
+    if (c) {
+        pool_t *hp = c->servers[0]->routes[0]->pool;
+        CHECK(hp->nups == 3);
+        CHECK(hp->ups[0]->h2 && !hp->ups[0]->tls && hp->ups[0]->port == 1);
+        CHECK(hp->ups[1]->h2 && hp->ups[1]->tls && hp->ups[1]->port == 2 && hp->client_ctx != NULL);
+        CHECK(!hp->ups[2]->h2 && !hp->ups[2]->tls);
+        pool_t *pa = c->servers[0]->routes[1]->pool;
+        CHECK(pa->upstream_h2 == 2 && pa->ups[0]->h2 && !pa->ups[0]->tls);
+        pool_t *pb = c->servers[0]->routes[2]->pool;
+        CHECK(pb->upstream_h2 == 1 && pb->ups[0]->h2 && pb->ups[0]->tls && pb->client_ctx != NULL);
+        pool_t *pc = c->servers[0]->routes[3]->pool;
+        CHECK(pc->upstream_h2 == 0 && pc->ups[0]->h2); /* scheme on the address still wins */
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 {\n  transport http {\n   versions h3\n  }\n }\n}\n", "versions accepts");
+#endif
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:99999\n}\n", "invalid upstream address");
     cfg_bad(":1 {\n reverse_proxy no.such.host.invalid:80\n}\n", "cannot resolve");
     cfg_bad(":1 {\n route {\n  match header X ~ \"(\"\n  to 127.0.0.1:1\n }\n}\n", "bad regex");

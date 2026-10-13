@@ -462,15 +462,20 @@ int http_chunk_scan(chunk_state_t *cs, const char *in, size_t len, size_t *consu
             i++;
             break;
         case CH_TRAILER:
-            if (c == '\r')
+            if (c == '\r') {
                 cs->st = CH_TRAILER_LF;
-            else if (c == '\n')
+            } else if (c == '\n') {
                 cs->st = CH_DONE;
-            else
+            } else {
                 cs->st = CH_TRAILER_LINE;
+                if (cs->trailers)
+                    buf_append(cs->trailers, in + i, 1);
+            }
             i++;
             break;
         case CH_TRAILER_LINE:
+            if (cs->trailers)
+                buf_append(cs->trailers, in + i, 1);
             if (c == '\n')
                 cs->st = CH_TRAILER;
             i++;

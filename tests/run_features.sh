@@ -5,6 +5,7 @@
 set -u
 cd "$(dirname "$0")/.."
 export no_proxy='*' NO_PROXY='*'   # never send test traffic through an outbound proxy
+unset https_proxy HTTPS_PROXY http_proxy HTTP_PROXY grpc_proxy
 BIN=./limer
 TMP=tests/tmp/features
 rm -rf "$TMP"; mkdir -p "$TMP/site/sub" "$TMP/conf.d"
@@ -555,6 +556,62 @@ curl -s -X POST $A/upstreams/127.0.0.1:9702/drain >/dev/null
 sleep 0.8
 expect_eq "drain propagates to all workers" "$(for i in $(seq 1 16); do echo "$(curl -s http://127.0.0.1:9793/)"; done | sort -u)" "hello from a"
 kill -TERM $ADP; wait $ADP 2>/dev/null
+
+echo "# http/2 to upstreams and grpc passthrough"
+if $BIN version | grep -q "http/2" && python3 -c "import grpc, grpc_tools" 2>/dev/null; then
+    python3 tests/grpc_service.py serve 9805 grpc-a & PIDS+=($!)
+    python3 tests/grpc_service.py serve 9806 grpc-b & PIDS+=($!)
+    wait_port 9805; wait_port 9806
+    cat > "$TMP/grpc.conf" <<CFG
+{
+    log_level warn
+}
+https://localhost:9795 {
+    tls internal
+    reverse_proxy h2c://127.0.0.1:9805 h2c://127.0.0.1:9806 {
+        lb_policy round_robin
+    }
+}
+:9796 {
+    reverse_proxy 127.0.0.1:9805 {
+        transport http {
+            versions h2c
+        }
+    }
+}
+:9797 {
+    reverse_proxy 127.0.0.1:9701
+}
+CFG
+    $BIN run -c "$TMP/grpc.conf" >/dev/null 2>"$TMP/grpc.log" & GP=$!; PIDS+=($GP)
+    wait_port 9795
+    openssl s_client -connect 127.0.0.1:9795 -servername localhost </dev/null 2>/dev/null | openssl x509 > "$TMP/limer-localhost.crt" 2>/dev/null
+    out=$(python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost 2>&1)
+    expect_contains "grpc unary call through limer (h2 in, h2c out)" "$out" "pong:hello:xff=127.0.0.1 server=grpc-"
+    expect_contains "grpc trailing metadata preserved" "$out" "trailer-x-server=grpc-"
+    expect_contains "grpc unary round robin reaches both" "$(for i in 1 2 3 4; do python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost 2>&1; done | grep -o 'server=grpc-[ab]' | sort -u | tr '\n' ' ')" "server=grpc-a server=grpc-b"
+    out=$(python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost --stream 500 2>&1)
+    expect_contains "grpc server streaming (500 messages)" "$out" "streamed 500 messages, last=tick 499"
+    out=$(python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost --fail 2>&1)
+    expect_contains "grpc error status passes through in trailers" "$out" "error FAILED_PRECONDITION: nope from grpc-"
+    # plain HTTP/2 with prior knowledge (h2c) on the client side, end to end to the h2c upstream
+    expect_contains "h2c prior-knowledge grpc client to h2c upstream" "$(python3 tests/grpc_service.py call 127.0.0.1:9796 2>&1)" "pong:hello"
+    r=$(curl -s --http2-prior-knowledge -o /dev/null -w '%{http_version} %{http_code}' http://127.0.0.1:9797/get)
+    expect_eq "h2c prior-knowledge client to an http/1.1 upstream" "$r" "2 200"
+    r=$(curl -s --http1.1 -o /dev/null -w '%{http_version} %{http_code}' http://127.0.0.1:9797/get)
+    expect_eq "http/1.1 still served on the same plain listener" "$r" "1.1 200"
+    # the same upstream over HTTP/1.1 from the client side
+    r=$(curl -s --http1.1 -D - -o /dev/null -X POST -H 'content-type: application/grpc' -H 'te: trailers' --data-binary '' http://127.0.0.1:9796/limertest.Echo/Ping)
+    expect_contains "h1 client sees the h2 upstream response as chunked with trailers" "$r" "Transfer-Encoding: chunked"
+    # concurrency: many parallel unary calls multiplexed on one session
+    okc=$(for i in $(seq 1 20); do python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost >/dev/null 2>&1 & done; wait; echo done)
+    expect_eq "20 parallel grpc calls complete" "$okc" "done"
+    expect_contains "grpc calls succeeded after concurrency" "$(python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost 2>&1)" "pong:hello"
+    expect_eq "no errors logged" "$(grep -c "error" $TMP/grpc.log)" "0"
+    kill -TERM $GP; wait $GP 2>/dev/null
+else
+    echo "  skip - HTTP/2 build or grpcio not available"
+fi
 
 echo "# reload keeps virtual hosts"
 sed -i 's/respond "two"/respond "two-v2"/' "$TMP/Limerfile"
