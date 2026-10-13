@@ -32,6 +32,7 @@ const char *keysrc_name(int s)
     case KS_BODY: return "body";
     case KS_METHOD: return "method";
     case KS_HOST: return "host";
+    case KS_TLS_CLIENT: return "tls_client";
     }
     return "?";
 }

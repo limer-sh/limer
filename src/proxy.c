@@ -183,6 +183,7 @@ typedef struct conn {
     SSL *ssl;
     int tls_handshaking;
 #endif
+    tls_client_info_t tls_client;   /* what the client presented (TLS sockets only) */
     int state;
     buf_t rbuf, wbuf;
     http_req_t req;
@@ -294,6 +295,7 @@ static void reap_graveyard(void)
 static void conn_close(conn_t *c);
 static void conn_process(conn_t *c);
 static void conn_pump_body(conn_t *c);
+static const tls_client_info_t *conn_client_cert(conn_t *c);
 #ifdef LIMER_H2
 #define H2_SEND_HIGH (1024 * 1024)
 struct h2u_session;
@@ -533,6 +535,24 @@ static void expand_placeholders(const char *v, conn_t *c, buf_t *out)
             buf_puts(out, c->ctx.tls ? "https" : "http");
         } else if (IS("route")) {
             buf_puts(out, c->route ? c->route->name : "");
+        } else if (n > 11 && memcmp(name, "tls_client_", 11) == 0) {
+            const tls_client_info_t *ci = conn_client_cert(c);
+            char field[32];
+            snprintf(field, sizeof field, "%.*s", (int)(n - 11), name + 11);
+            if (strcmp(field, "verified") == 0)
+                buf_puts(out, ci && ci->present && ci->verified ? "true" : "false");
+            else if (strcmp(field, "present") == 0)
+                buf_puts(out, ci && ci->present ? "true" : "false");
+            else if (ci && ci->present) {
+                if (strcmp(field, "subject") == 0)
+                    buf_puts(out, ci->subject);
+                else if (strcmp(field, "issuer") == 0)
+                    buf_puts(out, ci->issuer);
+                else if (strcmp(field, "serial") == 0)
+                    buf_puts(out, ci->serial);
+                else if (strcmp(field, "fingerprint") == 0)
+                    buf_puts(out, ci->fingerprint);
+            }
         } else if (n > 7 && memcmp(name, "header.", 7) == 0) {
             char hn[128];
             snprintf(hn, sizeof hn, "%.*s", (int)(n - 7), name + 7);
@@ -2183,8 +2203,20 @@ static void conn_ctx_init(conn_t *c)
     snprintf(c->ctx.peer_ip, sizeof c->ctx.peer_ip, "%s", c->peer_ip);
 #ifdef LIMER_TLS
     c->ctx.tls = c->ssl != NULL || c->h2_parent != NULL;
+    c->ctx.client_cert = c->h2_parent ? &c->h2_parent->tls_client : c->ssl ? &c->tls_client : NULL;
 #else
     c->ctx.tls = 0;
+    c->ctx.client_cert = NULL;
+#endif
+}
+
+static const tls_client_info_t *conn_client_cert(conn_t *c)
+{
+#ifdef LIMER_TLS
+    return c->h2_parent ? &c->h2_parent->tls_client : c->ssl ? &c->tls_client : NULL;
+#else
+    (void)c;
+    return NULL;
 #endif
 }
 
@@ -2592,6 +2624,7 @@ static void conn_tls_handshake(conn_t *c)
     int r = SSL_do_handshake(c->ssl);
     if (r == 1) {
         c->tls_handshaking = 0;
+        tls_client_info(c->ssl, &c->tls_client);
 #ifdef LIMER_H2
         const unsigned char *alpn = NULL;
         unsigned int alen = 0;

@@ -520,6 +520,7 @@ static int parse_keysrc(const char *s, int *src, int *needs_name)
         { "header", KS_HEADER, 1 }, { "cookie", KS_COOKIE, 1 }, { "query", KS_QUERY, 1 },
         { "path", KS_PATH, 0 }, { "uri", KS_URI, 0 }, { "json", KS_JSON, 1 }, { "form", KS_FORM, 1 },
         { "body", KS_BODY, 0 }, { "method", KS_METHOD, 0 }, { "host", KS_HOST, 0 },
+        { "tls_client", KS_TLS_CLIENT, 1 }, { "client_cert", KS_TLS_CLIENT, 1 },
         { NULL, 0, 0 }
     };
     for (int i = 0; tbl[i].n; i++)
@@ -636,6 +637,8 @@ static void pool_free(pool_t *p)
     hdr_ops_free(p->hdr_down, p->n_hdr_down);
     free(p->tls_server_name);
     free(p->tls_ca);
+    free(p->tls_client_cert);
+    free(p->tls_client_key);
     tls_free_pool_client(p);
     free(p);
 }
@@ -675,6 +678,9 @@ static void server_free(server_t *s)
     for (int i = 0; i < s->nroutes; i++)
         route_free(s->routes[i]);
     free(s->routes);
+    for (int i = 0; i < s->nclient_ca; i++)
+        free(s->client_ca[i]);
+    free(s->client_ca);
     free(s->tls_cert);
     free(s->tls_key);
     hdr_ops_free(s->hdr_down, s->n_hdr_down);
@@ -1134,6 +1140,17 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
             else
                 FAIL("line %d: versions accepts h2, h2c or 1.1", d->line);
         }
+    } else if (strcaseeq(k, "tls_client_auth")) {
+        /* tls_client_auth <cert.pem> <key.pem>: present a client certificate to upstreams */
+        if (want_args(d, 2, 2, err, errlen) < 0)
+            return -1;
+        for (int a = 1; a <= 2; a++)
+            if (access(d->args[a], R_OK) != 0)
+                FAIL("line %d: tls_client_auth: cannot read '%s': %s", d->line, d->args[a], strerror(errno));
+        free(p->tls_client_cert);
+        free(p->tls_client_key);
+        p->tls_client_cert = xstrdup(d->args[1]);
+        p->tls_client_key = xstrdup(d->args[2]);
     } else if (strcaseeq(k, "tls_insecure_skip_verify")) {
         p->tls_insecure = 1;
     } else if (strcaseeq(k, "tls_server_name")) {
@@ -2135,32 +2152,78 @@ static int parse_log(server_t *s, node_t *d, char *err, size_t errlen)
     return 0;
 }
 
+/* tls ... { client_auth { mode <m>; trusted_ca_cert_file <pem> ... } } */
+static int parse_client_auth(server_t *s, node_t *d, char *err, size_t errlen)
+{
+    if (d->nargs > 1)
+        FAIL("line %d: client_auth takes a block, not arguments", d->line);
+    s->client_auth_mode = CA_REQUIRE_AND_VERIFY;
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *k = d->kids[i];
+        const char *n = k->args[0];
+        if (strcaseeq(n, "mode")) {
+            if (want_args(k, 1, 1, err, errlen) < 0)
+                return -1;
+            const char *m = k->args[1];
+            if (strcaseeq(m, "request"))
+                s->client_auth_mode = CA_REQUEST;
+            else if (strcaseeq(m, "require"))
+                s->client_auth_mode = CA_REQUIRE;
+            else if (strcaseeq(m, "verify_if_given"))
+                s->client_auth_mode = CA_VERIFY_IF_GIVEN;
+            else if (strcaseeq(m, "require_and_verify"))
+                s->client_auth_mode = CA_REQUIRE_AND_VERIFY;
+            else
+                FAIL("line %d: client_auth mode accepts request, require, verify_if_given or require_and_verify", k->line);
+        } else if (strcaseeq(n, "trusted_ca_cert_file") || strcaseeq(n, "trusted_ca_cert")) {
+            if (want_args(k, 1, -1, err, errlen) < 0)
+                return -1;
+            for (int a = 1; a < k->nargs; a++) {
+                if (access(k->args[a], R_OK) != 0)
+                    FAIL("line %d: client_auth: cannot read '%s': %s", k->line, k->args[a], strerror(errno));
+                s->client_ca = xrealloc(s->client_ca, sizeof(char *) * (size_t)(s->nclient_ca + 1));
+                s->client_ca[s->nclient_ca++] = xstrdup(k->args[a]);
+            }
+        } else {
+            FAIL("line %d: unknown client_auth option '%s'", k->line, n);
+        }
+    }
+    if ((s->client_auth_mode == CA_VERIFY_IF_GIVEN || s->client_auth_mode == CA_REQUIRE_AND_VERIFY) && s->nclient_ca == 0)
+        FAIL("line %d: client_auth mode %s needs trusted_ca_cert_file", d->line,
+             s->client_auth_mode == CA_VERIFY_IF_GIVEN ? "verify_if_given" : "require_and_verify");
+    return 0;
+}
+
 static int parse_tls(server_t *s, node_t *d, char *err, size_t errlen)
 {
-    /* tls internal | tls <cert> <key> | tls <email> */
+    /* tls internal | tls <cert> <key> | tls <email> | tls  -- each with an optional { client_auth { } } block */
     if (d->nargs == 2 && strcaseeq(d->args[1], "internal")) {
         s->tls_mode = TLS_INTERNAL;
-        return 0;
-    }
-    if (d->nargs == 3) {
+    } else if (d->nargs == 3) {
         free(s->tls_cert);
         free(s->tls_key);
         s->tls_cert = xstrdup(d->args[1]);
         s->tls_key = xstrdup(d->args[2]);
         s->tls_mode = TLS_FILES;
-        return 0;
-    }
-    if (d->nargs == 2 && strchr(d->args[1], '@')) {
+    } else if (d->nargs == 2 && strchr(d->args[1], '@')) {
         s->tls_mode = TLS_AUTO;
         free(s->tls_cert);
         s->tls_cert = xstrdup(d->args[1]); /* account email for ACME */
-        return 0;
-    }
-    if (d->nargs == 1 && d->nkids) {
+    } else if (d->nargs == 1 && d->nkids) {
         s->tls_mode = TLS_AUTO;
-        return 0;
+    } else {
+        FAIL("line %d: tls accepts 'internal', '<cert.pem> <key.pem>' or an email for automatic certificates", d->line);
     }
-    FAIL("line %d: tls accepts 'internal', '<cert.pem> <key.pem>' or an email for automatic certificates", d->line);
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *k = d->kids[i];
+        if (strcaseeq(k->args[0], "client_auth")) {
+            if (parse_client_auth(s, k, err, errlen) < 0)
+                return -1;
+        } else {
+            FAIL("line %d: unknown tls option '%s'", k->line, k->args[0]);
+        }
+    }
+    return 0;
 }
 
 static int parse_server(config_t *cfg, node_t *d, char *err, size_t errlen)

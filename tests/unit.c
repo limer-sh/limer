@@ -644,6 +644,27 @@ TEST(test_config)
         config_unref(c);
     }
     cfg_bad(":1 {\n reverse_proxy https://no.such.host.invalid:9\n}\n", "cannot resolve");
+    /* mutual TLS: client_auth on a site, client certificates to upstreams */
+    c = cfg_ok("x.test {\n tls internal {\n  client_auth {\n   mode request\n  }\n }\n respond ok\n}\n"
+               "y.test {\n tls internal {\n  client_auth {\n   mode require\n  }\n }\n respond ok\n}\n");
+    if (c) {
+        CHECK(c->servers[0]->client_auth_mode == CA_REQUEST);
+        CHECK(c->servers[1]->client_auth_mode == CA_REQUIRE);
+        config_unref(c);
+    }
+    c = cfg_ok(":1 {\n route {\n  match tls_client verified == true\n  respond ok\n }\n respond no\n}\n");
+    if (c) {
+        route_t *r = c->servers[0]->routes[0];
+        CHECK(r->nm == 1 && r->m[0].key.src == KS_TLS_CLIENT);
+        CHECK_STR(r->m[0].key.name, "verified");
+        config_unref(c);
+    }
+    cfg_bad("x.test {\n tls internal {\n  client_auth {\n   mode verify_if_given\n  }\n }\n respond ok\n}\n", "needs trusted_ca_cert_file");
+    cfg_bad("x.test {\n tls internal {\n  client_auth {\n   mode require_and_verify\n  }\n }\n respond ok\n}\n", "needs trusted_ca_cert_file");
+    cfg_bad("x.test {\n tls internal {\n  client_auth {\n   mode bogus\n  }\n }\n respond ok\n}\n", "client_auth mode accepts");
+    cfg_bad("x.test {\n tls internal {\n  client_auth {\n   trusted_ca_cert_file /no/such/ca.pem\n  }\n }\n respond ok\n}\n", "cannot read");
+    cfg_bad("x.test {\n tls internal {\n  frobnicate\n }\n respond ok\n}\n", "unknown tls option");
+    cfg_bad(":1 {\n reverse_proxy https://127.0.0.1:1 {\n  tls_client_auth /no/such/c.pem /no/such/k.pem\n }\n}\n", "cannot read");
 #ifdef LIMER_H2
     /* http/2 upstreams: h2c:// (cleartext), h2:// (tls + alpn) and transport versions */
     c = cfg_ok(":1 {\n reverse_proxy h2c://127.0.0.1:1 h2://127.0.0.1:2 127.0.0.1:3\n"
