@@ -1,9 +1,10 @@
 # Limer - HTTP load balancer with payload-based distribution
 CC      ?= cc
 CFLAGS  ?= -O2 -g
-override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
+override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -pthread
 LDFLAGS ?=
-LDLIBS  += -lm -lcrypt
+override LDFLAGS += -pthread
+LDLIBS  += -lm -lcrypt -lresolv
 
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
@@ -21,6 +22,15 @@ ENCODE ?= $(shell pkg-config --exists zlib libzstd libbrotlienc 2>/dev/null && e
 ifeq ($(ENCODE),1)
 override CFLAGS += -DLIMER_ENCODE $(shell pkg-config --cflags zlib libzstd libbrotlienc 2>/dev/null)
 LDLIBS += $(shell pkg-config --libs zlib libzstd libbrotlienc 2>/dev/null)
+endif
+
+# HTTP/2 needs libnghttp2 (auto-detected; requires TLS for ALPN).
+H2 ?= $(shell pkg-config --exists libnghttp2 2>/dev/null && echo 1 || echo 0)
+ifeq ($(H2),1)
+ifeq ($(TLS),1)
+override CFLAGS += -DLIMER_H2 $(shell pkg-config --cflags libnghttp2 2>/dev/null)
+LDLIBS += $(shell pkg-config --libs libnghttp2 2>/dev/null)
+endif
 endif
 
 # `make SAN=1` builds everything with AddressSanitizer + UBSan.
@@ -71,7 +81,8 @@ security: $(BIN)
 features: $(BIN)
 	./tests/run_features.sh
 
-# Needs a `pebble` binary (PEBBLE=/path) and `127.0.0.1 limer.test www.limer.test` in /etc/hosts; skips otherwise.
+# Needs `pebble` (PEBBLE=/path), optionally `pebble-challtestsrv` (CHALLTESTSRV=/path) for dns-01,
+# and `127.0.0.1 limer.test www.limer.test alpn.limer.test dns.limer.test` in /etc/hosts; skips otherwise.
 acme: $(BIN)
 	./tests/run_acme.sh
 

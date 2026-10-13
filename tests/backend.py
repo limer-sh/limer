@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Small test upstream: identifies itself and echoes request details as JSON.
 
-Usage: backend.py PORT NAME [--slow SECONDS] [--fail-health]
+Usage: backend.py PORT NAME [--bind IP] [--slow SECONDS] [--fail-health] [--tls CERT KEY] [--client-ca CA]
 Endpoints:
   /healthz      -> 200 "ok" (or 503 with --fail-health)
   /echo         -> JSON with name, method, path, headers, body
@@ -23,13 +23,25 @@ PORT = int(sys.argv[1])
 NAME = sys.argv[2]
 SLOW = 0.0
 FAIL_HEALTH = False
+TLS = None
+CLIENT_CA = None
+RECORD = None
+BIND = "127.0.0.1"
 args = sys.argv[3:]
 while args:
     a = args.pop(0)
-    if a == "--slow":
+    if a == "--bind":
+        BIND = args.pop(0)
+    elif a == "--client-ca":
+        CLIENT_CA = args.pop(0)   # require client certificates signed by this CA
+    elif a == "--record":
+        RECORD = args.pop(0)      # append "METHOD PATH body_len body" for each request
+    elif a == "--slow":
         SLOW = float(args.pop(0))
     elif a == "--fail-health":
         FAIL_HEALTH = True
+    elif a == "--tls":
+        TLS = (args.pop(0), args.pop(0))  # cert, key
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -39,6 +51,18 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _body(self):
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            out = b""
+            while True:
+                line = self.rfile.readline().strip()
+                n = int(line.split(b";")[0], 16) if line else 0
+                if n == 0:
+                    # trailers (if any) up to the blank line
+                    while self.rfile.readline().strip():
+                        pass
+                    return out
+                out += self.rfile.read(n)
+                self.rfile.readline()
         n = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(n) if n else b""
 
@@ -54,8 +78,23 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def handle_any(self):
-        body = self._body()
         path = self.path.split("?")[0]
+        if RECORD and path != "/early":
+            b = self._body()
+            with open(RECORD, "a") as rf:
+                rf.write("%s %s %d %s\n" % (self.command, self.path, len(b), b.decode("latin1")))
+            self._send(200, b"recorded")
+            return
+        if path == "/early":
+            # answer without reading the body (the proxy must not reuse the connection);
+            # linger a little so the response is read before the reset
+            self.close_connection = True
+            self.wfile.write(b"HTTP/1.1 413 Payload Too Large\r\nX-Backend: " + NAME.encode() +
+                             b"\r\nContent-Length: 5\r\nConnection: close\r\n\r\nearly")
+            self.wfile.flush()
+            time.sleep(0.5)
+            return
+        body = self._body()
         if path == "/healthz":
             if FAIL_HEALTH:
                 self._send(503, b"unhealthy")
@@ -70,6 +109,12 @@ class Handler(BaseHTTPRequestHandler):
                 "body": body.decode("utf-8", "replace"),
                 "body_len": len(body),
             }
+            self._send(200, json.dumps(doc).encode(), "application/json")
+        elif path == "/upload":
+            import hashlib
+            doc = {"name": NAME, "body_len": len(body), "sha256": hashlib.sha256(body).hexdigest(),
+                   "chunked": "chunked" in (self.headers.get("Transfer-Encoding") or "").lower(),
+                   "content_length": self.headers.get("Content-Length")}
             self._send(200, json.dumps(doc).encode(), "application/json")
         elif path == "/chunked":
             self.send_response(200)
@@ -137,4 +182,13 @@ class Server(ThreadingHTTPServer):
 
 
 if __name__ == "__main__":
-    Server(("127.0.0.1", PORT), Handler).serve_forever()
+    srv = Server((BIND, PORT), Handler)
+    if TLS:
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(TLS[0], TLS[1])
+        if CLIENT_CA:
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.load_verify_locations(CLIENT_CA)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    srv.serve_forever()

@@ -42,6 +42,28 @@ if command -v caddy >/dev/null; then
     done
 fi
 
+if command -v h2load >/dev/null; then
+    cat > bench/Limerfile.h2 <<'CFG'
+{
+    log_level warn
+    admin off
+}
+https://localhost:8443 {
+    tls internal
+    reverse_proxy 127.0.0.1:9001 127.0.0.1:9002
+}
+CFG
+    for w in 1 "$(nproc)"; do
+        echo "# h2load -> limer ($w worker(s), TLS) -> backends"
+        ./limer run -c bench/Limerfile.h2 -w "$w" 2>/dev/null & LP=$!
+        sleep 0.6
+        printf "%-38s " "HTTP/2, 10 conns x 10 streams"; h2load -n 100000 -c 10 -m 10 https://localhost:8443/ 2>&1 | awk '/finished in/{print $4, $5}'
+        printf "%-38s " "HTTP/1.1 over TLS, 10 conns"; h2load -n 100000 -c 10 --h1 https://localhost:8443/ 2>&1 | awk '/finished in/{print $4, $5}'
+        kill -TERM $LP; wait $LP 2>/dev/null
+    done
+    rm -f bench/Limerfile.h2
+fi
+
 for w in 1 "$(nproc)"; do
     echo "# wrk -> limer ($w worker(s)) -> backends"
     ./limer run -c bench/Limerfile -w "$w" 2>/dev/null & LP=$!

@@ -11,7 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev zlib1g-dev libzstd-dev libbrotli-dev pkg-config python3 curl valgrind
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev zlib1g-dev libzstd-dev libbrotli-dev libnghttp2-dev pkg-config python3 curl valgrind
+      - name: Install gRPC test client (python)
+        run: python3 -m pip install --user grpcio grpcio-tools || pip3 install --user grpcio grpcio-tools
       - name: Build
         run: make
       - name: Unit tests
@@ -27,7 +29,10 @@ jobs:
           curl -sSL -o /tmp/pebble.tar.gz https://github.com/letsencrypt/pebble/releases/latest/download/pebble-linux-amd64.tar.gz
           tar xzf /tmp/pebble.tar.gz -C /tmp
           sudo install -m 0755 "$(find /tmp/pebble-linux-amd64 -type f -name pebble)" /usr/local/bin/pebble
-          echo "127.0.0.1 limer.test www.limer.test" | sudo tee -a /etc/hosts
+          curl -sSL -o /tmp/challtestsrv.tar.gz https://github.com/letsencrypt/pebble/releases/latest/download/pebble-challtestsrv-linux-amd64.tar.gz
+          tar xzf /tmp/challtestsrv.tar.gz -C /tmp
+          sudo install -m 0755 "$(find /tmp/pebble-challtestsrv-linux-amd64 -type f -name pebble-challtestsrv)" /usr/local/bin/pebble-challtestsrv
+          echo "127.0.0.1 limer.test www.limer.test alpn.limer.test dns.limer.test" | sudo tee -a /etc/hosts
       - name: Automatic HTTPS (ACME) tests
         run: make acme
       - name: Security tests
@@ -41,7 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev zlib1g-dev libzstd-dev libbrotli-dev pkg-config python3 curl
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev zlib1g-dev libzstd-dev libbrotli-dev libnghttp2-dev pkg-config python3 curl
       - name: Sanitized build and suites
         run: make check-asan
         env:

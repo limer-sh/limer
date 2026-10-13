@@ -520,6 +520,7 @@ static int parse_keysrc(const char *s, int *src, int *needs_name)
         { "header", KS_HEADER, 1 }, { "cookie", KS_COOKIE, 1 }, { "query", KS_QUERY, 1 },
         { "path", KS_PATH, 0 }, { "uri", KS_URI, 0 }, { "json", KS_JSON, 1 }, { "form", KS_FORM, 1 },
         { "body", KS_BODY, 0 }, { "method", KS_METHOD, 0 }, { "host", KS_HOST, 0 },
+        { "tls_client", KS_TLS_CLIENT, 1 }, { "client_cert", KS_TLS_CLIENT, 1 },
         { NULL, 0, 0 }
     };
     for (int i = 0; tbl[i].n; i++)
@@ -569,6 +570,7 @@ static void matcher_free(matcher_t *m)
     free(m->vals);
     free(m->re);
     free(m->nums);
+    free(m->split_key.name);
 }
 
 static void hdr_ops_free(hdr_op_t *ops, int n)
@@ -593,6 +595,16 @@ static void auth_free(basic_auth_t *a)
     free(a);
 }
 
+static void rl_cfg_free(rate_limit_cfg_t *r)
+{
+    if (!r)
+        return;
+    free(r->name);
+    free(r->key);
+    ratelimit_free(r->rl);
+    free(r);
+}
+
 static void files_free(file_server_t *f)
 {
     if (!f)
@@ -611,18 +623,26 @@ static void pool_free(pool_t *p)
 {
     if (!p)
         return;
-    for (int i = 0; i < p->nups; i++) {
-        free(p->ups[i]->hostport);
-        free(p->ups[i]->host);
-        free(p->ups[i]);
-    }
+    for (int i = 0; i < p->nups; i++)
+        upstream_free(p->ups[i]);
     free(p->ups);
+    for (int i = 0; i < p->nretired; i++)
+        upstream_free(p->retired[i]);
+    free(p->retired);
+    free(p->dyn_name);
+    if (p->mirror)
+        pool_free(p->mirror);
     free(p->name);
     free(p->key.name);
     free(p->health_uri);
     free(p->health_host);
     hdr_ops_free(p->hdr_up, p->n_hdr_up);
     hdr_ops_free(p->hdr_down, p->n_hdr_down);
+    free(p->tls_server_name);
+    free(p->tls_ca);
+    free(p->tls_client_cert);
+    free(p->tls_client_key);
+    tls_free_pool_client(p);
     free(p);
 }
 
@@ -644,6 +664,8 @@ static void route_free(route_t *r)
     free(r->rw);
     auth_free(r->auth);
     files_free(r->files);
+    rl_cfg_free(r->rl);
+    free(r->cache);
     free(r);
 }
 
@@ -660,11 +682,16 @@ static void server_free(server_t *s)
     for (int i = 0; i < s->nroutes; i++)
         route_free(s->routes[i]);
     free(s->routes);
+    for (int i = 0; i < s->nclient_ca; i++)
+        free(s->client_ca[i]);
+    free(s->client_ca);
     free(s->tls_cert);
     free(s->tls_key);
     hdr_ops_free(s->hdr_down, s->n_hdr_down);
     hdr_ops_free(s->hdr_up, s->n_hdr_up);
     auth_free(s->auth);
+    rl_cfg_free(s->rl);
+    free(s->cache);
     free(s->encode);
     if (s->log_fd > 2)
         close(s->log_fd);
@@ -687,6 +714,10 @@ static void config_free(config_t *c)
     free(c->acme_ca);
     free(c->acme_ca_root);
     free(c->acme_email);
+    free(c->acme_dns_script);
+    for (int i = 0; i < c->nresolvers; i++)
+        free(c->resolvers[i]);
+    free(c->resolvers);
     free(c);
 }
 
@@ -707,8 +738,57 @@ void config_unref(config_t *c)
 /* Upstreams and pools                                                 */
 /* ------------------------------------------------------------------ */
 
+static const config_t *g_loading_cfg; /* set while config_parse_in runs */
+int config_lenient_resolve;
+
+static int resolve_failed(upstream_t *u, int line, const char *detail, char *err, size_t errlen)
+{
+    if (config_lenient_resolve) {
+        LOGW("line %d: cannot resolve upstream '%s' (%s); keeping its previous address", line, u->hostport, detail);
+        u->resolved = 0;
+        u->addrlen = 0;
+        return 0;
+    }
+    snprintf(err, errlen, "line %d: cannot resolve upstream '%s': %s", line, u->hostport, detail);
+    return -1;
+}
+
+void resolve_job_init(resolve_job_t *job, const config_t *cfg, int kind, const char *name, int port)
+{
+    memset(job, 0, sizeof *job);
+    job->kind = kind;
+    snprintf(job->name, sizeof job->name, "%s", name);
+    job->port = port;
+    for (int i = 0; cfg && i < cfg->nresolvers && i < 4; i++) {
+        snprintf(job->resolvers[i], sizeof job->resolvers[i], "%s", cfg->resolvers[i]);
+        job->nresolvers++;
+    }
+}
+
 static int resolve_upstream(upstream_t *u, int line, char *err, size_t errlen)
 {
+    if (g_loading_cfg && g_loading_cfg->nresolvers && !is_ip_literal(u->host)) {
+        /* named upstreams go through the configured resolvers */
+        resolve_job_t *job = xcalloc(1, sizeof *job);
+        resolve_job_init(job, g_loading_cfg, RESOLVE_ADDR, u->host, u->port);
+        resolve_sync(job);
+        if (job->nres == 0) {
+            int rc = resolve_failed(u, line, job->err[0] ? job->err : "no address", err, errlen);
+            free(job);
+            return rc;
+        }
+        int pick = 0;
+        for (int i = 0; i < job->nres; i++)
+            if (job->res[i].addr.ss_family == AF_INET) {
+                pick = i;
+                break;
+            }
+        memcpy(&u->addr, &job->res[pick].addr, job->res[pick].len);
+        u->addrlen = job->res[pick].len;
+        u->resolved = 1;
+        free(job);
+        return 0;
+    }
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -720,7 +800,7 @@ static int resolve_upstream(upstream_t *u, int line, char *err, size_t errlen)
     if (rc != 0 || !res) {
         if (res)
             freeaddrinfo(res);
-        FAIL("line %d: cannot resolve upstream '%s': %s", line, u->hostport, rc ? gai_strerror(rc) : "no address");
+        return resolve_failed(u, line, rc ? gai_strerror(rc) : "no address", err, errlen);
     }
     struct addrinfo *pick = res;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next)
@@ -739,11 +819,20 @@ static int pool_add_upstream(pool_t *p, const char *spec, int line, char *err, s
 {
     if (p->nups >= 64)
         FAIL("line %d: at most 64 upstreams per pool", line);
-    if (str_has_prefix(spec, "https://"))
-        FAIL("line %d: upstream '%s': TLS to upstreams is not supported", line, spec);
     upstream_t *u = xcalloc(1, sizeof *u);
     u->weight = 1;
-    if (parse_hostport(spec, &u->host, &u->port, 80) < 0) {
+    if (str_has_prefix(spec, "https://")) {
+        u->tls = 1;
+        spec += 8;
+    } else if (str_has_prefix(spec, "h2c://")) {
+        u->h2 = 1;
+        spec += 6;
+    } else if (str_has_prefix(spec, "h2://")) {
+        u->h2 = 1;
+        u->tls = 1;
+        spec += 5;
+    }
+    if (parse_hostport(spec, &u->host, &u->port, u->tls ? 443 : 80) < 0) {
         free(u);
         FAIL("line %d: invalid upstream address '%s'", line, spec);
     }
@@ -757,6 +846,7 @@ static int pool_add_upstream(pool_t *p, const char *spec, int line, char *err, s
     else
         snprintf(hp, sizeof hp, "%s:%d", u->host, u->port);
     u->hostport = xstrdup(hp);
+    snprintf(u->sticky_id, sizeof u->sticky_id, "%016llx", (unsigned long long)hash64(hp, strlen(hp)));
     if (resolve_upstream(u, line, err, errlen) < 0) {
         free(u->host);
         free(u->hostport);
@@ -867,6 +957,11 @@ static int parse_lb_policy(pool_t *p, node_t *d, char *err, size_t errlen)
     } else if (strcaseeq(pol, "uri_hash")) {
         p->policy = LB_HASH;
         p->key.src = KS_URI;
+    } else if (strcaseeq(pol, "sticky_cookie") || strcaseeq(pol, "cookie_sticky")) {
+        p->policy = LB_STICKY;
+        p->key.src = KS_COOKIE;
+        p->key.name = xstrdup(d->nargs > 2 ? d->args[2] : "limer_sticky");
+        return 0;
     } else {
         int argi = 1;
         if (strcaseeq(pol, "hash") || strcaseeq(pol, "payload") || strcaseeq(pol, "payload_hash")) {
@@ -907,6 +1002,8 @@ static pool_t *pool_new(const char *name)
     p->keepalive_idle = 256;
     p->keepalive_timeout = 60;
     p->preserve_host = 1;
+    p->refresh = 30;
+    p->mirror_sample = 100;
     return p;
 }
 
@@ -990,8 +1087,118 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
     } else if (strcaseeq(k, "preserve_host")) {
         if (want_args(d, 1, 1, err, errlen) < 0 || arg_bool(d, 1, &p->preserve_host, err, errlen) < 0)
             return -1;
+    } else if (strcaseeq(k, "mirror")) {
+        /* mirror <upstreams...> [{ sample <pct>; ... }] : shadow a copy of the request */
+        if (p->mirror)
+            FAIL("line %d: only one mirror per reverse_proxy", d->line);
+        pool_t *mp = pool_new(p->name);
+        if (d->nargs > 1 && pool_add_upstream_list(mp, d, 1, err, errlen) < 0) {
+            pool_free(mp);
+            return -1;
+        }
+        for (int i = 0; i < d->nkids; i++) {
+            node_t *kk = d->kids[i];
+            int mh = 0;
+            if (strcaseeq(kk->args[0], "sample")) {
+                if (want_args(kk, 1, 1, err, errlen) < 0 || !is_numeric(kk->args[1], &p->mirror_sample) ||
+                    p->mirror_sample < 0 || p->mirror_sample > 100) {
+                    pool_free(mp);
+                    FAIL("line %d: mirror sample needs a percentage 0..100", kk->line);
+                }
+            } else if (parse_pool_directive(mp, kk, &mh, err, errlen) < 0 || !mh) {
+                pool_free(mp);
+                FAIL("line %d: unknown mirror option '%s'", kk->line, kk->args[0]);
+            }
+        }
+        p->mirror = mp;
+    } else if (strcaseeq(k, "mirror_sample")) {
+        if (want_args(d, 1, 1, err, errlen) < 0 || !is_numeric(d->args[1], &p->mirror_sample) ||
+            p->mirror_sample < 0 || p->mirror_sample > 100)
+            FAIL("line %d: mirror_sample needs a percentage 0..100", d->line);
+    } else if (strcaseeq(k, "tls")) {
+        /* `tls` inside a transport block: use TLS for every upstream of the pool */
+        if (d->nargs > 1)
+            FAIL("line %d: 'tls' takes no arguments here", d->line);
+        for (int i = 0; i < p->nups; i++)
+            p->ups[i]->tls = 1;
+        p->tls_all = 1;
+    } else if (strcaseeq(k, "dynamic")) {
+        /* dynamic a <name> <port> [{ refresh <dur> }]  |  dynamic srv <name> [{ refresh <dur> }] */
+        if (d->nargs < 3)
+            FAIL("line %d: dynamic needs 'a <name> <port>' or 'srv <name>'", d->line);
+        if (p->dyn_kind)
+            FAIL("line %d: only one 'dynamic' source per pool", d->line);
+        if (strcaseeq(d->args[1], "a") || strcaseeq(d->args[1], "aaaa")) {
+            if (d->nargs != 4)
+                FAIL("line %d: dynamic a needs a name and a port", d->line);
+            if (arg_int(d, 3, &p->dyn_port, 1, 65535, err, errlen) < 0)
+                return -1;
+            p->dyn_kind = 1;
+        } else if (strcaseeq(d->args[1], "srv")) {
+            if (d->nargs != 3)
+                FAIL("line %d: dynamic srv needs a name like _http._tcp.example.com", d->line);
+            p->dyn_kind = 2;
+        } else {
+            FAIL("line %d: dynamic accepts 'a' or 'srv'", d->line);
+        }
+        free(p->dyn_name);
+        p->dyn_name = xstrdup(d->args[2]);
+        for (int i = 0; i < d->nkids; i++) {
+            node_t *kk = d->kids[i];
+            if (strcaseeq(kk->args[0], "refresh")) {
+                if (want_args(kk, 1, 1, err, errlen) < 0 || arg_duration(kk, 1, &p->refresh, err, errlen) < 0)
+                    return -1;
+            } else {
+                FAIL("line %d: unknown dynamic option '%s'", kk->line, kk->args[0]);
+            }
+        }
+    } else if (strcaseeq(k, "refresh") || strcaseeq(k, "resolve_interval")) {
+        if (want_args(d, 1, 1, err, errlen) < 0)
+            return -1;
+        if (strcaseeq(d->args[1], "off") || strcmp(d->args[1], "0") == 0)
+            p->refresh = 0;
+        else if (arg_duration(d, 1, &p->refresh, err, errlen) < 0)
+            return -1;
+    } else if (strcaseeq(k, "versions")) {
+        /* transport http { versions h2 | h2c | 1.1 } */
+        if (want_args(d, 1, -1, err, errlen) < 0)
+            return -1;
+        p->upstream_h2 = 0;
+        for (int i = 1; i < d->nargs; i++) {
+            if (strcaseeq(d->args[i], "h2") || strcmp(d->args[i], "2") == 0)
+                p->upstream_h2 = 1;
+            else if (strcaseeq(d->args[i], "h2c"))
+                p->upstream_h2 = 2;
+            else if (strcaseeq(d->args[i], "1.1") || strcaseeq(d->args[i], "h1"))
+                ;
+            else
+                FAIL("line %d: versions accepts h2, h2c or 1.1", d->line);
+        }
+    } else if (strcaseeq(k, "tls_client_auth")) {
+        /* tls_client_auth <cert.pem> <key.pem>: present a client certificate to upstreams */
+        if (want_args(d, 2, 2, err, errlen) < 0)
+            return -1;
+        for (int a = 1; a <= 2; a++)
+            if (access(d->args[a], R_OK) != 0)
+                FAIL("line %d: tls_client_auth: cannot read '%s': %s", d->line, d->args[a], strerror(errno));
+        free(p->tls_client_cert);
+        free(p->tls_client_key);
+        p->tls_client_cert = xstrdup(d->args[1]);
+        p->tls_client_key = xstrdup(d->args[2]);
+    } else if (strcaseeq(k, "tls_insecure_skip_verify")) {
+        p->tls_insecure = 1;
+    } else if (strcaseeq(k, "tls_server_name")) {
+        if (want_args(d, 1, 1, err, errlen) < 0)
+            return -1;
+        free(p->tls_server_name);
+        p->tls_server_name = xstrdup(d->args[1]);
+    } else if (strcaseeq(k, "tls_trusted_ca_certs")) {
+        if (want_args(d, 1, 1, err, errlen) < 0)
+            return -1;
+        free(p->tls_ca);
+        p->tls_ca = xstrdup(d->args[1]);
     } else if (strcaseeq(k, "transport")) {
-        /* Caddy compatibility: transport http { keepalive_idle_conns N ... } */
+        /* Caddy compatibility: transport http { keepalive_idle_conns N; tls; ... } */
         for (int i = 0; i < d->nkids; i++) {
             int h = 0;
             node_t *c = d->kids[i];
@@ -1013,21 +1220,218 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
 
 static int pool_finalize(pool_t *p, int line, char *err, size_t errlen)
 {
-    if (p->nups == 0)
+    if (p->nups == 0 && !p->dyn_kind)
         FAIL("line %d: '%s' has no upstreams (use 'to host:port ...')", line, p->name);
+    int pool_tls = p->tls_all;
+    int any_tls = pool_tls, any_h2 = p->upstream_h2 != 0;
+    for (int i = 0; i < p->nups; i++) {
+        if (pool_tls)
+            p->ups[i]->tls = 1;
+        if (p->upstream_h2 == 1) {
+            p->ups[i]->h2 = 1;
+            p->ups[i]->tls = 1;
+        } else if (p->upstream_h2 == 2) {
+            p->ups[i]->h2 = 1;
+        }
+        if (p->ups[i]->tls)
+            any_tls = 1;
+        if (p->ups[i]->h2)
+            any_h2 = 1;
+    }
+#ifndef LIMER_H2
+    if (any_h2)
+        FAIL("line %d: '%s': HTTP/2 upstreams need a build with nghttp2", line, p->name);
+#endif
+    (void)any_h2;
+    if (any_tls && tls_init_pool_client(p, err, errlen) < 0)
+        return -1;
     p->total_weight = 0;
     for (int i = 0; i < p->nups; i++)
         p->total_weight += p->ups[i]->weight;
-    if (p->total_weight <= 0)
+    if (p->total_weight <= 0 && p->nups > 0)
         FAIL("line %d: '%s': all upstreams have weight 0", line, p->name);
-    if (p->retries > p->nups - 1)
+    if (!p->dyn_kind && p->retries > p->nups - 1)
         p->retries = p->nups - 1;
+    if (p->mirror) {
+        if (p->mirror->nups == 0 && !p->mirror->dyn_kind)
+            FAIL("line %d: mirror has no upstreams", line);
+        if (pool_finalize(p->mirror, line, err, errlen) < 0)
+            return -1;
+    }
     return 0;
+}
+
+/* ---- upstreams that come and go at runtime (dynamic lookups, re-resolution) ---- */
+
+upstream_t *upstream_new_resolved(pool_t *p, const char *host, const struct sockaddr *sa, socklen_t len, int port, int weight)
+{
+    upstream_t *u = xcalloc(1, sizeof *u);
+    u->weight = weight > 0 ? weight : 1;
+    u->host = xstrdup(host);
+    u->port = port;
+    u->tls = p->tls_all || p->upstream_h2 == 1;
+    u->h2 = p->upstream_h2 != 0;
+    memcpy(&u->addr, sa, len);
+    u->addrlen = len;
+    if (u->addr.ss_family == AF_INET)
+        ((struct sockaddr_in *)&u->addr)->sin_port = htons((uint16_t)port);
+    else if (u->addr.ss_family == AF_INET6)
+        ((struct sockaddr_in6 *)&u->addr)->sin6_port = htons((uint16_t)port);
+    u->resolved = 1;
+    u->dynamic = 1;
+    char ip[INET6_ADDRSTRLEN] = "?";
+    if (sa->sa_family == AF_INET)
+        inet_ntop(AF_INET, &((const struct sockaddr_in *)sa)->sin_addr, ip, sizeof ip);
+    else if (sa->sa_family == AF_INET6)
+        inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)sa)->sin6_addr, ip, sizeof ip);
+    char hp[300];
+    if (sa->sa_family == AF_INET6)
+        snprintf(hp, sizeof hp, "[%s]:%d", ip, port);
+    else
+        snprintf(hp, sizeof hp, "%s:%d", ip, port);
+    u->hostport = xstrdup(hp);
+    snprintf(u->sticky_id, sizeof u->sticky_id, "%016llx", (unsigned long long)hash64(hp, strlen(hp)));
+    return u;
+}
+
+void upstream_free(upstream_t *u)
+{
+    if (!u)
+        return;
+    free(u->hostport);
+    free(u->host);
+    free(u);
+}
+
+void pool_recompute(pool_t *p)
+{
+    p->total_weight = 0;
+    for (int i = 0; i < p->nups; i++)
+        p->total_weight += p->ups[i]->weight;
+    if (p->rr_index >= p->nups)
+        p->rr_index = 0;
+}
+
+int pool_add_runtime(pool_t *p, upstream_t *u)
+{
+    if (p->nups >= 64)
+        return -1;
+    p->ups = xrealloc(p->ups, sizeof(upstream_t *) * (size_t)(p->nups + 1));
+    p->ups[p->nups++] = u;
+    pool_recompute(p);
+    return 0;
+}
+
+void pool_retire_upstream(pool_t *p, int idx)
+{
+    upstream_t *u = p->ups[idx];
+    memmove(p->ups + idx, p->ups + idx + 1, sizeof(upstream_t *) * (size_t)(p->nups - idx - 1));
+    p->nups--;
+    u->gone = 1;
+    p->retired = xrealloc(p->retired, sizeof(upstream_t *) * (size_t)(p->nretired + 1));
+    p->retired[p->nretired++] = u;
+    pool_recompute(p);
+}
+
+void pool_reap_retired(pool_t *p)
+{
+    for (int i = 0; i < p->nretired;) {
+        upstream_t *u = p->retired[i];
+        if (u->active == 0 && u->nidle == 0 && !u->hc && !u->h2u) {
+            upstream_free(u);
+            memmove(p->retired + i, p->retired + i + 1, sizeof(upstream_t *) * (size_t)(p->nretired - i - 1));
+            p->nretired--;
+        } else {
+            i++;
+        }
+    }
+}
+
+/* first-time lookup of dynamic pools while loading (blocking; failures only warn) */
+static void config_resolve_dynamic(config_t *cfg)
+{
+    for (int i = 0; i < cfg->nservers; i++) {
+        server_t *s = cfg->servers[i];
+        for (int r = 0; r < s->nroutes; r++) {
+            pool_t *p = s->routes[r]->pool;
+            if (!p || !p->dyn_kind)
+                continue;
+            resolve_job_t *job = xcalloc(1, sizeof *job);
+            resolve_job_init(job, cfg, p->dyn_kind == 2 ? RESOLVE_SRV : RESOLVE_ADDR, p->dyn_name, p->dyn_port);
+            resolve_sync(job);
+            for (int k = 0; k < job->nres; k++) {
+                resolve_result_t *rr = &job->res[k];
+                upstream_t *u = upstream_new_resolved(p, rr->target, (struct sockaddr *)&rr->addr, rr->len, rr->port, rr->weight);
+                int dup = 0;
+                for (int m = 0; m < p->nups && !dup; m++)
+                    dup = strcmp(p->ups[m]->hostport, u->hostport) == 0;
+                if (dup || pool_add_runtime(p, u) < 0)
+                    upstream_free(u);
+            }
+            if (job->nres == 0)
+                LOGW("pool %s: dynamic %s %s: %s (pool starts empty)", p->name, p->dyn_kind == 2 ? "srv" : "a", p->dyn_name, job->err);
+            else
+                LOGI("pool %s: dynamic %s %s resolved to %d upstream(s)", p->name, p->dyn_kind == 2 ? "srv" : "a", p->dyn_name, job->nres);
+            free(job);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /* Matchers and route-level directives                                 */
 /* ------------------------------------------------------------------ */
+
+static int parse_cache(cache_cfg_t **out, node_t *d, char *err, size_t errlen)
+{
+    cache_cfg_t *cc = xcalloc(1, sizeof *cc);
+    cc->max_object = 1024 * 1024;   /* 1 MiB */
+    cc->methods_head = 1;
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *k = d->kids[i];
+        const char *n = k->args[0];
+        int rc = 0;
+        if (strcaseeq(n, "ttl") || strcaseeq(n, "default_ttl")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0)
+                rc = arg_duration(k, 1, &cc->ttl, err, errlen);
+        } else if (strcaseeq(n, "stale") || strcaseeq(n, "stale_while_revalidate")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0)
+                rc = arg_duration(k, 1, &cc->swr, err, errlen);
+        } else if (strcaseeq(n, "max_object") || strcaseeq(n, "max_object_size")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0 && parse_size(k->args[1], &cc->max_object) < 0) {
+                snprintf(err, errlen, "line %d: invalid size '%s'", k->line, k->args[1]);
+                rc = -1;
+            }
+        } else if (strcaseeq(n, "methods")) {
+            if ((rc = want_args(k, 1, -1, err, errlen)) == 0) {
+                cc->methods_head = 0;
+                for (int a = 1; a < k->nargs; a++) {
+                    if (strcaseeq(k->args[a], "HEAD"))
+                        cc->methods_head = 1;
+                    else if (!strcaseeq(k->args[a], "GET")) {
+                        snprintf(err, errlen, "line %d: cache only caches GET and HEAD", k->line);
+                        rc = -1;
+                    }
+                }
+            }
+        } else {
+            snprintf(err, errlen, "line %d: unknown cache option '%s'", k->line, n);
+            rc = -1;
+        }
+        if (rc < 0) {
+            free(cc);
+            return -1;
+        }
+    }
+    free(*out);
+    *out = cc;
+    return 0;
+}
+
+static void route_add_matcher(route_t *r, const matcher_t *m)
+{
+    r->m = xrealloc(r->m, sizeof(matcher_t) * (size_t)(r->nm + 1));
+    r->m[r->nm++] = *m;
+}
 
 static int parse_match(route_t *r, node_t *d, char *err, size_t errlen)
 {
@@ -1041,6 +1445,34 @@ static int parse_match(route_t *r, node_t *d, char *err, size_t errlen)
     }
     if (ai >= d->nargs)
         FAIL("line %d: 'match' needs a source (method, path, host, header, query, cookie, json, form, body, remote_ip)", d->line);
+    if (ai < d->nargs && strcaseeq(d->args[ai], "split")) {
+        /* match [not] split <percent> [<key-source> [name]] */
+        ai++;
+        if (ai >= d->nargs || !is_numeric(d->args[ai], &m.split_pct) || m.split_pct < 0 || m.split_pct > 100) {
+            free(m.key.name);
+            FAIL("line %d: 'match split' needs a percentage 0..100", d->line);
+        }
+        ai++;
+        m.is_split = 1;
+        m.split_key.src = KS_CLIENT_IP;
+        if (ai < d->nargs) {
+            int snamed;
+            if (parse_keysrc(d->args[ai], &m.split_key.src, &snamed) < 0)
+                FAIL("line %d: unknown split key source '%s'", d->line, d->args[ai]);
+            ai++;
+            if (snamed) {
+                if (ai >= d->nargs)
+                    FAIL("line %d: 'match split ... %s' needs a name", d->line, d->args[ai - 1]);
+                m.split_key.name = xstrdup(d->args[ai++]);
+            }
+        }
+        if (ai != d->nargs) {
+            free(m.split_key.name);
+            FAIL("line %d: 'match split' takes a percentage and an optional key source", d->line);
+        }
+        route_add_matcher(r, &m);
+        return 0;
+    }
     int named;
     if (parse_keysrc(d->args[ai], &m.key.src, &named) < 0)
         FAIL("line %d: unknown match source '%s'", d->line, d->args[ai]);
@@ -1139,6 +1571,99 @@ static void route_add_rewrite(route_t *r, int kind, const char *a, const char *b
     r->rw[r->nrw].a = xstrdup(a);
     r->rw[r->nrw].b = b ? xstrdup(b) : NULL;
     r->nrw++;
+}
+
+/* "10r/s", "600r/m", "100r/h", or a plain number per second */
+static int parse_rate(const char *s, double *out)
+{
+    char *end;
+    double v = strtod(s, &end);
+    if (end == s || v <= 0)
+        return -1;
+    if (*end == 0) {
+        *out = v;
+        return 0;
+    }
+    if (strcmp(end, "r/s") == 0 || strcmp(end, "/s") == 0)
+        *out = v;
+    else if (strcmp(end, "r/m") == 0 || strcmp(end, "/m") == 0)
+        *out = v / 60.0;
+    else if (strcmp(end, "r/h") == 0 || strcmp(end, "/h") == 0)
+        *out = v / 3600.0;
+    else
+        return -1;
+    return 0;
+}
+
+/* rate_limit [zone] [rate] { key <tmpl>; rate <r>; burst <n>; status <code>; max_keys <n> } */
+static int parse_rate_limit(rate_limit_cfg_t **out, node_t *d, char *err, size_t errlen)
+{
+    rate_limit_cfg_t *r = xcalloc(1, sizeof *r);
+    r->status = 429;
+    r->max_keys = 100000;
+    int ai = 1;
+    if (ai < d->nargs && parse_rate(d->args[ai], &r->rate) < 0) {
+        r->name = xstrdup(d->args[ai++]);
+        if (ai < d->nargs && parse_rate(d->args[ai], &r->rate) == 0)
+            ai++;
+    } else if (ai < d->nargs) {
+        ai++;
+    }
+    if (ai < d->nargs) {
+        rl_cfg_free(r);
+        FAIL("line %d: rate_limit accepts [zone] [rate] followed by an options block", d->line);
+    }
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *k = d->kids[i];
+        const char *n = k->args[0];
+        int rc = 0;
+        if (strcaseeq(n, "key")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0) {
+                free(r->key);
+                r->key = xstrdup(k->args[1]);
+            }
+        } else if (strcaseeq(n, "rate") || strcaseeq(n, "events")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0 && parse_rate(k->args[1], &r->rate) < 0) {
+                snprintf(err, errlen, "line %d: invalid rate '%s' (use e.g. 10r/s, 600r/m)", k->line, k->args[1]);
+                rc = -1;
+            }
+        } else if (strcaseeq(n, "burst")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0) {
+                r->burst = atof(k->args[1]);
+                if (r->burst <= 0) {
+                    snprintf(err, errlen, "line %d: burst must be positive", k->line);
+                    rc = -1;
+                }
+            }
+        } else if (strcaseeq(n, "status")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0)
+                rc = arg_int(k, 1, &r->status, 400, 599, err, errlen);
+        } else if (strcaseeq(n, "max_keys")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0)
+                rc = arg_int(k, 1, &r->max_keys, 1, 100000000, err, errlen);
+        } else {
+            snprintf(err, errlen, "line %d: unknown rate_limit option '%s'", k->line, n);
+            rc = -1;
+        }
+        if (rc < 0) {
+            rl_cfg_free(r);
+            return -1;
+        }
+    }
+    if (r->rate <= 0) {
+        rl_cfg_free(r);
+        FAIL("line %d: rate_limit needs a rate (e.g. 'rate 10r/s')", d->line);
+    }
+    if (!r->key)
+        r->key = xstrdup("{remote_ip}");
+    if (!r->name)
+        r->name = xstrdup("default");
+    if (r->burst <= 0)
+        r->burst = r->rate < 1 ? 1 : r->rate;
+    r->rl = ratelimit_new(r->rate, r->burst, r->max_keys);
+    rl_cfg_free(*out);
+    *out = r;
+    return 0;
 }
 
 static int parse_basic_auth(basic_auth_t **out, node_t *d, char *err, size_t errlen)
@@ -1408,6 +1933,12 @@ static int parse_route_directive(route_t *r, pool_t *p, node_t *c, char **root_h
     if (strcaseeq(k, "basic_auth") || strcaseeq(k, "basicauth")) {
         return parse_basic_auth(&r->auth, c, err, errlen) < 0 ? -1 : 1;
     }
+    if (strcaseeq(k, "rate_limit")) {
+        return parse_rate_limit(&r->rl, c, err, errlen) < 0 ? -1 : 1;
+    }
+    if (strcaseeq(k, "cache")) {
+        return parse_cache(&r->cache, c, err, errlen) < 0 ? -1 : 1;
+    }
     if (strcaseeq(k, "header") || strcaseeq(k, "header_down")) {
         return add_hdr_ops(&p->hdr_down, &p->n_hdr_down, c, err, errlen) < 0 ? -1 : 1;
     }
@@ -1468,6 +1999,7 @@ static int route_finish(server_t *s, route_t *r, pool_t *p, char *root_hint, con
         }
     }
     free(root_hint);
+    route_compute_needs_body(r);
     s->routes = xrealloc(s->routes, sizeof(route_t *) * (size_t)(s->nroutes + 1));
     s->routes[s->nroutes++] = r;
     return 0;
@@ -1567,6 +2099,7 @@ static int parse_reverse_proxy(server_t *s, node_t *d, char *err, size_t errlen)
     if (pool_finalize(p, d->line, err, errlen) < 0)
         goto fail;
     r->pool = p;
+    route_compute_needs_body(r);
     s->routes = xrealloc(s->routes, sizeof(route_t *) * (size_t)(s->nroutes + 1));
     s->routes[s->nroutes++] = r;
     return 0;
@@ -1743,32 +2276,78 @@ static int parse_log(server_t *s, node_t *d, char *err, size_t errlen)
     return 0;
 }
 
+/* tls ... { client_auth { mode <m>; trusted_ca_cert_file <pem> ... } } */
+static int parse_client_auth(server_t *s, node_t *d, char *err, size_t errlen)
+{
+    if (d->nargs > 1)
+        FAIL("line %d: client_auth takes a block, not arguments", d->line);
+    s->client_auth_mode = CA_REQUIRE_AND_VERIFY;
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *k = d->kids[i];
+        const char *n = k->args[0];
+        if (strcaseeq(n, "mode")) {
+            if (want_args(k, 1, 1, err, errlen) < 0)
+                return -1;
+            const char *m = k->args[1];
+            if (strcaseeq(m, "request"))
+                s->client_auth_mode = CA_REQUEST;
+            else if (strcaseeq(m, "require"))
+                s->client_auth_mode = CA_REQUIRE;
+            else if (strcaseeq(m, "verify_if_given"))
+                s->client_auth_mode = CA_VERIFY_IF_GIVEN;
+            else if (strcaseeq(m, "require_and_verify"))
+                s->client_auth_mode = CA_REQUIRE_AND_VERIFY;
+            else
+                FAIL("line %d: client_auth mode accepts request, require, verify_if_given or require_and_verify", k->line);
+        } else if (strcaseeq(n, "trusted_ca_cert_file") || strcaseeq(n, "trusted_ca_cert")) {
+            if (want_args(k, 1, -1, err, errlen) < 0)
+                return -1;
+            for (int a = 1; a < k->nargs; a++) {
+                if (access(k->args[a], R_OK) != 0)
+                    FAIL("line %d: client_auth: cannot read '%s': %s", k->line, k->args[a], strerror(errno));
+                s->client_ca = xrealloc(s->client_ca, sizeof(char *) * (size_t)(s->nclient_ca + 1));
+                s->client_ca[s->nclient_ca++] = xstrdup(k->args[a]);
+            }
+        } else {
+            FAIL("line %d: unknown client_auth option '%s'", k->line, n);
+        }
+    }
+    if ((s->client_auth_mode == CA_VERIFY_IF_GIVEN || s->client_auth_mode == CA_REQUIRE_AND_VERIFY) && s->nclient_ca == 0)
+        FAIL("line %d: client_auth mode %s needs trusted_ca_cert_file", d->line,
+             s->client_auth_mode == CA_VERIFY_IF_GIVEN ? "verify_if_given" : "require_and_verify");
+    return 0;
+}
+
 static int parse_tls(server_t *s, node_t *d, char *err, size_t errlen)
 {
-    /* tls internal | tls <cert> <key> | tls <email> */
+    /* tls internal | tls <cert> <key> | tls <email> | tls  -- each with an optional { client_auth { } } block */
     if (d->nargs == 2 && strcaseeq(d->args[1], "internal")) {
         s->tls_mode = TLS_INTERNAL;
-        return 0;
-    }
-    if (d->nargs == 3) {
+    } else if (d->nargs == 3) {
         free(s->tls_cert);
         free(s->tls_key);
         s->tls_cert = xstrdup(d->args[1]);
         s->tls_key = xstrdup(d->args[2]);
         s->tls_mode = TLS_FILES;
-        return 0;
-    }
-    if (d->nargs == 2 && strchr(d->args[1], '@')) {
+    } else if (d->nargs == 2 && strchr(d->args[1], '@')) {
         s->tls_mode = TLS_AUTO;
         free(s->tls_cert);
         s->tls_cert = xstrdup(d->args[1]); /* account email for ACME */
-        return 0;
-    }
-    if (d->nargs == 1 && d->nkids) {
+    } else if (d->nargs == 1 && d->nkids) {
         s->tls_mode = TLS_AUTO;
-        return 0;
+    } else {
+        FAIL("line %d: tls accepts 'internal', '<cert.pem> <key.pem>' or an email for automatic certificates", d->line);
     }
-    FAIL("line %d: tls accepts 'internal', '<cert.pem> <key.pem>' or an email for automatic certificates", d->line);
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *k = d->kids[i];
+        if (strcaseeq(k->args[0], "client_auth")) {
+            if (parse_client_auth(s, k, err, errlen) < 0)
+                return -1;
+        } else {
+            FAIL("line %d: unknown tls option '%s'", k->line, k->args[0]);
+        }
+    }
+    return 0;
 }
 
 static int parse_server(config_t *cfg, node_t *d, char *err, size_t errlen)
@@ -1859,6 +2438,16 @@ static int parse_server(config_t *cfg, node_t *d, char *err, size_t errlen)
                             snprintf(err, errlen, "line %d: invalid size '%s'", kk->line, kk->args[1]);
                             rc = -1;
                         }
+                    } else if (strcaseeq(kk->args[0], "mode") && kk->nargs == 2) {
+                        /* mode stream (default: stream unless something reads the body) | buffer */
+                        if (strcaseeq(kk->args[1], "stream") || strcaseeq(kk->args[1], "auto"))
+                            s->body_mode = 0;
+                        else if (strcaseeq(kk->args[1], "buffer"))
+                            s->body_mode = 1;
+                        else {
+                            snprintf(err, errlen, "line %d: request_body mode accepts stream or buffer", kk->line);
+                            rc = -1;
+                        }
                     } else {
                         snprintf(err, errlen, "line %d: unknown request_body option '%s'", kk->line, kk->args[0]);
                         rc = -1;
@@ -1884,6 +2473,10 @@ static int parse_server(config_t *cfg, node_t *d, char *err, size_t errlen)
             rc = add_hdr_ops(&s->hdr_up, &s->n_hdr_up, c, err, errlen);
         } else if (strcaseeq(k, "basic_auth") || strcaseeq(k, "basicauth")) {
             rc = parse_basic_auth(&s->auth, c, err, errlen);
+        } else if (strcaseeq(k, "rate_limit")) {
+            rc = parse_rate_limit(&s->rl, c, err, errlen);
+        } else if (strcaseeq(k, "cache")) {
+            rc = parse_cache(&s->cache, c, err, errlen);
         } else if (strcaseeq(k, "encode")) {
             if ((rc = want_args(c, 0, -1, err, errlen)) == 0) {
                 buf_t b;
@@ -1935,6 +2528,10 @@ static int parse_server(config_t *cfg, node_t *d, char *err, size_t errlen)
         server_free(s);
         FAIL("line %d: site block has no handlers (reverse_proxy, route, respond, file_server, ...)", d->line);
     }
+    s->needs_body = (s->rl && template_needs_body(s->rl->key)) ? 1 : 0;
+    for (int i = 0; i < s->n_hdr_up; i++)
+        if (template_needs_body(s->hdr_up[i].value))
+            s->needs_body = 1;
     cfg->servers = xrealloc(cfg->servers, sizeof(server_t *) * (size_t)(cfg->nservers + 1));
     cfg->servers[cfg->nservers++] = s;
     return 0;
@@ -2005,6 +2602,47 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
                 return -1;
             free(cfg->acme_ca_root);
             cfg->acme_ca_root = xstrdup(c->args[1]);
+        } else if (strcaseeq(k, "acme_challenge")) {
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            if (strcaseeq(c->args[1], "http-01") || strcaseeq(c->args[1], "http"))
+                cfg->acme_challenge = 0;
+            else if (strcaseeq(c->args[1], "tls-alpn-01") || strcaseeq(c->args[1], "tls-alpn"))
+                cfg->acme_challenge = 1;
+            else if (strcaseeq(c->args[1], "dns-01") || strcaseeq(c->args[1], "dns"))
+                cfg->acme_challenge = 2;
+            else
+                FAIL("line %d: acme_challenge accepts http-01, tls-alpn-01 or dns-01", c->line);
+        } else if (strcaseeq(k, "acme_dns_script")) {
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            if (access(c->args[1], X_OK) != 0)
+                FAIL("line %d: acme_dns_script '%s' is not executable", c->line, c->args[1]);
+            free(cfg->acme_dns_script);
+            cfg->acme_dns_script = xstrdup(c->args[1]);
+        } else if (strcaseeq(k, "acme_dns_propagation")) {
+            if (want_args(c, 1, 1, err, errlen) < 0 || arg_duration(c, 1, &cfg->acme_dns_propagation, err, errlen) < 0)
+                return -1;
+        } else if (strcaseeq(k, "cache_capacity") || strcaseeq(k, "cache_size")) {
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            if (parse_size(c->args[1], &cfg->cache_capacity) < 0)
+                FAIL("line %d: invalid cache_capacity '%s'", c->line, c->args[1]);
+        } else if (strcaseeq(k, "resolvers")) {
+            if (want_args(c, 1, 4, err, errlen) < 0)
+                return -1;
+            for (int i = 1; i < c->nargs; i++) {
+                char host[64];
+                snprintf(host, sizeof host, "%s", c->args[i]);
+                char *colon = strchr(host, ':');
+                if (colon)
+                    *colon = 0;
+                struct in_addr a4;
+                if (inet_pton(AF_INET, host, &a4) != 1)
+                    FAIL("line %d: resolvers takes IPv4 addresses like 10.0.0.2 or 10.0.0.2:5353", c->line);
+                cfg->resolvers = xrealloc(cfg->resolvers, sizeof(char *) * (size_t)(cfg->nresolvers + 1));
+                cfg->resolvers[cfg->nresolvers++] = xstrdup(c->args[i]);
+            }
         } else if (strcaseeq(k, "auto_https")) {
             if (want_args(c, 1, 1, err, errlen) < 0)
                 return -1;
@@ -2177,8 +2815,10 @@ static config_t *config_parse_in(const char *text, const char *path, const char 
     cfg->grace = 10;
     cfg->http_port = 80;
     cfg->https_port = 443;
+    cfg->acme_dns_propagation = 10;
     cfg->path = xstrdup(path ? path : "<inline>");
     cfg->text = xstrdup(text);
+    g_loading_cfg = cfg;
 
     for (int k = 0; k < root->nkids; k++) {
         node_t *d = root->kids[k];
@@ -2195,11 +2835,13 @@ static config_t *config_parse_in(const char *text, const char *path, const char 
         }
         if (r < 0) {
             node_free(root);
+            g_loading_cfg = NULL;
             config_unref(cfg);
             return NULL;
         }
     }
     node_free(root);
+    g_loading_cfg = NULL;
     if (cfg->nservers == 0) {
         snprintf(err, errlen, "no server blocks defined");
         config_unref(cfg);
@@ -2219,6 +2861,9 @@ static config_t *config_parse_in(const char *text, const char *path, const char 
     if (!cfg->acme_ca)
         cfg->acme_ca = xstrdup("https://acme-v02.api.letsencrypt.org/directory");
     config_add_redirect_servers(cfg);
+    config_resolve_dynamic(cfg);
+    g_loading_cfg = NULL;
+    overrides_apply(cfg);
     if (config_finish_tls(cfg, err, errlen) < 0) {
         config_unref(cfg);
         return NULL;
@@ -2251,4 +2896,176 @@ config_t *config_load(const char *path, char *err, size_t errlen)
     free(dup);
     free(text);
     return cfg;
+}
+
+/* ------------------------------------------------------------------ */
+/* Runtime overrides                                                   */
+/* ------------------------------------------------------------------ */
+
+typedef struct override {
+    char hostport[300];
+    int drained;   /* -1 unset */
+    int weight;    /* -1 unset */
+} override_t;
+
+static int overrides_read(const config_t *cfg, override_t **out)
+{
+    char path[2048];
+    snprintf(path, sizeof path, "%s/overrides.conf", cfg->storage);
+    FILE *f = fopen(path, "r");
+    *out = NULL;
+    if (!f)
+        return 0;
+    override_t *list = NULL;
+    int n = 0;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        override_t o;
+        o.drained = o.weight = -1;
+        char *save = NULL;
+        char *tok = strtok_r(line, " \t\r\n", &save);
+        if (!tok || *tok == '#')
+            continue;
+        snprintf(o.hostport, sizeof o.hostport, "%s", tok);
+        while ((tok = strtok_r(NULL, " \t\r\n", &save))) {
+            if (str_has_prefix(tok, "drained="))
+                o.drained = atoi(tok + 8) ? 1 : 0;
+            else if (str_has_prefix(tok, "weight="))
+                o.weight = atoi(tok + 7);
+        }
+        list = xrealloc(list, sizeof(override_t) * (size_t)(n + 1));
+        list[n++] = o;
+    }
+    fclose(f);
+    *out = list;
+    return n;
+}
+
+static int overrides_write(const config_t *cfg, override_t *list, int n)
+{
+    if (mkdir_p(cfg->storage) < 0)
+        return -1;
+    char path[2048], tmp[2060];
+    snprintf(path, sizeof path, "%s/overrides.conf", cfg->storage);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return -1;
+    fputs("# runtime upstream overrides written by the admin API\n", f);
+    for (int i = 0; i < n; i++) {
+        if (list[i].drained < 0 && list[i].weight < 0)
+            continue;
+        fprintf(f, "%s", list[i].hostport);
+        if (list[i].drained >= 0)
+            fprintf(f, " drained=%d", list[i].drained);
+        if (list[i].weight >= 0)
+            fprintf(f, " weight=%d", list[i].weight);
+        fputc('\n', f);
+    }
+    fclose(f);
+    return rename(tmp, path);
+}
+
+/* Apply stored overrides to every matching upstream of cfg. */
+int overrides_apply(config_t *cfg)
+{
+    override_t *list;
+    int n = overrides_read(cfg, &list);
+    for (int o = 0; o < n; o++) {
+        for (int i = 0; i < cfg->nservers; i++) {
+            server_t *s = cfg->servers[i];
+            for (int r = 0; r < s->nroutes; r++) {
+                pool_t *p = s->routes[r]->pool;
+                if (!p)
+                    continue;
+                int changed = 0;
+                for (int k = 0; k < p->nups; k++) {
+                    upstream_t *u = p->ups[k];
+                    if (strcmp(u->hostport, list[o].hostport) != 0)
+                        continue;
+                    if (list[o].drained >= 0)
+                        u->drained = list[o].drained;
+                    if (list[o].weight > 0) {
+                        u->weight = list[o].weight;
+                        changed = 1;
+                    }
+                }
+                if (changed) {
+                    p->total_weight = 0;
+                    for (int k = 0; k < p->nups; k++)
+                        p->total_weight += p->ups[k]->weight;
+                }
+            }
+        }
+    }
+    free(list);
+    return n;
+}
+
+int overrides_apply_upstream(const config_t *cfg, upstream_t *u)
+{
+    override_t *list;
+    int n = overrides_read(cfg, &list);
+    int hit = 0;
+    for (int o = 0; o < n; o++) {
+        if (strcmp(u->hostport, list[o].hostport) != 0)
+            continue;
+        if (list[o].drained >= 0)
+            u->drained = list[o].drained;
+        if (list[o].weight > 0)
+            u->weight = list[o].weight;
+        hit = 1;
+    }
+    free(list);
+    return hit;
+}
+
+int overrides_set(const config_t *cfg, const char *hostport, int drained, int weight, char *err, size_t errlen)
+{
+    override_t *list;
+    int n = overrides_read(cfg, &list);
+    int found = -1;
+    for (int i = 0; i < n; i++)
+        if (strcmp(list[i].hostport, hostport) == 0)
+            found = i;
+    if (found < 0) {
+        list = xrealloc(list, sizeof(override_t) * (size_t)(n + 1));
+        found = n++;
+        snprintf(list[found].hostport, sizeof list[found].hostport, "%s", hostport);
+        list[found].drained = list[found].weight = -1;
+    }
+    if (drained >= 0)
+        list[found].drained = drained;
+    if (weight >= 0)
+        list[found].weight = weight;
+    int rc = overrides_write(cfg, list, n);
+    if (rc < 0)
+        snprintf(err, errlen, "cannot write %s/overrides.conf: %s", cfg->storage, strerror(errno));
+    free(list);
+    return rc;
+}
+
+int overrides_clear(const config_t *cfg)
+{
+    char path[2048];
+    snprintf(path, sizeof path, "%s/overrides.conf", cfg->storage);
+    return unlink(path) == 0 || errno == ENOENT ? 0 : -1;
+}
+
+int overrides_list(const config_t *cfg, buf_t *json)
+{
+    override_t *list;
+    int n = overrides_read(cfg, &list);
+    buf_puts(json, "{\"overrides\":[");
+    for (int i = 0; i < n; i++) {
+        buf_printf(json, "%s{\"address\":\"%s\"", i ? "," : "", list[i].hostport);
+        if (list[i].drained >= 0)
+            buf_printf(json, ",\"drained\":%s", list[i].drained ? "true" : "false");
+        if (list[i].weight >= 0)
+            buf_printf(json, ",\"weight\":%d", list[i].weight);
+        buf_puts(json, "}");
+    }
+    buf_puts(json, "]}\n");
+    free(list);
+    return n;
 }
