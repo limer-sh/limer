@@ -386,3 +386,147 @@ int glob_match(const char *p, const char *s)
         p++;
     return *p == 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Additional helpers                                                  */
+/* ------------------------------------------------------------------ */
+
+int is_ip_literal(const char *s)
+{
+    unsigned char b[16];
+    if (inet_pton(AF_INET, s, b) == 1)
+        return 1;
+    char tmp[64];
+    if (s[0] == '[') {
+        size_t n = strlen(s);
+        if (n < 3 || s[n - 1] != ']' || n - 2 >= sizeof tmp)
+            return 0;
+        memcpy(tmp, s + 1, n - 2);
+        tmp[n - 2] = 0;
+        s = tmp;
+    }
+    return inet_pton(AF_INET6, s, b) == 1;
+}
+
+static const char b64std[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static const char b64url[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+size_t base64_encode(const unsigned char *in, size_t n, char *out, int url)
+{
+    const char *tbl = url ? b64url : b64std;
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned v = (unsigned)in[i] << 16;
+        if (i + 1 < n)
+            v |= (unsigned)in[i + 1] << 8;
+        if (i + 2 < n)
+            v |= in[i + 2];
+        out[o++] = tbl[(v >> 18) & 63];
+        out[o++] = tbl[(v >> 12) & 63];
+        if (i + 1 < n)
+            out[o++] = tbl[(v >> 6) & 63];
+        else if (!url)
+            out[o++] = '=';
+        if (i + 2 < n)
+            out[o++] = tbl[v & 63];
+        else if (!url)
+            out[o++] = '=';
+    }
+    out[o] = 0;
+    return o;
+}
+
+static int b64val(int c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+
+int base64_decode(const char *in, size_t n, unsigned char *out, size_t outcap)
+{
+    size_t o = 0;
+    unsigned acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (in[i] == '=' || in[i] == '\n' || in[i] == '\r')
+            continue;
+        int v = b64val((unsigned char)in[i]);
+        if (v < 0)
+            return -1;
+        acc = (acc << 6) | (unsigned)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (o >= outcap)
+                return -1;
+            out[o++] = (unsigned char)((acc >> bits) & 0xff);
+        }
+    }
+    return (int)o;
+}
+
+/* Normalise a URL path: percent-decode, collapse "//" and ".", resolve "..".
+ * Returns a malloc'd path starting with '/', or NULL if ".." would escape the
+ * root or the path contains a NUL byte. */
+char *path_clean(const char *path)
+{
+    size_t n = strlen(path);
+    char *dec = xmalloc(n + 2);
+    int dl = url_decode(path, n, dec, n + 2);
+    if (dl < 0) {
+        free(dec);
+        return NULL;
+    }
+    if (memchr(dec, 0, (size_t)dl)) {
+        free(dec);
+        return NULL;
+    }
+    /* split on '/', keep a stack of segments */
+    char **seg = xcalloc((size_t)dl + 2, sizeof(char *));
+    int ns = 0;
+    char *p = dec;
+    while (*p == '/')
+        p++;
+    while (*p) {
+        char *s = p;
+        while (*p && *p != '/')
+            p++;
+        size_t len = (size_t)(p - s);
+        while (*p == '/')
+            p++;
+        if (len == 1 && s[0] == '.')
+            continue;
+        if (len == 2 && s[0] == '.' && s[1] == '.') {
+            if (ns == 0) {
+                free(seg);
+                free(dec);
+                return NULL;
+            }
+            ns--;
+            continue;
+        }
+        seg[ns++] = xstrndup(s, len);
+    }
+    int trailing = dl > 0 && dec[dl - 1] == '/';
+    buf_t b;
+    buf_init(&b);
+    if (ns == 0)
+        buf_puts(&b, "/");
+    for (int i = 0; i < ns; i++) {
+        buf_puts(&b, "/");
+        buf_puts(&b, seg[i]);
+        free(seg[i]);
+    }
+    if (ns > 0 && trailing)
+        buf_puts(&b, "/");
+    buf_append(&b, "", 1);
+    free(seg);
+    free(dec);
+    char *out = xstrdup(b.data);
+    buf_free(&b);
+    return out;
+}

@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <regex.h>
 
 #ifdef LIMER_TLS
@@ -17,6 +18,8 @@
 #endif
 
 #define LIMER_VERSION "0.1.0"
+
+typedef struct buf buf_t;
 
 /* ------------------------------------------------------------------ */
 /* Logging                                                             */
@@ -28,6 +31,10 @@ extern int log_level;
 void log_set_level_name(const char *name);
 void log_msg(int level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void log_access(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void log_access_to(int fd, const char *line, size_t len);
+/* open an access log destination: "stdout", "stderr" or a file path; returns fd or -1 */
+int  log_open_target(const char *spec, char *err, size_t errlen);
+void log_json_escape(buf_t *b, const char *s);
 
 #define LOGD(...) do { if (log_level <= LOG_DEBUG) log_msg(LOG_DEBUG, __VA_ARGS__); } while (0)
 #define LOGI(...) do { if (log_level <= LOG_INFO)  log_msg(LOG_INFO,  __VA_ARGS__); } while (0)
@@ -59,17 +66,21 @@ void sockaddr_to_str(const struct sockaddr *sa, char *out, size_t outlen, int wi
 int url_decode(const char *in, size_t inlen, char *out, size_t outlen);
 int is_numeric(const char *s, double *out);
 int glob_match(const char *pattern, const char *s);   /* '*' matches any run of chars */
+int is_ip_literal(const char *s);
+size_t base64_encode(const unsigned char *in, size_t n, char *out, int url);  /* out needs 4*(n/3+1)+1 */
+int    base64_decode(const char *in, size_t n, unsigned char *out, size_t outcap);  /* -1 on error */
+char  *path_clean(const char *path);   /* collapse //, ., ..; result starts with '/'; NULL if escaping */
 
 /* ------------------------------------------------------------------ */
 /* Growable buffer                                                     */
 /* ------------------------------------------------------------------ */
 
-typedef struct buf {
+struct buf {
     char *data;
     size_t off;   /* bytes already consumed from the front */
     size_t len;   /* bytes written so far                   */
     size_t cap;
-} buf_t;
+};
 
 void   buf_init(buf_t *b);
 void   buf_free(buf_t *b);
@@ -109,7 +120,9 @@ typedef struct http_req {
     char   *raw;        /* owned copy of the request head */
     size_t  raw_len;
     char   *method;
-    char   *uri;        /* request-target as sent */
+    char   *uri;        /* request-target as sent (or rewritten) */
+    char   *uri_owned;  /* storage for a rewritten uri */
+    char   *orig_path;  /* path before rewrites (NULL when unchanged) */
     char   *path;       /* owned, path part without query */
     char   *query;      /* owned, may be "" */
     int     minor;      /* HTTP/1.minor */
@@ -280,7 +293,34 @@ typedef struct pool {
     int   preserve_host;      /* pass Host header through (default on) */
 } pool_t;
 
-enum route_kind { ROUTE_PROXY = 0, ROUTE_RESPOND, ROUTE_REDIRECT };
+enum route_kind { ROUTE_PROXY = 0, ROUTE_RESPOND, ROUTE_REDIRECT, ROUTE_ERROR, ROUTE_ABORT, ROUTE_FILES };
+
+enum rewrite_kind { RW_PATH = 0, RW_STRIP_PREFIX, RW_STRIP_SUFFIX, RW_REPLACE, RW_URI };
+
+typedef struct rewrite {
+    int   kind;
+    char *a;        /* path / prefix / suffix / search */
+    char *b;        /* replacement */
+} rewrite_t;
+
+typedef struct auth_user {
+    char *name;
+    char *hash;     /* bcrypt ($2a$/$2b$/$2y$) or any crypt(3) hash */
+} auth_user_t;
+
+typedef struct basic_auth {
+    auth_user_t *users;
+    int   nusers;
+    char *realm;
+} basic_auth_t;
+
+typedef struct file_server {
+    char *root;
+    char **index;  int nindex;
+    int   browse;
+    char **try_files; int ntry;
+    int   hide_dotfiles;
+} file_server_t;
 
 typedef struct route {
     char     *name;
@@ -291,20 +331,37 @@ typedef struct route {
     int       resp_status;
     char     *resp_body;
     hdr_op_t *hdr_down; int n_hdr_down;
+    rewrite_t *rw; int nrw;
+    basic_auth_t *auth;
+    file_server_t *files;
 } route_t;
 
+enum tls_mode { TLS_NONE = 0, TLS_FILES, TLS_INTERNAL, TLS_AUTO };
+
 typedef struct server {
-    char  **addrs;
+    char  **addrs;       /* bind addresses ("host:port" / ":port"), one listener each */
     int     naddr;
+    char  **hosts;       /* hostnames this site answers for (glob allowed); none = catch-all */
+    int     nhosts;
+    int     port;        /* port of the first address, for redirects/logging */
     route_t **routes;
     int     nroutes;
     size_t  max_body;
     double  read_timeout;
     double  idle_timeout;
     int     access_log;
+    int     log_fd;      /* -1 none; 1 stdout; 2 stderr; else an opened file */
+    int     log_json;
     int     is_admin;
+    int     tls_mode;    /* enum tls_mode */
     char   *tls_cert;
     char   *tls_key;
+    hdr_op_t *hdr_down; int n_hdr_down;   /* `header` directive: all responses */
+    hdr_op_t *hdr_up;   int n_hdr_up;     /* `request_header`: all proxied requests */
+    basic_auth_t *auth;                   /* server-wide basic_auth */
+    char   *encode;      /* "gzip zstd br" or NULL */
+    int     encode_min;
+    int     redirect_https;   /* http listener that redirects to https (auto https) */
 #ifdef LIMER_TLS
     SSL_CTX *ssl_ctx;
 #endif
@@ -321,6 +378,13 @@ typedef struct config {
     char    *pidfile;
     int      log_level;
     double   grace;
+    int      http_port;         /* default 80  */
+    int      https_port;        /* default 443 */
+    char    *storage;           /* certificate / state directory */
+    char    *acme_ca;           /* ACME directory URL */
+    char    *acme_ca_root;      /* PEM bundle to trust for the ACME CA (testing) */
+    char    *acme_email;
+    int      acme_disabled;     /* auto_https off */
     int      refs;
 } config_t;
 
@@ -370,7 +434,37 @@ void proxy_request_shutdown(void);
 /* TLS                                                                 */
 /* ------------------------------------------------------------------ */
 
-int  tls_init_server(server_t *s, char *err, size_t errlen);
+/* Compression (encode.c) */
+typedef struct encoder encoder_t;
+encoder_t  *encoder_new(const char *name);                 /* "gzip", "zstd" or "br" */
+int         encoder_write(encoder_t *e, const void *in, size_t n, buf_t *out, int flush); /* 0 none, 1 sync, 2 finish */
+void        encoder_free(encoder_t *e);
+const char *encode_name(const encoder_t *e);
+const char *encode_choose(const char *server_list, const char *accept_encoding);
+int         encode_compressible(const char *content_type);
+int         encode_available(void);
+
+/* Static files (files.c) */
+const char *mime_type_for(const char *path);
+void        http_date(time_t t, char *out, size_t n);
+time_t      http_date_parse(const char *s);
+int         files_listing(const char *dir, const char *urlpath, int hide_dotfiles, buf_t *out);
+int         path_has_dotfile(const char *clean);
+
+/* ACME (acme.c) */
+int  acme_load_stored(config_t *cfg, server_t *s, char *err, size_t errlen);
+int  acme_manager_start(config_t *cfg);   /* fork the certificate manager if needed */
+void acme_manager_stop(void);
+int  acme_challenge_lookup(const config_t *cfg, const char *token, buf_t *out);
+
+int  tls_init_server(server_t *s, char *err, size_t errlen);   /* from files */
+int  tls_init_internal(server_t *s, char *err, size_t errlen); /* self-signed for its hosts */
+int  tls_load_pem(server_t *s, const char *cert, const char *key, char *err, size_t errlen);
 void tls_free_server(server_t *s);
+#ifdef LIMER_TLS
+void tls_set_sni_resolver(SSL_CTX *(*fn)(SSL *, const char *));
+#endif
+/* basic auth */
+int  auth_verify(const basic_auth_t *a, const char *authorization_header);
 
 #endif /* LIMER_H */

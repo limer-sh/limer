@@ -22,6 +22,9 @@
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <sys/un.h>
+#include <ctype.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifdef LIMER_TLS
@@ -102,9 +105,12 @@ static void ev_del(ev_t *e)
 
 typedef struct listener {
     ev_t ev;
-    server_t *srv;
     config_t *cfg;
     char *addr;
+    server_t **servers;     /* sites sharing this bind address */
+    int nservers;
+    server_t *default_srv;  /* catch-all site, or the first one */
+    int tls;
     double paused_until;    /* accept() backs off after EMFILE/ENFILE */
     struct listener *next;
 } listener_t;
@@ -193,6 +199,14 @@ typedef struct conn {
     int resp_committed;         /* some response bytes reached the socket */
     size_t resp_head_mark;      /* wbuf readable length before the response head */
     int pre_head_close;         /* close_after_write before the head was built */
+    encoder_t *enc;             /* response compressor, when active */
+    buf_t enc_out;              /* scratch for encoder output */
+    buf_t dechunk;              /* scratch for de-chunked upstream bodies */
+    int out_chunked;            /* we frame the body as chunked ourselves */
+    int body_sync;              /* flush the encoder after every piece (streaming) */
+    int file_fd;                /* static file being streamed, or -1 */
+    off_t file_off;
+    off_t file_remaining;
     char lb_why[128];
     int in_process;
     int dead;
@@ -476,6 +490,84 @@ static void hlist_write(hlist_t *h, buf_t *out)
 }
 
 /* ------------------------------------------------------------------ */
+/* Site selection                                                      */
+/* ------------------------------------------------------------------ */
+
+static int server_has_bind(const server_t *s, const char *bind)
+{
+    for (int i = 0; i < s->naddr; i++)
+        if (strcmp(s->addrs[i], bind) == 0)
+            return 1;
+    return 0;
+}
+
+/* Pick the site for a Host (without port) on a bind address: exact match,
+ * then wildcard match, then the catch-all site. NULL when nothing fits. */
+static server_t *select_server(config_t *cfg, const char *bind, const char *host)
+{
+    server_t *exact = NULL, *wild = NULL, *any = NULL;
+    for (int i = 0; i < cfg->nservers; i++) {
+        server_t *s = cfg->servers[i];
+        if (!server_has_bind(s, bind))
+            continue;
+        if (s->nhosts == 0) {
+            if (!any)
+                any = s;
+            continue;
+        }
+        if (!host)
+            continue;
+        for (int h = 0; h < s->nhosts; h++) {
+            if (strcasecmp(s->hosts[h], host) == 0) {
+                if (!exact)
+                    exact = s;
+            } else if (strchr(s->hosts[h], '*')) {
+                /* case-insensitive glob */
+                char lp[256], lh[256];
+                snprintf(lp, sizeof lp, "%s", s->hosts[h]);
+                snprintf(lh, sizeof lh, "%s", host);
+                for (char *q = lp; *q; q++) *q = (char)tolower((unsigned char)*q);
+                for (char *q = lh; *q; q++) *q = (char)tolower((unsigned char)*q);
+                if (glob_match(lp, lh) && !wild)
+                    wild = s;
+            }
+        }
+    }
+    return exact ? exact : wild ? wild : any;
+}
+
+/* Host header without the port */
+static void host_only(const char *hdr, char *out, size_t n)
+{
+    if (!hdr) {
+        out[0] = 0;
+        return;
+    }
+    snprintf(out, n, "%s", hdr);
+    char *rb = strchr(out, ']');
+    char *colon = strrchr(rb ? rb : out, ':');
+    if (colon)
+        *colon = 0;
+    size_t l = strlen(out);
+    while (l && out[l - 1] == '.')
+        out[--l] = 0;
+}
+
+#ifdef LIMER_TLS
+static SSL_CTX *sni_resolve(SSL *ssl, const char *name)
+{
+    conn_t *c = SSL_get_app_data(ssl);
+    if (!c)
+        return NULL;
+    server_t *s = select_server(c->cfg, c->listen_addr, name);
+    if (!s || !s->ssl_ctx)
+        return NULL;
+    c->srv = s;
+    return s->ssl_ctx;
+}
+#endif
+
+/* ------------------------------------------------------------------ */
 /* Client connections                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -523,6 +615,19 @@ static void conn_reset_request(conn_t *c)
     c->resp_committed = 0;
     c->resp_head_mark = 0;
     c->pre_head_close = 0;
+    if (c->enc) {
+        encoder_free(c->enc);
+        c->enc = NULL;
+    }
+    buf_reset(&c->enc_out);
+    buf_reset(&c->dechunk);
+    c->out_chunked = 0;
+    c->body_sync = 0;
+    if (c->file_fd >= 0) {
+        close(c->file_fd);
+        c->file_fd = -1;
+    }
+    c->file_off = c->file_remaining = 0;
     c->lb_why[0] = 0;
     c->got_request_bytes = 0;
 }
@@ -565,20 +670,58 @@ static void conn_update_mask(conn_t *c)
 
 static void conn_log_access(conn_t *c)
 {
-    if (!c->srv->access_log || !c->req.method)
+    server_t *srv = c->srv;
+    if (!srv || !srv->access_log || srv->log_fd < 0 || !c->req.method)
         return;
     double ms = (g_now - c->req_start) * 1000.0;
-    log_access("%s \"%s %s HTTP/1.%d\" %d %llu %.1fms route=%s upstream=%s%s%s",
-               c->peer_str, c->req.method, c->req.uri, c->req.minor, c->resp_status,
-               (unsigned long long)c->resp_bytes, ms,
-               c->route ? c->route->name : "-",
-               c->up ? c->up->hostport : "-",
-               c->lb_why[0] ? " via=" : "", c->lb_why);
+    buf_t b;
+    buf_init(&b);
+    const char *host = http_hdr_get(c->req.hdrs, c->req.nhdr, "Host");
+    if (srv->log_json) {
+        buf_printf(&b, "{\"ts\":%.3f,\"remote\":", now_wall());
+        log_json_escape(&b, c->peer_str);
+        buf_puts(&b, ",\"host\":");
+        log_json_escape(&b, host ? host : "");
+        buf_puts(&b, ",\"method\":");
+        log_json_escape(&b, c->req.method);
+        buf_puts(&b, ",\"uri\":");
+        log_json_escape(&b, c->req.uri);
+        buf_printf(&b, ",\"proto\":\"HTTP/1.%d\",\"tls\":%s,\"status\":%d,\"bytes\":%llu,\"duration_ms\":%.3f,\"route\":",
+                   c->req.minor, c->ctx.tls ? "true" : "false", c->resp_status, (unsigned long long)c->resp_bytes, ms);
+        log_json_escape(&b, c->route ? c->route->name : "");
+        buf_puts(&b, ",\"upstream\":");
+        log_json_escape(&b, c->up ? c->up->hostport : "");
+        if (c->lb_why[0]) {
+            buf_puts(&b, ",\"lb\":");
+            log_json_escape(&b, c->lb_why);
+        }
+        const char *ua = http_hdr_get(c->req.hdrs, c->req.nhdr, "User-Agent");
+        if (ua) {
+            buf_puts(&b, ",\"user_agent\":");
+            log_json_escape(&b, ua);
+        }
+        buf_puts(&b, "}");
+    } else {
+        buf_printf(&b, "%s %s \"%s %s HTTP/1.%d\" %d %llu %.1fms route=%s upstream=%s%s%s",
+                   c->peer_str, host ? host : "-", c->req.method, c->req.uri, c->req.minor, c->resp_status,
+                   (unsigned long long)c->resp_bytes, ms,
+                   c->route ? c->route->name : "-",
+                   c->up ? c->up->hostport : "-",
+                   c->lb_why[0] ? " via=" : "", c->lb_why);
+    }
+    log_access_to(srv->log_fd, b.data, b.len);
+    buf_free(&b);
 }
 
 static void conn_destroy(ev_t *e)
 {
     conn_t *c = (conn_t *)e;
+    if (c->enc)
+        encoder_free(c->enc);
+    buf_free(&c->enc_out);
+    buf_free(&c->dechunk);
+    if (c->file_fd >= 0)
+        close(c->file_fd);
     buf_free(&c->rbuf);
     buf_free(&c->wbuf);
     http_req_free(&c->req);
@@ -656,6 +799,72 @@ static void conn_flush(conn_t *c)
     conn_update_mask(c);
 }
 
+/* ---- response body pipeline: optional compression + our own chunking ---- */
+
+static void conn_body_write_raw(conn_t *c, const void *d, size_t n)
+{
+    if (n == 0)
+        return;
+    if (c->out_chunked) {
+        buf_printf(&c->wbuf, "%zx\r\n", n);
+        buf_append(&c->wbuf, d, n);
+        buf_puts(&c->wbuf, "\r\n");
+        c->resp_bytes += n;
+    } else {
+        buf_append(&c->wbuf, d, n);
+        c->resp_bytes += n;
+    }
+}
+
+/* flush: 0 buffer, 1 sync flush (streaming), 2 finish */
+static void conn_body_emit(conn_t *c, const void *d, size_t n, int flush)
+{
+    if (!c->enc) {
+        conn_body_write_raw(c, d, n);
+        return;
+    }
+    buf_reset(&c->enc_out);
+    if (encoder_write(c->enc, d, n, &c->enc_out, flush) < 0) {
+        LOGW("compression failed; closing connection");
+        c->close_after_write = 1;
+        return;
+    }
+    conn_body_write_raw(c, buf_rptr(&c->enc_out), buf_readable(&c->enc_out));
+    buf_reset(&c->enc_out);
+}
+
+static void conn_body_finish(conn_t *c)
+{
+    if (c->enc) {
+        conn_body_emit(c, "", 0, 2);
+        encoder_free(c->enc);
+        c->enc = NULL;
+    }
+    if (c->out_chunked) {
+        buf_puts(&c->wbuf, "0\r\n\r\n");
+        c->out_chunked = 0;
+    }
+}
+
+/* Decide whether (and how) to compress a response. Returns the encoding name. */
+static const char *conn_pick_encoding(conn_t *c, const char *content_type, int64_t length, int status, const char *existing_encoding)
+{
+    server_t *s = c->srv;
+    if (!s || !s->encode || !encode_available())
+        return NULL;
+    if (existing_encoding && *existing_encoding && strcasecmp(existing_encoding, "identity") != 0)
+        return NULL;
+    if (status < 200 || status == 204 || status == 206 || status == 304 || status >= 300)
+        return NULL;
+    if (c->req.method && strcmp(c->req.method, "HEAD") == 0)
+        return NULL;
+    if (!encode_compressible(content_type))
+        return NULL;
+    if (length >= 0 && length < s->encode_min)
+        return NULL;
+    return encode_choose(s->encode, http_hdr_get(c->req.hdrs, c->req.nhdr, "Accept-Encoding"));
+}
+
 static const char *content_type_for(const char *body)
 {
     if (!body || !*body)
@@ -675,12 +884,27 @@ static void conn_write_simple_response(conn_t *c, int status, const char *ctype,
     int keep = c->req.keep_alive && !c->close_after_write && !g_shutting_down && c->state != CS_CLOSING;
     hlist_t h = { 0 };
     char tmp[64];
+    buf_t packed;
+    buf_init(&packed);
+    const char *encname = conn_pick_encoding(c, ctype, (int64_t)blen, status, NULL);
+    if (encname) {
+        encoder_t *e = encoder_new(encname);
+        if (e && encoder_write(e, body, blen, &packed, 2) == 0) {
+            body = buf_rptr(&packed);
+            blen = buf_readable(&packed);
+            hlist_add(&h, "Content-Encoding", encname);
+            hlist_add(&h, "Vary", "Accept-Encoding");
+        }
+        encoder_free(e);
+    }
     if (ctype)
         hlist_add(&h, "Content-Type", ctype);
     snprintf(tmp, sizeof tmp, "%zu", blen);
     hlist_add(&h, "Content-Length", tmp);
     hlist_add(&h, "Connection", keep ? "keep-alive" : "close");
     hlist_add(&h, "Server", "limer");
+    if (c->srv && c->srv->n_hdr_down)
+        hlist_apply_ops(&h, c->srv->hdr_down, c->srv->n_hdr_down, c);
     if (ops)
         hlist_apply_ops(&h, ops, nops, c);
     buf_printf(&c->wbuf, "HTTP/1.1 %d %s\r\n", status, http_status_reason(status));
@@ -692,6 +916,7 @@ static void conn_write_simple_response(conn_t *c, int status, const char *ctype,
     if (!is_head && blen)
         buf_append(&c->wbuf, body, blen);
     hlist_free(&h);
+    buf_free(&packed);
     c->resp_status = status;
     c->resp_bytes = is_head ? 0 : blen;
     c->resp_head_sent = 1;
@@ -1012,6 +1237,8 @@ static void build_upstream_request(conn_t *c, uconn_t *uc)
     if (orig_host)
         hlist_add(&h, "X-Forwarded-Host", orig_host);
     hlist_add(&h, "X-Real-IP", c->peer_ip);
+    if (c->srv->n_hdr_up)
+        hlist_apply_ops(&h, c->srv->hdr_up, c->srv->n_hdr_up, c);
     hlist_apply_ops(&h, p->hdr_up, p->n_hdr_up, c);
     hlist_write(&h, out);
     hlist_free(&h);
@@ -1095,14 +1322,33 @@ static void build_client_response_head(conn_t *c, uconn_t *uc)
         c->resp_mode = RM_CLOSE;
     }
 
-    int keep = c->req.keep_alive && !g_shutting_down && !tunnel &&
-               c->resp_mode != RM_CLOSE && c->resp_mode != RM_DECHUNK;
-    if (!keep)
-        c->close_after_write = 1;
     /* A bodiless response that still advertises a body (e.g. a 204 with
      * Content-Length) would leave stray bytes on the connection: don't pool it. */
     c->upstream_reusable = r->keep_alive && c->resp_mode != RM_CLOSE &&
                            !(c->resp_mode == RM_NONE && !is_head && (r->content_length > 0 || r->chunked));
+
+    /* compression: the body is re-framed as chunked (HTTP/1.1) or close-delimited */
+    const char *encname = NULL;
+    if (c->resp_mode != RM_NONE)
+        encname = conn_pick_encoding(c, http_hdr_get(r->hdrs, r->nhdr, "Content-Type"),
+                                     c->resp_mode == RM_LENGTH ? r->content_length : -1, r->status,
+                                     http_hdr_get(r->hdrs, r->nhdr, "Content-Encoding"));
+    if (encname && (c->enc = encoder_new(encname)) != NULL) {
+        c->body_sync = c->resp_mode != RM_LENGTH;
+        if (c->resp_mode == RM_CHUNKED)
+            c->resp_mode = RM_DECHUNK;
+        if (c->req.minor >= 1)
+            c->out_chunked = 1;
+    }
+    int keep = c->req.keep_alive && !g_shutting_down && !tunnel;
+    if (c->enc) {
+        if (!c->out_chunked)
+            keep = 0;
+    } else if (c->resp_mode == RM_CLOSE || c->resp_mode == RM_DECHUNK) {
+        keep = 0;
+    }
+    if (!keep)
+        c->close_after_write = 1;
 
     hlist_t h = { 0 };
     const char *conn_hdr = http_hdr_get(r->hdrs, r->nhdr, "Connection");
@@ -1123,21 +1369,31 @@ static void build_client_response_head(conn_t *c, uconn_t *uc)
         hlist_add(&h, n, r->hdrs[i].value);
     }
     char tmp[32];
-    switch (c->resp_mode) {
-    case RM_LENGTH:
-        snprintf(tmp, sizeof tmp, "%lld", (long long)r->content_length);
-        hlist_add(&h, "Content-Length", tmp);
-        break;
-    case RM_CHUNKED:
-        hlist_add(&h, "Transfer-Encoding", "chunked");
-        break;
-    default:
-        break;
+    if (c->enc) {
+        hlist_del(&h, "Content-Length");
+        hlist_add(&h, "Content-Encoding", encode_name(c->enc));
+        hlist_add(&h, "Vary", "Accept-Encoding");
+        if (c->out_chunked)
+            hlist_add(&h, "Transfer-Encoding", "chunked");
+    } else {
+        switch (c->resp_mode) {
+        case RM_LENGTH:
+            snprintf(tmp, sizeof tmp, "%lld", (long long)r->content_length);
+            hlist_add(&h, "Content-Length", tmp);
+            break;
+        case RM_CHUNKED:
+            hlist_add(&h, "Transfer-Encoding", "chunked");
+            break;
+        default:
+            break;
+        }
     }
     if (tunnel)
         hlist_add(&h, "Connection", "Upgrade");
     else
         hlist_add(&h, "Connection", keep ? "keep-alive" : "close");
+    if (c->srv->n_hdr_down)
+        hlist_apply_ops(&h, c->srv->hdr_down, c->srv->n_hdr_down, c);
     hlist_apply_ops(&h, p->hdr_down, p->n_hdr_down, c);
 
     buf_printf(&c->wbuf, "HTTP/1.1 %d %s\r\n", r->status, *r->reason ? r->reason : http_status_reason(r->status));
@@ -1154,6 +1410,7 @@ static void conn_response_done(conn_t *c)
     uconn_t *uc = c->uc;
     upstream_t *u = c->up;
     pool_t *p = c->pool;
+    conn_body_finish(c);
     if (u) {
         if (p->unhealthy_5xx && c->resp_status >= 500 && c->resp_status <= 599)
             upstream_report_failure(p, u, g_now, "5xx response");
@@ -1210,11 +1467,10 @@ static void uconn_forward_body(uconn_t *uc)
         size_t take = avail;
         if ((int64_t)take > c->resp_remaining)
             take = (size_t)c->resp_remaining;
-        buf_append(&c->wbuf, data, take);
-        buf_consume(&uc->rbuf, take);
-        c->resp_bytes += take;
         c->resp_remaining -= (int64_t)take;
         done = c->resp_remaining == 0;
+        conn_body_emit(c, data, take, c->body_sync && !done ? 1 : 0);
+        buf_consume(&uc->rbuf, take);
         break;
     }
     case RM_CHUNKED: {
@@ -1231,20 +1487,20 @@ static void uconn_forward_body(uconn_t *uc)
     }
     case RM_DECHUNK: {
         size_t consumed = 0;
-        size_t before = buf_readable(&c->wbuf);
-        if (http_chunk_scan(&c->resp_cs, data, avail, &consumed, &c->wbuf) < 0) {
+        buf_reset(&c->dechunk);
+        if (http_chunk_scan(&c->resp_cs, data, avail, &consumed, &c->dechunk) < 0) {
             uconn_fail(uc, "malformed chunked response", 502, 0);
             return;
         }
-        c->resp_bytes += buf_readable(&c->wbuf) - before;
         buf_consume(&uc->rbuf, consumed);
         done = c->resp_cs.done;
+        conn_body_emit(c, buf_rptr(&c->dechunk), buf_readable(&c->dechunk), c->body_sync && !done ? 1 : 0);
+        buf_reset(&c->dechunk);
         break;
     }
     case RM_CLOSE:
-        buf_append(&c->wbuf, data, avail);
+        conn_body_emit(c, data, avail, c->body_sync ? 1 : 0);
         buf_consume(&uc->rbuf, avail);
-        c->resp_bytes += avail;
         break;
     }
     conn_flush(c);
@@ -1421,6 +1677,111 @@ static void uconn_cb(ev_t *e, uint32_t events)
 /* Request dispatch                                                    */
 /* ------------------------------------------------------------------ */
 
+/* Apply a route's rewrites to the request path/query/uri. */
+static void apply_rewrites(conn_t *c, const route_t *r)
+{
+    http_req_t *q = &c->req;
+    for (int i = 0; i < r->nrw; i++) {
+        const rewrite_t *rw = &r->rw[i];
+        char *npath = NULL, *nquery = NULL;
+        switch (rw->kind) {
+        case RW_URI: {
+            buf_t b;
+            buf_init(&b);
+            expand_placeholders(rw->a, c, &b);
+            buf_append(&b, "", 1);
+            const char *qm = strchr(b.data, '?');
+            if (qm) {
+                npath = xstrndup(b.data, (size_t)(qm - b.data));
+                nquery = xstrdup(qm + 1);
+            } else {
+                npath = xstrdup(b.data);
+            }
+            buf_free(&b);
+            break;
+        }
+        case RW_STRIP_PREFIX:
+            if (str_has_prefix(q->path, rw->a)) {
+                const char *rest = q->path + strlen(rw->a);
+                npath = *rest == '/' ? xstrdup(rest) : *rest ? NULL : xstrdup("/");
+                if (!npath && *rest) {
+                    /* prefix matched mid-segment: only strip when it ends on a boundary */
+                    npath = NULL;
+                }
+            }
+            break;
+        case RW_STRIP_SUFFIX: {
+            size_t pl = strlen(q->path), sl = strlen(rw->a);
+            if (pl >= sl && strcmp(q->path + pl - sl, rw->a) == 0)
+                npath = pl == sl ? xstrdup("/") : xstrndup(q->path, pl - sl);
+            break;
+        }
+        case RW_REPLACE: {
+            size_t sl = strlen(rw->a);
+            if (!sl)
+                break;
+            buf_t b;
+            buf_init(&b);
+            const char *p = q->path;
+            int changed = 0;
+            while (*p) {
+                if (strncmp(p, rw->a, sl) == 0) {
+                    buf_puts(&b, rw->b ? rw->b : "");
+                    p += sl;
+                    changed = 1;
+                } else {
+                    buf_append(&b, p++, 1);
+                }
+            }
+            buf_append(&b, "", 1);
+            if (changed)
+                npath = xstrdup(b.data);
+            buf_free(&b);
+            break;
+        }
+        }
+        if (!npath)
+            continue;
+        if (!*npath) {
+            free(npath);
+            npath = xstrdup("/");
+        }
+        if (!q->orig_path)
+            q->orig_path = xstrdup(q->path);
+        free(q->path);
+        q->path = npath;
+        if (nquery) {
+            free(q->query);
+            q->query = nquery;
+        }
+        buf_t u;
+        buf_init(&u);
+        buf_puts(&u, q->path);
+        if (*q->query) {
+            buf_puts(&u, "?");
+            buf_puts(&u, q->query);
+        }
+        buf_append(&u, "", 1);
+        free(q->uri_owned);
+        q->uri_owned = xstrdup(u.data);
+        q->uri = q->uri_owned;
+        buf_free(&u);
+    }
+}
+
+static void conn_respond_unauthorized(conn_t *c, const basic_auth_t *a)
+{
+    char extra[512];
+    snprintf(extra, sizeof extra, "WWW-Authenticate: Basic realm=\"%s\", charset=\"UTF-8\"\r\n", a->realm);
+    const char *body = "401 Unauthorized\n";
+    conn_write_simple_response(c, 401, "text/plain; charset=utf-8", body, strlen(body), NULL, 0, extra);
+    c->state = CS_LOCAL;
+    conn_next_request(c);
+}
+
+static void conn_serve_files(conn_t *c, route_t *r);
+static void file_pump(conn_t *c);
+
 static void conn_dispatch(conn_t *c)
 {
     http_req_t *r = &c->req;
@@ -1438,6 +1799,48 @@ static void conn_dispatch(conn_t *c)
         admin_handle(c);
         return;
     }
+
+    /* ACME http-01 challenges are answered on plain-http listeners */
+    if (!c->ctx.tls && str_has_prefix(r->path, "/.well-known/acme-challenge/")) {
+        buf_t ka;
+        buf_init(&ka);
+        if (acme_challenge_lookup(c->cfg, r->path + 28, &ka)) {
+            conn_write_simple_response(c, 200, "text/plain", buf_rptr(&ka), buf_readable(&ka), NULL, 0, NULL);
+            buf_free(&ka);
+            c->state = CS_LOCAL;
+            conn_next_request(c);
+            return;
+        }
+        buf_free(&ka);
+    }
+
+    /* implicit http -> https redirect site */
+    if (c->srv->redirect_https) {
+        if (c->cfg->acme_disabled == 2) {
+            conn_send_error(c, 404, "this site is served over https", 0);
+            return;
+        }
+        char host[256];
+        host_only(http_hdr_get(r->hdrs, r->nhdr, "Host"), host, sizeof host);
+        if (!host[0])
+            snprintf(host, sizeof host, "%s", c->srv->nhosts ? c->srv->hosts[0] : "localhost");
+        char loc[2048];
+        if (c->srv->port == 443)
+            snprintf(loc, sizeof loc, "Location: https://%s%s\r\n", host, r->uri);
+        else
+            snprintf(loc, sizeof loc, "Location: https://%s:%d%s\r\n", host, c->srv->port, r->uri);
+        c->route = c->srv->routes[0];
+        conn_write_simple_response(c, 308, "text/plain; charset=utf-8", "", 0, NULL, 0, loc);
+        c->state = CS_LOCAL;
+        conn_next_request(c);
+        return;
+    }
+
+    if (c->srv->auth && !auth_verify(c->srv->auth, http_hdr_get(r->hdrs, r->nhdr, "Authorization"))) {
+        conn_respond_unauthorized(c, c->srv->auth);
+        return;
+    }
+
     route_t *route = NULL;
     for (int i = 0; i < c->srv->nroutes; i++)
         if (route_matches(c->srv->routes[i], &c->ctx)) {
@@ -1449,15 +1852,42 @@ static void conn_dispatch(conn_t *c)
         conn_send_error(c, 404, "no route matched the request", 0);
         return;
     }
+    if (route->auth && !auth_verify(route->auth, http_hdr_get(r->hdrs, r->nhdr, "Authorization"))) {
+        conn_respond_unauthorized(c, route->auth);
+        return;
+    }
+    if (route->nrw)
+        apply_rewrites(c, route);
+
     switch (route->kind) {
     case ROUTE_RESPOND: {
         const char *body = route->resp_body ? route->resp_body : "";
-        conn_write_simple_response(c, route->resp_status, content_type_for(body), body, strlen(body),
+        buf_t eb;
+        buf_init(&eb);
+        expand_placeholders(body, c, &eb);
+        buf_append(&eb, "", 1);
+        conn_write_simple_response(c, route->resp_status, content_type_for(eb.data), eb.data, eb.len - 1,
+                                   route->hdr_down, route->n_hdr_down, NULL);
+        buf_free(&eb);
+        c->state = CS_LOCAL;
+        conn_next_request(c);
+        return;
+    }
+    case ROUTE_ERROR: {
+        char body[1024];
+        int n = snprintf(body, sizeof body, "%d %s\n%s%s", route->resp_status, http_status_reason(route->resp_status),
+                         route->resp_body ? route->resp_body : "", route->resp_body ? "\n" : "");
+        conn_write_simple_response(c, route->resp_status, "text/plain; charset=utf-8", body, (size_t)(n < 0 ? 0 : n),
                                    route->hdr_down, route->n_hdr_down, NULL);
         c->state = CS_LOCAL;
         conn_next_request(c);
         return;
     }
+    case ROUTE_ABORT:
+        c->resp_status = 0;
+        conn_log_access(c);
+        conn_close(c);
+        return;
     case ROUTE_REDIRECT: {
         buf_t loc;
         buf_init(&loc);
@@ -1472,6 +1902,9 @@ static void conn_dispatch(conn_t *c)
         conn_next_request(c);
         return;
     }
+    case ROUTE_FILES:
+        conn_serve_files(c, route);
+        return;
     case ROUTE_PROXY:
     default:
         c->pool = route->pool;
@@ -1527,6 +1960,21 @@ static void conn_process(conn_t *c)
                 return;
             }
             buf_consume(&c->rbuf, consumed);
+            {
+                char host[256];
+                host_only(http_hdr_get(c->req.hdrs, c->req.nhdr, "Host"), host, sizeof host);
+                server_t *srv = select_server(c->cfg, c->listen_addr, host[0] ? host : NULL);
+                if (!srv) {
+                    c->in_process = 0;
+                    conn_send_error(c, 404, "no site configured for this host", 0);
+                    return;
+                }
+#ifdef LIMER_TLS
+                if (c->ssl && srv->tls_mode == TLS_NONE)
+                    srv = c->srv; /* never jump from a TLS site to a plain one */
+#endif
+                c->srv = srv;
+            }
             if (c->req.content_length > (int64_t)c->srv->max_body) {
                 c->in_process = 0;
                 conn_send_error(c, 413, "request body exceeds max_body", 1);
@@ -1710,6 +2158,11 @@ static void conn_cb(ev_t *e, uint32_t events)
         conn_flush(c);
         if (c->dead)
             return;
+        if (c->file_fd >= 0 && buf_readable(&c->wbuf) < WBUF_LOW_WATER) {
+            file_pump(c);
+            if (c->dead)
+                return;
+        }
     }
     if (events & (EPOLLIN | EPOLLHUP | EPOLLRDHUP)) {
         if (c->state == CS_LOCAL || c->state == CS_CLOSING) {
@@ -1767,7 +2220,7 @@ static void listener_cb(ev_t *e, uint32_t events)
         c->ev.fd = fd;
         c->ev.cb = conn_cb;
         c->ev.destroy = conn_destroy;
-        c->srv = l->srv;
+        c->srv = l->default_srv;
         c->cfg = l->cfg;
         config_ref(c->cfg);
         snprintf(c->listen_addr, sizeof c->listen_addr, "%s", l->addr);
@@ -1777,15 +2230,19 @@ static void listener_cb(ev_t *e, uint32_t events)
         sockaddr_to_str((struct sockaddr *)&peer, c->peer_str, sizeof c->peer_str, 1);
         buf_init(&c->rbuf);
         buf_init(&c->wbuf);
+        buf_init(&c->enc_out);
+        buf_init(&c->dechunk);
+        c->file_fd = -1;
         http_req_init(&c->req);
         c->state = CS_HEAD;
         c->deadline = g_now + c->srv->read_timeout;
         conn_list_add(c);
         g_stats.active_conns++;
 #ifdef LIMER_TLS
-        if (l->srv->ssl_ctx) {
-            c->ssl = SSL_new(l->srv->ssl_ctx);
+        if (l->tls && l->default_srv->ssl_ctx) {
+            c->ssl = SSL_new(l->default_srv->ssl_ctx);
             SSL_set_fd(c->ssl, fd);
+            SSL_set_app_data(c->ssl, c);
             SSL_set_accept_state(c->ssl);
             c->tls_handshaking = 1;
             ev_add(&c->ev, EPOLLIN);
@@ -1872,6 +2329,7 @@ static void listener_destroy(ev_t *e)
     listener_t *l = (listener_t *)e;
     config_unref(l->cfg);
     free(l->addr);
+    free(l->servers);
     free(l);
 }
 
@@ -1880,7 +2338,8 @@ static void listener_free(listener_t *l)
     ev_retire(&l->ev);
 }
 
-/* Create listeners for cfg, reusing sockets from the previous config. */
+/* Create listeners for cfg, reusing sockets from the previous config.
+ * Several sites may share one bind address; they are told apart by Host/SNI. */
 static int apply_listeners(config_t *cfg, char *err, size_t errlen)
 {
     listener_t *fresh = NULL;
@@ -1889,38 +2348,55 @@ static int apply_listeners(config_t *cfg, char *err, size_t errlen)
         server_t *s = cfg->servers[i];
         for (int a = 0; a < s->naddr; a++) {
             const char *addr = s->addrs[a];
-            /* duplicate address within the new config? */
+            listener_t *l = NULL;
             for (listener_t *f = fresh; f; f = f->next)
-                if (strcmp(f->addr, addr) == 0) {
-                    snprintf(err, errlen, "address %s is used by more than one server block", addr);
-                    goto fail;
+                if (strcmp(f->addr, addr) == 0)
+                    l = f;
+            if (!l) {
+                listener_t *old = find_listener(addr);
+                int fd;
+                if (old) {
+                    fd = dup(old->ev.fd);
+                    if (fd < 0) {
+                        snprintf(err, errlen, "dup: %s", strerror(errno));
+                        goto fail;
+                    }
+                    set_cloexec(fd);
+                } else {
+                    fd = bind_listener(addr, err, errlen);
+                    if (fd < 0)
+                        goto fail;
                 }
-            listener_t *old = find_listener(addr);
-            int fd;
-            if (old) {
-                fd = dup(old->ev.fd);
-                if (fd < 0) {
-                    snprintf(err, errlen, "dup: %s", strerror(errno));
-                    goto fail;
-                }
-                set_cloexec(fd);
-            } else {
-                fd = bind_listener(addr, err, errlen);
-                if (fd < 0)
-                    goto fail;
+                l = xcalloc(1, sizeof *l);
+                l->ev.fd = fd;
+                l->ev.cb = listener_cb;
+                l->ev.destroy = listener_destroy;
+                l->cfg = cfg;
+                config_ref(cfg);
+                l->addr = xstrdup(addr);
+                l->tls = s->tls_mode != TLS_NONE;
+                *tail = l;
+                tail = &l->next;
             }
-            listener_t *l = xcalloc(1, sizeof *l);
-            l->ev.fd = fd;
-            l->ev.cb = listener_cb;
-            l->ev.destroy = listener_destroy;
-            l->srv = s;
-            l->cfg = cfg;
-            config_ref(cfg);
-            l->addr = xstrdup(addr);
-            *tail = l;
-            tail = &l->next;
+            if ((s->tls_mode != TLS_NONE) != l->tls) {
+                snprintf(err, errlen, "address %s is used by both an http and an https site", addr);
+                goto fail;
+            }
+            if (s->nhosts == 0) {
+                for (int k = 0; k < l->nservers; k++)
+                    if (l->servers[k]->nhosts == 0) {
+                        snprintf(err, errlen, "address %s is used by more than one site without a hostname", addr);
+                        goto fail;
+                    }
+                l->default_srv = s;
+            }
+            l->servers = xrealloc(l->servers, sizeof(server_t *) * (size_t)(l->nservers + 1));
+            l->servers[l->nservers++] = s;
         }
     }
+    for (listener_t *l = fresh; l; l = l->next)
+        if (!l->default_srv)
+            l->default_srv = l->servers[0];
     /* swap in */
     while (g_listeners) {
         listener_t *l = g_listeners;
@@ -1933,7 +2409,24 @@ static int apply_listeners(config_t *cfg, char *err, size_t errlen)
             snprintf(err, errlen, "epoll_ctl: %s", strerror(errno));
             return -1;
         }
-        LOGI("listening on %s%s", l->addr, l->srv->is_admin ? " (admin)" : (l->srv->tls_cert ? " (tls)" : ""));
+        buf_t names;
+        buf_init(&names);
+        for (int k = 0; k < l->nservers; k++) {
+            server_t *s = l->servers[k];
+            if (k)
+                buf_puts(&names, ", ");
+            if (s->is_admin)
+                buf_puts(&names, "admin");
+            else if (s->nhosts)
+                buf_printf(&names, "%s%s", s->hosts[0], s->nhosts > 1 ? "+" : "");
+            else
+                buf_puts(&names, "*");
+            if (s->redirect_https)
+                buf_puts(&names, " (redirect)");
+        }
+        buf_append(&names, "", 1);
+        LOGI("listening on %s%s: %s", l->addr, l->tls ? " (tls)" : "", names.data);
+        buf_free(&names);
     }
     return 0;
 fail:
@@ -2100,6 +2593,294 @@ static void health_tick(void)
             }
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Static files                                                        */
+/* ------------------------------------------------------------------ */
+
+#define FILE_CHUNK (64 * 1024)
+
+static void file_pump(conn_t *c)
+{
+    for (;;) {
+        while (c->file_remaining > 0 && buf_readable(&c->wbuf) < WBUF_HIGH_WATER) {
+            char tmp[FILE_CHUNK];
+            size_t want = c->file_remaining < (off_t)sizeof tmp ? (size_t)c->file_remaining : sizeof tmp;
+            ssize_t r = pread(c->file_fd, tmp, want, c->file_off);
+            if (r <= 0) {
+                LOGW("file read failed: %s", r < 0 ? strerror(errno) : "short file");
+                c->close_after_write = 1;
+                c->file_remaining = 0;
+                break;
+            }
+            c->file_off += r;
+            c->file_remaining -= r;
+            conn_body_emit(c, tmp, (size_t)r, 0);
+        }
+        if (c->file_remaining == 0) {
+            conn_body_finish(c);
+            close(c->file_fd);
+            c->file_fd = -1;
+            conn_next_request(c);
+            return;
+        }
+        conn_flush(c);
+        if (c->dead)
+            return;
+        if (buf_readable(&c->wbuf) > 0) {
+            conn_update_mask(c); /* resume on EPOLLOUT */
+            return;
+        }
+    }
+}
+
+/* Parse a single-range "bytes=a-b" header. Returns 0 full, 1 partial, -1 unsatisfiable, 2 ignore. */
+static int parse_range(const char *v, off_t size, off_t *start, off_t *end)
+{
+    if (!v || strncasecmp(v, "bytes=", 6) != 0)
+        return 0;
+    v += 6;
+    if (strchr(v, ','))
+        return 2; /* multiple ranges are served in full */
+    char *dash = strchr(v, '-');
+    if (!dash)
+        return -1;
+    if (dash == v) {
+        /* suffix: last N bytes */
+        long long n = atoll(dash + 1);
+        if (n <= 0)
+            return -1;
+        if (n > size)
+            n = size;
+        *start = size - n;
+        *end = size - 1;
+    } else {
+        char *e1;
+        long long a = strtoll(v, &e1, 10);
+        if (e1 != dash || a < 0)
+            return -1;
+        long long b = size - 1;
+        if (dash[1]) {
+            char *e2;
+            b = strtoll(dash + 1, &e2, 10);
+            if (*e2 || b < a)
+                return -1;
+            if (b > size - 1)
+                b = size - 1;
+        }
+        if (a > size - 1)
+            return -1;
+        *start = a;
+        *end = b;
+    }
+    return 1;
+}
+
+static void conn_serve_files(conn_t *c, route_t *r)
+{
+    file_server_t *fs = r->files;
+    http_req_t *q = &c->req;
+    int is_head = strcmp(q->method, "HEAD") == 0;
+    if (!is_head && strcmp(q->method, "GET") != 0) {
+        conn_write_simple_response(c, 405, "text/plain; charset=utf-8", "405 Method Not Allowed\n", 23, NULL, 0, "Allow: GET, HEAD\r\n");
+        c->state = CS_LOCAL;
+        conn_next_request(c);
+        return;
+    }
+    char *clean = path_clean(q->path);
+    if (!clean || (fs->hide_dotfiles && path_has_dotfile(clean))) {
+        free(clean);
+        conn_send_error(c, 404, "not found", 0);
+        return;
+    }
+    /* try_files: first existing candidate wins */
+    if (fs->ntry) {
+        for (int i = 0; i < fs->ntry; i++) {
+            buf_t cand;
+            buf_init(&cand);
+            expand_placeholders(fs->try_files[i], c, &cand);
+            buf_append(&cand, "", 1);
+            char *cc = path_clean(cand.data);
+            buf_free(&cand);
+            if (!cc)
+                continue;
+            char full[4096];
+            snprintf(full, sizeof full, "%s%s", fs->root, cc);
+            struct stat st;
+            if (stat(full, &st) == 0 && (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
+                free(clean);
+                clean = cc;
+                break;
+            }
+            free(cc);
+        }
+    }
+    char full[4096];
+    snprintf(full, sizeof full, "%s%s", fs->root, clean);
+    struct stat st;
+    if (stat(full, &st) < 0) {
+        free(clean);
+        conn_send_error(c, errno == EACCES ? 403 : 404, errno == EACCES ? "forbidden" : "not found", 0);
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        size_t cl = strlen(clean);
+        if (clean[cl - 1] != '/') {
+            char loc[4096];
+            const char *shown = q->orig_path ? q->orig_path : q->path;
+            snprintf(loc, sizeof loc, "Location: %s/%s%s\r\n", shown, *q->query ? "?" : "", q->query);
+            free(clean);
+            conn_write_simple_response(c, 301, "text/plain; charset=utf-8", "", 0, r->hdr_down, r->n_hdr_down, loc);
+            c->state = CS_LOCAL;
+            conn_next_request(c);
+            return;
+        }
+        int found = 0;
+        for (int i = 0; i < fs->nindex; i++) {
+            char cand[4096];
+            snprintf(cand, sizeof cand, "%s%s", full, fs->index[i]);
+            struct stat ist;
+            if (stat(cand, &ist) == 0 && S_ISREG(ist.st_mode)) {
+                snprintf(full, sizeof full, "%s", cand);
+                st = ist;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            if (!fs->browse) {
+                free(clean);
+                conn_send_error(c, 404, "not found", 0);
+                return;
+            }
+            buf_t html;
+            buf_init(&html);
+            if (files_listing(full, clean, fs->hide_dotfiles, &html) < 0) {
+                buf_free(&html);
+                free(clean);
+                conn_send_error(c, 403, "forbidden", 0);
+                return;
+            }
+            conn_write_simple_response(c, 200, "text/html; charset=utf-8", html.data ? html.data : "", html.len, r->hdr_down, r->n_hdr_down, NULL);
+            buf_free(&html);
+            free(clean);
+            c->state = CS_LOCAL;
+            conn_next_request(c);
+            return;
+        }
+    }
+    free(clean);
+    if (!S_ISREG(st.st_mode)) {
+        conn_send_error(c, 404, "not found", 0);
+        return;
+    }
+    int fd = open(full, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        conn_send_error(c, errno == EACCES ? 403 : 404, errno == EACCES ? "forbidden" : "not found", 0);
+        return;
+    }
+    char etag[64], lastmod[64];
+    snprintf(etag, sizeof etag, "\"%llx-%llx\"", (unsigned long long)st.st_mtime, (unsigned long long)st.st_size);
+    http_date(st.st_mtime, lastmod, sizeof lastmod);
+
+    /* conditional requests */
+    const char *inm = http_hdr_get(q->hdrs, q->nhdr, "If-None-Match");
+    const char *ims = http_hdr_get(q->hdrs, q->nhdr, "If-Modified-Since");
+    int not_modified = 0;
+    if (inm) {
+        not_modified = strstr(inm, etag) != NULL || strcmp(inm, "*") == 0;
+    } else if (ims) {
+        time_t t = http_date_parse(ims);
+        if (t != (time_t)-1 && st.st_mtime <= t)
+            not_modified = 1;
+    }
+    const char *ctype = mime_type_for(full);
+    int status = 200;
+    off_t start = 0, end = st.st_size - 1;
+    char extra[512] = "";
+    if (not_modified) {
+        close(fd);
+        snprintf(extra, sizeof extra, "ETag: %s\r\nLast-Modified: %s\r\n", etag, lastmod);
+        conn_write_simple_response(c, 304, NULL, "", 0, r->hdr_down, r->n_hdr_down, extra);
+        c->state = CS_LOCAL;
+        conn_next_request(c);
+        return;
+    }
+    const char *range = http_hdr_get(q->hdrs, q->nhdr, "Range");
+    const char *ifrange = http_hdr_get(q->hdrs, q->nhdr, "If-Range");
+    if (range && ifrange && strcmp(ifrange, etag) != 0)
+        range = NULL;
+    if (range && st.st_size > 0) {
+        int rr = parse_range(range, st.st_size, &start, &end);
+        if (rr < 0) {
+            close(fd);
+            snprintf(extra, sizeof extra, "Content-Range: bytes */%lld\r\n", (long long)st.st_size);
+            conn_write_simple_response(c, 416, "text/plain; charset=utf-8", "416 Range Not Satisfiable\n", 26, r->hdr_down, r->n_hdr_down, extra);
+            c->state = CS_LOCAL;
+            conn_next_request(c);
+            return;
+        }
+        if (rr == 1)
+            status = 206;
+    }
+    off_t length = end - start + 1;
+    if (st.st_size == 0)
+        length = 0;
+
+    hlist_t h = { 0 };
+    char tmp[128];
+    hlist_add(&h, "Content-Type", ctype);
+    hlist_add(&h, "Accept-Ranges", "bytes");
+    hlist_add(&h, "ETag", etag);
+    hlist_add(&h, "Last-Modified", lastmod);
+    const char *encname = status == 200 ? conn_pick_encoding(c, ctype, (int64_t)length, 200, NULL) : NULL;
+    if (encname && !is_head && (c->enc = encoder_new(encname)) != NULL) {
+        hlist_add(&h, "Content-Encoding", encname);
+        hlist_add(&h, "Vary", "Accept-Encoding");
+        if (c->req.minor >= 1) {
+            c->out_chunked = 1;
+            hlist_add(&h, "Transfer-Encoding", "chunked");
+        } else {
+            c->close_after_write = 1;
+        }
+    } else {
+        snprintf(tmp, sizeof tmp, "%lld", (long long)length);
+        hlist_add(&h, "Content-Length", tmp);
+        if (status == 206) {
+            snprintf(tmp, sizeof tmp, "bytes %lld-%lld/%lld", (long long)start, (long long)end, (long long)st.st_size);
+            hlist_add(&h, "Content-Range", tmp);
+        }
+    }
+    int keep = q->keep_alive && !g_shutting_down && !c->close_after_write;
+    hlist_add(&h, "Connection", keep ? "keep-alive" : "close");
+    if (c->srv->n_hdr_down)
+        hlist_apply_ops(&h, c->srv->hdr_down, c->srv->n_hdr_down, c);
+    hlist_apply_ops(&h, r->hdr_down, r->n_hdr_down, c);
+    buf_printf(&c->wbuf, "HTTP/1.1 %d %s\r\n", status, http_status_reason(status));
+    hlist_write(&h, &c->wbuf);
+    buf_puts(&c->wbuf, "\r\n");
+    hlist_free(&h);
+    c->resp_status = status;
+    c->resp_head_sent = 1;
+    if (!keep)
+        c->close_after_write = 1;
+    c->state = CS_LOCAL;
+    if (is_head || length == 0) {
+        close(fd);
+        if (c->enc) {
+            encoder_free(c->enc);
+            c->enc = NULL;
+        }
+        if (c->out_chunked)
+            conn_body_finish(c);
+        conn_next_request(c);
+        return;
+    }
+    c->file_fd = fd;
+    c->file_off = start;
+    c->file_remaining = length;
+    file_pump(c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2472,6 +3253,9 @@ int proxy_run(config_t *cfg, int worker_id)
         LOGI("descriptor limit %lu, max_connections %d", (unsigned long)rl.rlim_cur, cfg->max_connections);
     }
     signal(SIGPIPE, SIG_IGN);
+#ifdef LIMER_TLS
+    tls_set_sni_resolver(sni_resolve);
+#endif
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_sighup;
