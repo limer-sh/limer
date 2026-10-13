@@ -284,6 +284,89 @@ expect_not_contains "small responses not compressed" "$(curl -s -D - -o /dev/nul
 expect_contains "Vary: Accept-Encoding" "$(curl -s -D - -o /dev/null -H 'Accept-Encoding: gzip' $F/big.txt)" "Vary: Accept-Encoding"
 expect_not_contains "no encoding without Accept-Encoding" "$(curl -s -D - -o /dev/null $F/big.txt)" "Content-Encoding"
 
+echo "# tls to upstreams"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$TMP/up.key" -out "$TMP/up.crt" -days 2 \
+    -subj "/CN=backend.test" -addext "subjectAltName=DNS:backend.test,IP:127.0.0.1" >/dev/null 2>&1
+python3 tests/backend.py 9703 tls-a --tls "$TMP/up.crt" "$TMP/up.key" & PIDS+=($!)
+python3 tests/backend.py 9704 tls-b --tls "$TMP/up.crt" "$TMP/up.key" & PIDS+=($!)
+wait_port 9703; wait_port 9704
+cat > "$TMP/uptls.conf" <<CFG
+{
+    log_level warn
+}
+:9786 {
+    route {
+        match path /insecure
+        reverse_proxy https://127.0.0.1:9703 {
+            tls_insecure_skip_verify
+        }
+    }
+    route {
+        match path /verified /echo
+        reverse_proxy https://127.0.0.1:9703 https://127.0.0.1:9704 {
+            tls_trusted_ca_certs $TMP/up.crt
+            tls_server_name backend.test
+            health_uri /healthz
+            health_interval 0.5s
+        }
+    }
+    route {
+        match path /badca
+        reverse_proxy https://127.0.0.1:9703 {
+            lb_retries 0
+            max_fails 0
+        }
+    }
+    route {
+        match path /transport
+        reverse_proxy 127.0.0.1:9703 {
+            transport http {
+                tls
+                tls_insecure_skip_verify
+            }
+        }
+    }
+    route {
+        match path /dead
+        reverse_proxy https://127.0.0.1:9799 https://127.0.0.1:9704 {
+            tls_insecure_skip_verify
+            connect_timeout 1s
+        }
+    }
+}
+CFG
+$BIN run -c "$TMP/uptls.conf" >/dev/null 2>"$TMP/uptls.log" & UP=$!; PIDS+=($UP)
+wait_port 9786; sleep 0.8
+U=http://127.0.0.1:9786
+expect_eq "https upstream with insecure skip verify" "$(curl -s $U/insecure)" "hello from tls-a"
+r=$(for i in 1 2 3 4; do echo "$(curl -s $U/verified)"; done | sort -u | tr '\n' ' ')
+expect_eq "https upstreams verified against a trusted CA, round robin" "$r" "hello from tls-a hello from tls-b "
+expect_contains "proxied over tls keeps request details" "$(curl -s $U/echo)" '"X-Forwarded-Proto": "http"'
+expect_eq "untrusted upstream certificate -> 502" "$(H $U/badca)" "502"
+expect_contains "verification failure is reported" "$(curl -s $U/badca)" "tls handshake"
+expect_eq "transport http { tls } enables tls for plain upstreams" "$(curl -s $U/transport)" "hello from tls-a"
+expect_eq "retry over tls after a dead upstream" "$(curl -s $U/dead)" "hello from tls-b"
+r=$(curl -s -o /dev/null -o /dev/null -o /dev/null $U/verified $U/verified $U/verified -w '%{num_connects} ')
+expect_eq "keep-alive to the client over tls upstreams" "$r" "1 0 0 "
+cat > "$TMP/uptls-admin.conf" <<CFG
+{
+    admin 127.0.0.1:9787
+    log_level warn
+}
+:9788 {
+    reverse_proxy https://127.0.0.1:9703 https://127.0.0.1:9704 {
+        tls_trusted_ca_certs $TMP/up.crt
+        tls_server_name backend.test
+        health_uri /healthz
+        health_interval 0.3s
+    }
+}
+CFG
+$BIN run -c "$TMP/uptls-admin.conf" >/dev/null 2>&1 & UP2=$!; PIDS+=($UP2)
+wait_port 9787; sleep 1
+expect_contains "active health checks over tls report up" "$(curl -s http://127.0.0.1:9787/upstreams)" '"address":"127.0.0.1:9703","weight":1,"healthy":true'
+kill -TERM $UP $UP2; wait $UP $UP2 2>/dev/null
+
 echo "# reload keeps virtual hosts"
 sed -i 's/respond "two"/respond "two-v2"/' "$TMP/Limerfile"
 kill -HUP $LIMER; sleep 0.5

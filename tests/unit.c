@@ -624,7 +624,26 @@ TEST(test_config)
     cfg_bad(":1 {\n reverse_proxy weight=2\n}\n", "weight= must follow");
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 weight=abc\n}\n", "invalid weight");
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 weight=0\n}\n", "weight 0");
-    cfg_bad(":1 {\n reverse_proxy https://127.0.0.1:1\n}\n", "TLS to upstreams");
+    c = cfg_ok(":1 {\n reverse_proxy https://127.0.0.1:1 https://localhost:8443 127.0.0.1:2 {\n"
+               "  tls_insecure_skip_verify\n  tls_server_name backend.test\n }\n"
+               " route {\n  match path /t\n  reverse_proxy 127.0.0.1:3 {\n   transport http {\n    tls\n    tls_insecure_skip_verify\n   }\n  }\n }\n}\n");
+    if (c) {
+        pool_t *tp = c->servers[0]->routes[0]->pool;
+        CHECK(tp->nups == 3 && tp->ups[0]->tls && tp->ups[0]->port == 1 && tp->ups[1]->tls && tp->ups[1]->port == 8443 && !tp->ups[2]->tls);
+        CHECK(tp->tls_insecure && tp->client_ctx != NULL);
+        CHECK_STR(tp->tls_server_name, "backend.test");
+        pool_t *tt = c->servers[0]->routes[1]->pool;
+        CHECK(tt->ups[0]->tls && tt->client_ctx != NULL); /* transport http { tls } */
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n reverse_proxy https://127.0.0.1:1 {\n  tls_trusted_ca_certs /no/such/ca.pem\n }\n}\n", "tls_trusted_ca_certs");
+    c = cfg_ok(":1 {\n reverse_proxy https://127.0.0.1:1\n}\n");
+    if (c) {
+        CHECK(c->servers[0]->routes[0]->pool->ups[0]->tls && c->servers[0]->routes[0]->pool->ups[0]->port == 1);
+        CHECK(c->servers[0]->routes[0]->pool->client_ctx != NULL);
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n reverse_proxy https://no.such.host.invalid:9\n}\n", "cannot resolve");
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:99999\n}\n", "invalid upstream address");
     cfg_bad(":1 {\n reverse_proxy no.such.host.invalid:80\n}\n", "cannot resolve");
     cfg_bad(":1 {\n route {\n  match header X ~ \"(\"\n  to 127.0.0.1:1\n }\n}\n", "bad regex");
