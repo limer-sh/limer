@@ -1,0 +1,5 @@
+/build/
+/limer
+*.o
+*.d
+/tests/tmp/
