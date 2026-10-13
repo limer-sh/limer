@@ -52,9 +52,26 @@ HTTPS with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
 - **Reverse proxy**: keep-alive on both sides with an upstream connection
   pool, retries on other upstreams, active HTTP health checks and passive
   ejection, Caddy-style forwarding headers, `header_up`/`header_down`,
-  WebSocket and `Upgrade` tunnelling, TLS to upstreams with verification,
-  cookie-based sticky sessions, and HTTP/2 to upstreams (`h2c://`, `h2://`)
-  with trailers intact, so gRPC passes through.
+  WebSocket and `Upgrade` tunnelling, TLS to upstreams with verification and
+  client certificates, cookie-based sticky sessions, and HTTP/2 to upstreams
+  (`h2c://`, `h2://`) with trailers intact, so gRPC (including bidirectional
+  streaming) passes through.
+- **Streaming request bodies**: large uploads and bidirectional gRPC are
+  forwarded as they arrive, with backpressure both ways, unless a matcher,
+  hash key or placeholder needs to read the body (then it is buffered).
+- **Dynamic upstreams**: a pool can come from DNS, `dynamic a <name> <port>`
+  (one upstream per A/AAAA record) or `dynamic srv <name>` (SRV targets with
+  their ports and weights), re-resolved on an interval; named upstreams are
+  re-resolved too. Point lookups at specific `resolvers`.
+- **Mutual TLS**: require or request client certificates per site
+  (`tls { client_auth { ... } }`), match and log them, and present a client
+  certificate to upstreams (`tls_client_auth`).
+- **Traffic splitting and mirroring**: send a deterministic, sticky
+  percentage of traffic to a canary with `match split <pct>`, or shadow a
+  copy of each request to another pool with `mirror` and discard the reply.
+- **Response caching**: an in-memory LRU cache (`cache { }`) honouring
+  `Cache-Control`, `Expires`, `Vary`, `ETag`/`Last-Modified` revalidation
+  and stale-while-revalidate.
 - **Rate limiting**: token buckets per site or per route, keyed by any
   placeholder (`{remote_ip}`, `{header.X-Api-Key}`, `{json.tenant}`...),
   with `Retry-After` on rejection.
@@ -78,11 +95,12 @@ HTTPS with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
   globs, snippets `(name) { }` with `{args.N}`, per-site `log { output;
   format json|common }`.
 - **Operations**: `limer validate`, hot reload on `SIGHUP` / `limer reload` /
-  `POST /reload` (bad configs are rejected and the old one keeps running),
-  graceful shutdown with a grace period, multi-process `workers` with
-  `SO_REUSEPORT`, pidfile, access logs, admin API with JSON upstream status,
-  Prometheus metrics, and runtime drain / weight overrides that survive
-  reloads.
+  `POST /reload` (bad configs are rejected and the old one keeps running;
+  a reload keeps DNS-resolved upstreams and tolerates a name that is briefly
+  unresolvable), graceful shutdown with a grace period, multi-process
+  `workers` with `SO_REUSEPORT`, pidfile, access logs, admin API with JSON
+  upstream status, Prometheus metrics (upstreams, rate-limit zones, cache),
+  and runtime drain / weight overrides that survive reloads.
 - **HTTP/1.1 done properly**: pipelining, chunked bodies both ways,
   `Expect: 100-continue`, HEAD/204/304 framing, close-delimited responses,
   request-smuggling guards, bounded buffering with backpressure.
@@ -155,6 +173,8 @@ replaced from the environment.
     acme_dns_script /etc/limer/dns-hook.sh   # for dns-01 (see Automatic HTTPS)
     acme_dns_propagation 30s
     auto_https on             # off | disable_redirects
+    resolvers 10.0.0.2 10.0.0.3   # DNS servers for upstream lookups (default: system)
+    cache_capacity 64m        # total response-cache size per worker
 }
 
 # snippets can be imported into any block, with {args.N} substitution
@@ -193,12 +213,14 @@ exact match, then wildcard, then the site without a hostname.
 | `tls <cert.pem> <key.pem>` | Use your own certificate. |
 | `tls internal` | Self-signed certificate for the site's names. |
 | `tls <email>` | Automatic certificate with this account email. |
+| `tls ... { client_auth { mode <m>; trusted_ca_cert_file <pem> } }` | Require or request client certificates (mutual TLS). |
 | `log [{ output stdout|stderr|<file>; format json|common }]` | Access log for this site. |
 | `header [+|-]Name [value]` or `header { ... }` | Set, add or delete response headers on every response. |
 | `request_header [+|-]Name [value]` | Same for requests sent upstream. |
 | `basic_auth [realm] { user <bcrypt-hash> ... }` | Protect the whole site (`htpasswd -nbB user pass`). |
 | `encode [gzip] [zstd] [br] [{ minimum_length N }]` | Compress eligible responses; server order is the preference. |
 | `rate_limit [zone] [rate] [{ key; rate; burst; status; max_keys }]` | Limit requests per key for the whole site (see Rate limiting). |
+| `cache [{ ttl <dur>; stale <dur>; max_object <size> }]` | Cache proxied GET/HEAD responses (see Response caching). |
 | `root <dir>` | Default root for `file_server` in this site. |
 | `max_body <size>` / `request_body { max_size <size> }` | Largest request body (`8m`); bodies are buffered so routing can inspect them. |
 | `read_timeout <dur>` / `idle_timeout <dur>` | Request read time (`30s`) and keep-alive idle time (`2m`). |
@@ -229,6 +251,8 @@ match [not] <source> [name] [operator] [values...]
 | `form` | yes | `match form action checkout` (urlencoded bodies) |
 | `body` | no | `match body ~ "priority=(high|urgent)"` |
 | `uri` | no | `match uri *= "debug=1"` |
+| `tls_client` | yes (field) | `match tls_client verified == true`, `match tls_client subject *= "OU=ops"` |
+| `split` | no (pct [+ key]) | `match split 5`, `match split 10 header X-User` |
 
 Without an operator, `==` is assumed; `==` with no values means `exists`.
 Path and host use glob matching with `*`. Regexes are POSIX extended.
@@ -265,12 +289,18 @@ Path and host use glob matching with `*`. Regexes are POSIX extended.
 | `header_up [+|-]Name [value]` / `header_down ...` | | Edit request / response headers. |
 | `preserve_host on|off` | `on` | Pass the client's `Host` through. |
 | `tls_insecure_skip_verify`, `tls_server_name <name>`, `tls_trusted_ca_certs <pem>` | | Upstream TLS verification. |
+| `tls_client_auth <cert.pem> <key.pem>` | | Present a client certificate to the upstream. |
+| `dynamic a <name> <port>` / `dynamic srv <name>` | | Populate the pool from DNS (see Dynamic upstreams). |
+| `refresh <dur>` | `30s` | Re-resolution interval for dynamic and named upstreams (`off` to pin). |
+| `mirror <upstreams...> [{ sample <pct> }]` | | Shadow a copy of each request to another pool; the reply is discarded. |
 | `transport http { keepalive_idle_conns N; tls; versions h2|h2c|1.1; ... }` | | Caddy-compatible spelling of the above; `versions h2c` or `h2` makes every upstream in the pool HTTP/2. |
 
 Header values, `respond` bodies, `redir` targets, `rewrite` and
 `try_files` accept placeholders: `{remote_ip}`, `{host}`, `{path}`,
 `{query}`, `{uri}`, `{method}`, `{scheme}`, `{route}`,
-`{upstream_hostport}`, `{upstream_host}`, `{header.Name}`.
+`{upstream_hostport}`, `{upstream_host}`, `{header.Name}`, and (on TLS
+connections) `{tls_client_subject}`, `{tls_client_issuer}`,
+`{tls_client_serial}`, `{tls_client_fingerprint}`, `{tls_client_verified}`.
 
 ### Load balancing policies
 
@@ -308,12 +338,13 @@ real trailers (`grpc-status`, `grpc-message`, trailing metadata, and a
 trailers-only error stays trailers-only), an HTTP/1.1 client gets a chunked
 response with the trailers at the end. Clients may use TLS with ALPN or
 plain HTTP/2 with prior knowledge on an http listener, so gRPC works without
-TLS on either side. Unary and server-streaming calls are supported. Because
-request bodies are buffered for payload routing, client-streaming and
-bidirectional calls are sent only once the request body is complete, so
-they are not a fit for long-lived streams. Active health checks are plain
-HTTP/1.1 and need an upstream that still answers HTTP/1.1; for h2-only
-upstreams rely on passive health.
+TLS on either side. Unary, server-streaming, client-streaming and
+bidirectional calls all work: request bodies stream through (see below), so
+a route that does not inspect the body forwards gRPC frames as they arrive.
+A route whose matcher, hash key or placeholder reads the body buffers it
+first, which suits unary and server-streaming but not long-lived client
+streams. Active health checks are plain HTTP/1.1 and need an upstream that
+still answers HTTP/1.1; for h2-only upstreams rely on passive health.
 
 ### Rate limiting
 
@@ -341,6 +372,125 @@ client, per API key, per tenant in the JSON body, or per route. Rejected
 requests get `status` (`429`) with `Retry-After`, and zones are capped at
 `max_keys` (`100000`) buckets with least-recently-used eviction. Counts are
 per worker. `/metrics` exposes allowed and limited totals per zone.
+
+### Streaming request bodies
+
+A proxied request's body is streamed to the upstream as it arrives, with
+backpressure in both directions, so a large upload or a bidirectional gRPC
+stream never buffers in full. A request is streamed only when nothing on the
+matched route needs the body: a `json`/`form`/`body` matcher, a `hash` on one
+of those, a rate-limit key or a header placeholder that reads the body all
+force buffering (bounded by `max_body`). `request_body { mode buffer }`
+forces buffering for a whole site; `mode stream` is the default.
+
+### Dynamic upstreams
+
+```
+{ resolvers 10.0.0.2 }            # optional: use specific DNS servers
+api.example.com {
+    reverse_proxy {
+        dynamic srv _http._tcp.api.svc.cluster.local
+        refresh 10s
+    }
+}
+backend.example.com {
+    reverse_proxy {
+        dynamic a backends.internal 8080   # one upstream per A/AAAA record
+        refresh 30s
+    }
+}
+```
+
+`dynamic a <name> <port>` resolves a hostname to one upstream per address;
+`dynamic srv <name>` uses SRV records, taking each target's port and weight.
+The pool is re-resolved every `refresh` interval (default 30s, `off` to
+pin): new addresses are added, vanished ones are drained and removed once no
+request, connection, health check or HTTP/2 session still uses them, and a
+failed lookup keeps the last known set. A named static upstream
+(`reverse_proxy api.internal:8080`) is re-resolved on the same interval and
+switches address when its record changes. `resolvers` points lookups at
+specific servers (plain DNS, IPv4, optional `:port`); without it the system
+resolver and `/etc/hosts` apply. Runtime drain/weight overrides and reloads
+carry across re-resolution.
+
+### Mutual TLS
+
+```
+api.example.com {
+    tls internal {
+        client_auth {
+            mode require_and_verify            # request | require | verify_if_given
+            trusted_ca_cert_file /etc/limer/clients-ca.pem
+        }
+    }
+    reverse_proxy 10.0.0.2:8080 {
+        tls_client_auth /etc/limer/limer-client.pem /etc/limer/limer-client.key
+    }
+}
+```
+
+`client_auth` asks the client for a certificate. `request` accepts any (or
+none); `require` demands one but does not verify it; `verify_if_given`
+verifies a presented certificate against `trusted_ca_cert_file`;
+`require_and_verify` demands and verifies one. The settings are per site, so
+sites sharing a listener each enforce their own. What the client presented is
+available as the `tls_client` matcher and the `{tls_client_*}` placeholders
+(subject, issuer, serial, fingerprint, verified, present). `tls_client_auth`
+makes Limer present a client certificate when proxying to an upstream.
+
+### Traffic splitting and mirroring
+
+```
+# send 5% of users to a canary, the same users every time
+app.example.com {
+    route {
+        match split 5 cookie session
+        reverse_proxy canary.internal:8080
+    }
+    reverse_proxy stable.internal:8080 {
+        mirror shadow.internal:8080 { sample 10 }   # copy 10% to a shadow pool
+    }
+}
+```
+
+`match split <pct> [<key-source> [name]]` matches a deterministic fraction
+of requests. It hashes a key (the client IP by default, or a header, cookie,
+query, json field, ...) so a given client always lands on the same side;
+put the split route before the fallback to peel off a slice of traffic.
+`mirror` inside a `reverse_proxy` sends a fire-and-forget copy of each
+request (head and body) to another pool and discards the response, so a slow
+or dead mirror never affects the client; `sample <pct>` limits the share
+copied. Mirrored routes buffer the request body.
+
+### Response caching
+
+```
+{ cache_capacity 256m }
+static.example.com {
+    encode gzip zstd
+    cache {
+        ttl 5m         # freshness to assume when the response gives none
+        stale 30s      # serve stale this long while revalidating in the background
+        max_object 8m  # do not cache bodies larger than this
+    }
+    reverse_proxy 10.0.0.2:8080
+}
+```
+
+GET and HEAD responses are cached in memory per worker. Freshness comes from
+the response (`s-maxage`, `max-age`, `Expires`) or, failing that, the
+configured `ttl`; a response is not cached when it is `no-store`, `private`,
+carries `Set-Cookie` or `Vary: *`, or answers an authorized request without
+`public`. The identity body is stored once and framed and compressed per
+client, so one entry serves gzip, br and plain clients. Hits carry `Age` and
+`X-Cache: HIT`; a client's `If-None-Match`/`If-Modified-Since` against a
+cached validator gets `304`. A stale entry is revalidated conditionally and a
+`304` refreshes it in place; within the `stale` window the stale copy is
+served at once (`X-Cache: STALE`) while a background request refreshes it.
+Total size is bounded by `cache_capacity` (default 64 MiB) with LRU
+eviction, and `/metrics` reports hits, misses, stores, evictions and size.
+One variant per URL is kept: a request whose `Vary` headers differ from the
+stored variant replaces it.
 
 ## Automatic HTTPS
 
@@ -416,7 +566,7 @@ GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 | `make unit` | `tests/unit.c`: buffers, parsing helpers, CIDR matching, globbing, the HTTP head parsers (including every smuggling guard), the chunked decoder, the JSON path extractor, the Limerfile parser (site addresses, imports, snippets, every directive and ~60 rejected inputs), matchers and key extraction, and every balancing policy. |
 | `make fuzz` | `tests/fuzz.c`: a mutation fuzzer over the HTTP parsers, chunked decoder, JSON extractor, form/cookie extraction and config parser with invariant checks; reproducible by seed. |
 | `make integration` | `tests/run_tests.sh`: end-to-end proxying behaviour against Python backends: routing, hashing, weights, framing, keep-alive, pipelining, timeouts, retries, health checks, WebSocket upgrade, admin API, reload, graceful stop, TLS and multi-worker mode. |
-| `make features` | `tests/run_features.sh`: virtual hosts, SNI, redirects, handlers, basic auth, logging, static files, compression, TLS to upstreams, HTTP/2, rate limiting, sticky sessions, the runtime admin API, gRPC over h2c/h2 upstreams (needs `grpcio` and `grpcio-tools`; skipped otherwise) and reload. |
+| `make features` | `tests/run_features.sh`: virtual hosts, SNI, redirects, handlers, basic auth, logging, static files, compression, TLS to upstreams, HTTP/2, rate limiting, sticky sessions, the runtime admin API, gRPC over h2c/h2 upstreams and bidirectional streaming (needs `grpcio` and `grpcio-tools`; skipped otherwise), streaming request bodies, dynamic upstreams (a small test DNS server), mutual TLS, traffic splitting and mirroring, response caching, and reload. |
 | `make acme` | `tests/run_acme.sh`: certificate issuance over http-01, tls-alpn-01 and dns-01 (wildcard), storage and renewal against Pebble and pebble-challtestsrv (skips when they are not installed). |
 | `make security` | `tests/security_tests.py`: the black-box security suite described below. |
 
@@ -527,15 +677,17 @@ spread them over cores.
 
 Present: reverse proxy with health checks and all common balancing policies
 (plus payload hashing, which Caddy lacks), sticky sessions, rate limiting,
-site addresses and virtual hosts, automatic HTTPS (http-01, tls-alpn-01,
-dns-01 with wildcards), HTTP/2 on both sides including gRPC passthrough,
-static files, compression, the common handler directives, Caddyfile-style
-config with imports and snippets, reloads, metrics, a runtime admin API for
-draining and weights, multi-process workers.
+response caching, streaming request bodies, dynamic upstreams (DNS A/SRV),
+traffic splitting and request mirroring, mutual TLS, site addresses and
+virtual hosts, automatic HTTPS (http-01, tls-alpn-01, dns-01 with
+wildcards), HTTP/2 on both sides including gRPC passthrough, static files,
+compression, the common handler directives, Caddyfile-style config with
+imports and snippets, reloads, metrics, a runtime admin API for draining and
+weights, multi-process workers.
 
 Not there: HTTP/3, built-in DNS provider modules (dns-01 goes through a
-script), on-demand TLS, client certificate authentication, templates,
-FastCGI, the JSON config API and the plugin ecosystem.
+script), on-demand TLS, templates, FastCGI, the JSON config API and the
+plugin ecosystem.
 
 ## Layout
 
