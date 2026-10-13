@@ -52,6 +52,7 @@ typedef struct ev {
 
 static int g_epfd = -1;
 static config_t *g_cfg;
+static ipguard_t *g_ipguard;    /* per-source-IP admission control (DoS mitigation) */
 static int g_worker_id;
 static double g_now;
 static volatile sig_atomic_t g_reload_flag;
@@ -179,6 +180,7 @@ typedef struct conn {
     socklen_t peerlen;
     char peer_ip[64];
     char peer_str[80];
+    char client_ip[64];             /* effective client IP: peer, or XFF when behind a trusted proxy */
     struct conn *prev, *next;
 #ifdef LIMER_TLS
     SSL *ssl;
@@ -193,6 +195,7 @@ typedef struct conn {
     int rd_eof;
     int close_after_write;
     int got_request_bytes;
+    int ip_tracked;             /* counted against the per-IP connection guard */
     uint64_t requests;
 
     /* current request */
@@ -996,6 +999,10 @@ static void conn_close(conn_t *c)
     }
 #endif
     conn_list_del(c);
+    if (c->ip_tracked && g_ipguard) {
+        ipguard_release(g_ipguard, c->peer_ip);
+        c->ip_tracked = 0;
+    }
     if (c->h2_parent) {
 #ifdef LIMER_H2
         h2_stream_close(c);
@@ -1576,7 +1583,7 @@ static void build_upstream_request(conn_t *c, uconn_t *uc)
     hlist_add(&h, "X-Forwarded-Proto", c->ctx.tls ? "https" : "http");
     if (orig_host)
         hlist_add(&h, "X-Forwarded-Host", orig_host);
-    hlist_add(&h, "X-Real-IP", c->peer_ip);
+    hlist_add(&h, "X-Real-IP", c->client_ip[0] ? c->client_ip : c->peer_ip);
     if (c->srv->n_hdr_up)
         hlist_apply_ops(&h, c->srv->hdr_up, c->srv->n_hdr_up, c);
     hlist_apply_ops(&h, p->hdr_up, p->n_hdr_up, c);
@@ -1631,7 +1638,7 @@ static void build_mirror_request(conn_t *c, upstream_t *mu, pool_t *mp, buf_t *o
     hlist_add(&h, "X-Forwarded-Proto", c->ctx.tls ? "https" : "http");
     if (orig_host)
         hlist_add(&h, "X-Forwarded-Host", orig_host);
-    hlist_add(&h, "X-Real-IP", c->peer_ip);
+    hlist_add(&h, "X-Real-IP", c->client_ip[0] ? c->client_ip : c->peer_ip);
     char tmp[32];
     snprintf(tmp, sizeof tmp, "%zu", buf_readable(&r->body));
     hlist_add(&h, "Content-Length", tmp);
@@ -2359,6 +2366,9 @@ static int conn_rate_limited(conn_t *c, rate_limit_cfg_t *rl)
     buf_free(&key);
     if (ok)
         return 0;
+    /* A rate-limited client earns a strike toward an automatic ban. */
+    if (g_cfg->ipguard.enabled && g_ipguard)
+        ipguard_strike(g_ipguard, &g_cfg->ipguard, c->client_ip, g_now);
     char extra[160];
     snprintf(extra, sizeof extra, "Retry-After: %d\r\nX-RateLimit-Limit: %g\r\nX-RateLimit-Remaining: 0\r\n",
              (int)(retry + 0.999), ratelimit_rate(rl->rl));
@@ -2383,12 +2393,73 @@ static void conn_respond_unauthorized(conn_t *c, const basic_auth_t *a)
 static void conn_serve_files(conn_t *c, route_t *r);
 static void file_pump(conn_t *c);
 
+/* Is a textual IP address one of the configured trusted proxies? */
+static int ip_str_is_trusted(const char *ip)
+{
+    if (g_cfg->ntrusted_proxies == 0)
+        return 0;
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof ss);
+    if (inet_pton(AF_INET, ip, &((struct sockaddr_in *)&ss)->sin_addr) == 1)
+        ss.ss_family = AF_INET;
+    else if (inet_pton(AF_INET6, ip, &((struct sockaddr_in6 *)&ss)->sin6_addr) == 1)
+        ss.ss_family = AF_INET6;
+    else
+        return 0;
+    for (int i = 0; i < g_cfg->ntrusted_proxies; i++)
+        if (cidr_match(g_cfg->trusted_proxies[i], (struct sockaddr *)&ss))
+            return 1;
+    return 0;
+}
+
+/* Resolve the effective client IP. Defaults to the immediate TCP peer; only
+ * when that peer is a trusted proxy do we believe X-Forwarded-For, taking the
+ * right-most address that is not itself a trusted proxy. */
+static void compute_client_ip(conn_t *c)
+{
+    snprintf(c->client_ip, sizeof c->client_ip, "%s", c->peer_ip);
+    if (g_cfg->ntrusted_proxies == 0)
+        return;
+    int trusted = 0;
+    for (int i = 0; i < g_cfg->ntrusted_proxies; i++)
+        if (cidr_match(g_cfg->trusted_proxies[i], (struct sockaddr *)&c->peer)) {
+            trusted = 1;
+            break;
+        }
+    if (!trusted)
+        return;
+    const char *xff = http_hdr_get(c->req.hdrs, c->req.nhdr, "X-Forwarded-For");
+    if (!xff || !*xff)
+        return;
+    char tmp[1024];
+    snprintf(tmp, sizeof tmp, "%s", xff);
+    char *toks[32];
+    int nt = 0;
+    for (char *p = strtok(tmp, ","); p && nt < 32; p = strtok(NULL, ",")) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        char *e = p + strlen(p);
+        while (e > p && (e[-1] == ' ' || e[-1] == '\t'))
+            *--e = 0;
+        if (*p)
+            toks[nt++] = p;
+    }
+    for (int i = nt - 1; i >= 0; i--)
+        if (!ip_str_is_trusted(toks[i])) {
+            snprintf(c->client_ip, sizeof c->client_ip, "%s", toks[i]);
+            return;
+        }
+    if (nt > 0)   /* every hop was a trusted proxy: fall back to the original client */
+        snprintf(c->client_ip, sizeof c->client_ip, "%s", toks[0]);
+}
+
 static void conn_ctx_init(conn_t *c)
 {
     c->ctx.req = &c->req;
     c->ctx.peer = (struct sockaddr *)&c->peer;
     c->ctx.peerlen = c->peerlen;
-    snprintf(c->ctx.peer_ip, sizeof c->ctx.peer_ip, "%s", c->peer_ip);
+    compute_client_ip(c);
+    snprintf(c->ctx.peer_ip, sizeof c->ctx.peer_ip, "%s", c->client_ip);
 #ifdef LIMER_TLS
     c->ctx.tls = c->ssl != NULL || c->h2_parent != NULL;
     c->ctx.client_cert = c->h2_parent ? &c->h2_parent->tls_client : c->ssl ? &c->tls_client : NULL;
@@ -3011,6 +3082,13 @@ static void conn_dispatch(conn_t *c)
         return;
     }
 
+    /* Layer 2: a client banned by the per-IP guard (possibly behind a trusted
+     * proxy, so keyed on the effective client IP) is turned away here. */
+    if (g_cfg->ipguard.enabled && g_ipguard && ipguard_is_banned(g_ipguard, c->client_ip, g_now)) {
+        conn_send_error(c, 403, "banned", 0);
+        return;
+    }
+
     if (c->srv->rl && conn_rate_limited(c, c->srv->rl))
         return;
     if (c->srv->auth && !auth_verify(c->srv->auth, http_hdr_get(r->hdrs, r->nhdr, "Authorization"))) {
@@ -3493,6 +3571,20 @@ static void listener_cb(ev_t *e, uint32_t events)
             close(fd);
             continue;
         }
+        char peer_ip[64];
+        sockaddr_to_str((struct sockaddr *)&peer, peer_ip, sizeof peer_ip, 0);
+        int ip_admitted = 0;
+        if (g_cfg->ipguard.enabled && g_ipguard) {
+            int v = ipguard_admit(g_ipguard, &g_cfg->ipguard, peer_ip, g_now);
+            if (v != IPGUARD_OK) {
+                LOGD("ipguard: refusing %s (%s)", peer_ip,
+                     v == IPGUARD_BANNED ? "banned" :
+                     v == IPGUARD_CONN_LIMIT ? "per-IP connection limit" : "connection rate");
+                close(fd);
+                continue;
+            }
+            ip_admitted = 1;
+        }
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         conn_t *c = xcalloc(1, sizeof *c);
@@ -3505,7 +3597,8 @@ static void listener_cb(ev_t *e, uint32_t events)
         snprintf(c->listen_addr, sizeof c->listen_addr, "%s", l->addr);
         memcpy(&c->peer, &peer, pl);
         c->peerlen = pl;
-        sockaddr_to_str((struct sockaddr *)&peer, c->peer_ip, sizeof c->peer_ip, 0);
+        snprintf(c->peer_ip, sizeof c->peer_ip, "%s", peer_ip);
+        c->ip_tracked = ip_admitted;
         sockaddr_to_str((struct sockaddr *)&peer, c->peer_str, sizeof c->peer_str, 1);
         buf_init(&c->rbuf);
         buf_init(&c->wbuf);
@@ -4503,6 +4596,21 @@ static void admin_metrics(buf_t *b)
     buf_printf(b, "limer_connections_active{worker=\"%d\"} %d\n", g_worker_id, g_stats.active_conns);
     buf_puts(b, "# HELP limer_upstream_connections Open upstream connections (active + idle).\n# TYPE limer_upstream_connections gauge\n");
     buf_printf(b, "limer_upstream_connections{worker=\"%d\"} %d\n", g_worker_id, g_stats.active_uconns);
+    if (g_cfg->ipguard.enabled && g_ipguard) {
+        uint64_t adm, rc, rr, rb, bans;
+        int tracked;
+        ipguard_stats(g_ipguard, &adm, &rc, &rr, &rb, &bans, &tracked);
+        buf_puts(b, "# HELP limer_ipguard_admitted_total Connections admitted by the per-IP guard.\n# TYPE limer_ipguard_admitted_total counter\n");
+        buf_printf(b, "limer_ipguard_admitted_total{worker=\"%d\"} %llu\n", g_worker_id, (unsigned long long)adm);
+        buf_puts(b, "# HELP limer_ipguard_refused_total Connections refused by the per-IP guard.\n# TYPE limer_ipguard_refused_total counter\n");
+        buf_printf(b, "limer_ipguard_refused_total{worker=\"%d\",reason=\"conn_limit\"} %llu\n", g_worker_id, (unsigned long long)rc);
+        buf_printf(b, "limer_ipguard_refused_total{worker=\"%d\",reason=\"conn_rate\"} %llu\n", g_worker_id, (unsigned long long)rr);
+        buf_printf(b, "limer_ipguard_refused_total{worker=\"%d\",reason=\"banned\"} %llu\n", g_worker_id, (unsigned long long)rb);
+        buf_puts(b, "# HELP limer_ipguard_bans_total Addresses banned.\n# TYPE limer_ipguard_bans_total counter\n");
+        buf_printf(b, "limer_ipguard_bans_total{worker=\"%d\"} %llu\n", g_worker_id, (unsigned long long)bans);
+        buf_puts(b, "# HELP limer_ipguard_tracked Addresses currently tracked.\n# TYPE limer_ipguard_tracked gauge\n");
+        buf_printf(b, "limer_ipguard_tracked{worker=\"%d\"} %d\n", g_worker_id, tracked);
+    }
     buf_puts(b, "# HELP limer_rate_limit_total Requests checked and limited per zone.\n# TYPE limer_rate_limit_total counter\n");
     for (int i = 0; i < g_cfg->nservers; i++) {
         server_t *s = g_cfg->servers[i];
@@ -5017,6 +5125,8 @@ int proxy_run(config_t *cfg, int worker_id)
     ev_add(&g_timer_ev, EPOLLIN);
     if (!g_cache)
         g_cache = cache_new(cfg->cache_capacity ? cfg->cache_capacity : 64 * 1024 * 1024);
+    if (!g_ipguard)
+        g_ipguard = ipguard_new(cfg->ipguard.max_keys);
     int rfd = resolver_start();
     if (rfd < 0) {
         LOGE("cannot start the resolver thread: %s", strerror(errno));
@@ -5069,6 +5179,8 @@ int proxy_run(config_t *cfg, int worker_id)
     resolver_stop();
     cache_free(g_cache);
     g_cache = NULL;
+    ipguard_free(g_ipguard);
+    g_ipguard = NULL;
     {
         /* drop lookups that were still in flight */
         resolve_job_t *job = resolver_take_done();

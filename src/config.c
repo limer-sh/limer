@@ -718,6 +718,9 @@ static void config_free(config_t *c)
     for (int i = 0; i < c->nresolvers; i++)
         free(c->resolvers[i]);
     free(c->resolvers);
+    for (int i = 0; i < c->ntrusted_proxies; i++)
+        free(c->trusted_proxies[i]);
+    free(c->trusted_proxies);
     free(c);
 }
 
@@ -2663,6 +2666,62 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
                 cfg->acme_disabled = 0;
             else
                 FAIL("line %d: auto_https accepts off, on or disable_redirects", c->line);
+        } else if (strcaseeq(k, "trusted_proxies") || strcaseeq(k, "trusted_proxy")) {
+            if (want_args(c, 1, 256, err, errlen) < 0)
+                return -1;
+            for (int a = 1; a < c->nargs; a++) {
+                struct sockaddr_storage ss;
+                if (inet_pton(AF_INET, c->args[a], &((struct sockaddr_in *)&ss)->sin_addr) != 1 &&
+                    inet_pton(AF_INET6, c->args[a], &((struct sockaddr_in6 *)&ss)->sin6_addr) != 1 &&
+                    strchr(c->args[a], '/') == NULL)
+                    FAIL("line %d: trusted_proxies needs an IP or CIDR, got '%s'", c->line, c->args[a]);
+                cfg->trusted_proxies = xrealloc(cfg->trusted_proxies, (size_t)(cfg->ntrusted_proxies + 1) * sizeof(char *));
+                cfg->trusted_proxies[cfg->ntrusted_proxies++] = xstrdup(c->args[a]);
+            }
+        } else if (strcaseeq(k, "ip_guard") || strcaseeq(k, "connection_guard")) {
+            ipguard_cfg_t *g = &cfg->ipguard;
+            g->enabled = 1;
+            for (int j = 0; j < c->nkids; j++) {
+                node_t *o = c->kids[j];
+                const char *n = o->args[0];
+                int rc = 0;
+                if (strcaseeq(n, "max_conns_per_ip") || strcaseeq(n, "max_conns")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
+                        rc = arg_int(o, 1, &g->max_conns_per_ip, 0, 10000000, err, errlen);
+                } else if (strcaseeq(n, "conn_rate")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0 && parse_rate(o->args[1], &g->conn_rate) < 0) {
+                        snprintf(err, errlen, "line %d: invalid conn_rate '%s' (use e.g. 50r/s, 600r/m)", o->line, o->args[1]);
+                        rc = -1;
+                    }
+                } else if (strcaseeq(n, "conn_burst")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0) {
+                        g->conn_burst = atof(o->args[1]);
+                        if (g->conn_burst <= 0) {
+                            snprintf(err, errlen, "line %d: conn_burst must be positive", o->line);
+                            rc = -1;
+                        }
+                    }
+                } else if (strcaseeq(n, "ban_threshold")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
+                        rc = arg_int(o, 1, &g->ban_threshold, 1, 100000000, err, errlen);
+                } else if (strcaseeq(n, "ban_window")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
+                        rc = arg_duration(o, 1, &g->ban_window, err, errlen);
+                } else if (strcaseeq(n, "ban_duration") || strcaseeq(n, "ban_for")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
+                        rc = arg_duration(o, 1, &g->ban_duration, err, errlen);
+                } else if (strcaseeq(n, "max_keys")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
+                        rc = arg_int(o, 1, &g->max_keys, 1, 100000000, err, errlen);
+                } else {
+                    snprintf(err, errlen, "line %d: unknown ip_guard option '%s'", o->line, n);
+                    rc = -1;
+                }
+                if (rc < 0)
+                    return -1;
+            }
+            if (g->ban_window <= 0)
+                g->ban_window = 10.0;
         } else {
             FAIL("line %d: unknown global option '%s'", c->line, k);
         }
