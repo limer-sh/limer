@@ -676,6 +676,22 @@ TEST(test_config)
         }
     }
     cfg_bad("{\n nope 1\n}\n:1 {\n reverse_proxy 127.0.0.1:1\n}\n", "unknown global option");
+    {
+        config_t *ac = cfg_ok("{\n acme_challenge tls-alpn-01\n acme_dns_propagation 3s\n acme_dns_script /bin/sh\n email a@b.c\n}\n:1 {\n respond ok\n}\n");
+        if (ac) {
+            CHECK(ac->acme_challenge == 1 && ac->acme_dns_propagation == 3);
+            CHECK_STR(ac->acme_dns_script, "/bin/sh");
+            CHECK_STR(ac->acme_email, "a@b.c");
+            config_unref(ac);
+        }
+        ac = cfg_ok("{\n acme_challenge dns-01\n}\n:1 {\n respond ok\n}\n");
+        if (ac) {
+            CHECK(ac->acme_challenge == 2);
+            config_unref(ac);
+        }
+    }
+    cfg_bad("{\n acme_challenge magic\n}\n:1 {\n respond ok\n}\n", "acme_challenge accepts");
+    cfg_bad("{\n acme_dns_script /no/such/script\n}\n:1 {\n respond ok\n}\n", "not executable");
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1\n}\n{\n workers 2\n}\n", "must come first");
     cfg_bad("bad!host {\n reverse_proxy 127.0.0.1:1\n}\n", "invalid hostname");
     cfg_bad(":abc {\n reverse_proxy 127.0.0.1:1\n}\n", "invalid port");

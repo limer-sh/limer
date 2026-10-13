@@ -670,6 +670,26 @@ static void host_only(const char *hdr, char *out, size_t n)
 }
 
 #ifdef LIMER_TLS
+/* tls-alpn-01: is `name` under validation? (<storage>/challenges/tls-alpn/<name>) */
+static int acme_alpn_resolve(SSL *ssl, const char *name, char *keyauth, size_t n)
+{
+    conn_t *c = SSL_get_app_data(ssl);
+    if (!c || !c->cfg || strchr(name, '/') || strstr(name, ".."))
+        return 0;
+    char path[2048];
+    snprintf(path, sizeof path, "%s/challenges/tls-alpn/%s", c->cfg->storage, name);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    size_t got = fread(keyauth, 1, n - 1, f);
+    fclose(f);
+    keyauth[got] = 0;
+    char *nl = strpbrk(keyauth, "\r\n");
+    if (nl)
+        *nl = 0;
+    return got > 0;
+}
+
 static SSL_CTX *sni_resolve(SSL *ssl, const char *name)
 {
     conn_t *c = SSL_get_app_data(ssl);
@@ -3729,6 +3749,7 @@ int proxy_run(config_t *cfg, int worker_id)
     signal(SIGPIPE, SIG_IGN);
 #ifdef LIMER_TLS
     tls_set_sni_resolver(sni_resolve);
+    tls_set_acme_resolver(acme_alpn_resolve);
 #endif
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);

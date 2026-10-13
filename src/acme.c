@@ -18,6 +18,7 @@
 #include <netinet/tcp.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -713,6 +714,28 @@ static int poll_status(acme_t *a, const char *url, const char *what, char *statu
     return 0;
 }
 
+static volatile sig_atomic_t manager_stop;
+
+/* run "<script> <action> <domain> <txt>" and wait for it */
+static int run_dns_script(const char *script, const char *action, const char *domain, const char *txt)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        execl(script, script, action, domain, txt, (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+        return -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        LOGE("acme: %s %s %s exited with %d", script, action, domain, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return -1;
+    }
+    return 0;
+}
+
 /* Obtain a certificate for the hosts and store it under certs/<hosts[0]>. */
 static int acme_obtain(acme_t *a, char **hosts, int nhosts)
 {
@@ -775,13 +798,20 @@ static int acme_obtain(acme_t *a, char **hosts, int nhosts)
             aresp_free(&r);
             continue;
         }
+        int is_wild = 0;
+        {
+            char w[8] = "";
+            jstr(r.body.data, "wildcard", w, sizeof w);
+            is_wild = strcmp(w, "true") == 0;
+        }
+        const char *want = cfg->acme_challenge == 2 || is_wild ? "dns-01" : cfg->acme_challenge == 1 ? "tls-alpn-01" : "http-01";
         char token[256] = "", curl_[1024] = "";
         for (int k = 0;; k++) {
             char path[64], type[32];
             snprintf(path, sizeof path, "challenges[%d].type", k);
             if (!jstr(r.body.data, path, type, sizeof type))
                 break;
-            if (strcmp(type, "http-01") == 0) {
+            if (strcmp(type, want) == 0) {
                 snprintf(path, sizeof path, "challenges[%d].token", k);
                 jstr(r.body.data, path, token, sizeof token);
                 snprintf(path, sizeof path, "challenges[%d].url", k);
@@ -791,30 +821,64 @@ static int acme_obtain(acme_t *a, char **hosts, int nhosts)
         }
         aresp_free(&r);
         if (!token[0] || !curl_[0]) {
-            LOGE("acme: no http-01 challenge offered for %s", ident);
+            LOGE("acme: no %s challenge offered for %s", want, ident);
             goto fail;
         }
-        char keyauth[512], cpath[2048];
+        char keyauth[512], cpath[2048], txt[80] = "";
         snprintf(keyauth, sizeof keyauth, "%s.%s", token, a->thumbprint);
-        snprintf(cpath, sizeof cpath, "%s/%s", chdir_, token);
-        if (write_file_atomic(cpath, keyauth, strlen(keyauth), 0644) < 0) {
+        if (strcmp(want, "http-01") == 0) {
+            snprintf(cpath, sizeof cpath, "%s/%s", chdir_, token);
+        } else if (strcmp(want, "tls-alpn-01") == 0) {
+            char lower[256];
+            snprintf(lower, sizeof lower, "%s", ident);
+            for (char *q = lower; *q; q++)
+                *q = (char)tolower((unsigned char)*q);
+            char d2[1100];
+            snprintf(d2, sizeof d2, "%s/tls-alpn", chdir_);
+            mkdir_p(d2);
+            snprintf(cpath, sizeof cpath, "%s/%s", d2, lower);
+        } else {
+            /* dns-01: TXT value is base64url(SHA-256(keyauth)) */
+            unsigned char dg[32];
+            unsigned int dl = 0;
+            EVP_Digest(keyauth, strlen(keyauth), dg, &dl, EVP_sha256(), NULL);
+            base64_encode(dg, 32, txt, 1);
+            cpath[0] = 0;
+            if (!cfg->acme_dns_script) {
+                LOGE("acme: dns-01 for %s needs 'acme_dns_script' in the global options", ident);
+                goto fail;
+            }
+        }
+        if (cpath[0] && write_file_atomic(cpath, keyauth, strlen(keyauth), 0644) < 0) {
             LOGE("acme: cannot write challenge file %s: %s", cpath, strerror(errno));
             goto fail;
         }
-        LOGI("acme: answering http-01 challenge for %s", ident);
+        if (!cpath[0]) {
+            if (run_dns_script(cfg->acme_dns_script, "present", ident, txt) != 0) {
+                LOGE("acme: dns script failed to present the record for %s", ident);
+                goto fail;
+            }
+            LOGI("acme: dns-01 record presented for %s; waiting %.0fs for propagation", ident, cfg->acme_dns_propagation);
+            for (double t = 0; t < cfg->acme_dns_propagation && !manager_stop; t += 1)
+                sleep(1);
+        }
+        LOGI("acme: answering %s challenge for %s", want, ident);
         if (acme_post(a, curl_, "{}", &r) < 0) {
-            unlink(cpath);
+            if (cpath[0]) unlink(cpath); else run_dns_script(cfg->acme_dns_script, "cleanup", ident, txt);
             goto fail;
         }
         if (r.status >= 400) {
             acme_log_problem("challenge", &r);
-            unlink(cpath);
+            if (cpath[0]) unlink(cpath); else run_dns_script(cfg->acme_dns_script, "cleanup", ident, txt);
             goto fail;
         }
         aresp_free(&r);
         status[0] = 0;
         rc = poll_status(a, authz[i], "authorization", status, sizeof status, &r, 30);
-        unlink(cpath);
+        if (cpath[0])
+            unlink(cpath);
+        else
+            run_dns_script(cfg->acme_dns_script, "cleanup", ident, txt);
         if (rc < 0)
             goto fail;
         if (strcmp(status, "valid") != 0) {
@@ -934,7 +998,6 @@ static double cert_remaining(const config_t *cfg, char **hosts, int nhosts, int 
 /* ------------------------------------------------------------------ */
 
 static pid_t manager_pid;
-static volatile sig_atomic_t manager_stop;
 
 static void manager_sig(int sig)
 {
@@ -972,8 +1035,8 @@ static int manager_main(config_t *cfg)
             for (int h = 0; h < s->nhosts; h++)
                 if (strchr(s->hosts[h], '*'))
                     wildcard = 1;
-            if (wildcard) {
-                LOGE("acme: site %s: wildcard names need DNS validation, which is not supported; use 'tls <cert> <key>'", s->hosts[0]);
+            if (wildcard && !cfg->acme_dns_script) {
+                LOGE("acme: site %s: wildcard names need dns-01 validation; set 'acme_dns_script' or use 'tls <cert> <key>'", s->hosts[0]);
                 continue;
             }
             int covers = 0;
