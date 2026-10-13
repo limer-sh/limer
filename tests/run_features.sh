@@ -244,6 +244,9 @@ sleep 0.2
 expect_contains "json access log" "$(tail -1 $TMP/one.log)" '"host":"one.test"'
 expect_contains "json access log fields" "$(tail -1 $TMP/one.log)" '"uri":"/logme","proto":"HTTP/1.1","tls":false,"status":200'
 expect_contains "common access log file" "$(tail -1 $TMP/access.log)" 'route='
+curl -s $B/echo >/dev/null
+sleep 0.2
+expect_contains "common access log names the upstream" "$(tail -1 $TMP/access.log)" 'upstream=127.0.0.1:9701'
 
 echo "# static files"
 F=http://127.0.0.1:9785
@@ -486,6 +489,10 @@ cat > "$TMP/sticky.conf" <<CFG
     log_level warn
 }
 :9792 {
+    log {
+        output file $TMP/sticky.log
+        format json
+    }
     reverse_proxy 127.0.0.1:9701 127.0.0.1:9702 {
         lb_policy sticky_cookie session
     }
@@ -505,6 +512,14 @@ expect_not_contains "no Set-Cookie when the cookie already matches" "$(curl -s -
 both=$(for i in 1 2 3 4 5 6; do echo "$(curl -s http://127.0.0.1:9792/)"; done | sort -u | wc -l)
 expect_eq "cookie-less requests are spread" "$both" "2"
 expect_contains "unknown cookie value gets a fresh assignment" "$(curl -s -D - -o /dev/null -b 'session=0000000000000000' http://127.0.0.1:9792/)" "Set-Cookie: session="
+sleep 0.2
+expect_contains "json access log names the upstream after the response" "$(tail -1 $TMP/sticky.log)" '"upstream":"127.0.0.1:970'
+printf '{\n    log_level warn\n}\n:9793 {\n    reverse_proxy 127.0.0.1:9701 127.0.0.1:9702 {\n        lb_policy cookie rct_lb somesecret\n    }\n}\n' > "$TMP/cookie.conf"
+out=$($BIN validate -c "$TMP/cookie.conf" 2>&1)
+expect_contains "caddy-style 'lb_policy cookie name secret' validates" "$out" "valid"
+printf '{\n    log_level warn\n}\n:9793 {\n    reverse_proxy 127.0.0.1:9701 127.0.0.1:9702 {\n        lb_policy round_robin extra\n    }\n}\n' > "$TMP/cookie-bad.conf"
+out=$($BIN validate -c "$TMP/cookie-bad.conf" 2>&1)
+expect_contains "extra lb_policy arguments are still rejected" "$out" "takes no arguments"
 kill -TERM $STP; wait $STP 2>/dev/null
 
 echo "# runtime admin api: drain, weights, overrides"
