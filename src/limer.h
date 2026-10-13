@@ -195,6 +195,7 @@ enum lb_policy {
     LB_RANDOM,
     LB_FIRST,
     LB_HASH,            /* rendezvous hash on a key source */
+    LB_STICKY,          /* cookie-based sticky sessions */
 };
 
 enum key_src {
@@ -252,6 +253,8 @@ typedef struct upstream {
     int   resolved;
 
     /* runtime state */
+    int   drained;            /* runtime: take no new requests */
+    char  sticky_id[20];      /* value used in sticky cookies */
     int   active;             /* in-flight requests */
     uint64_t requests;
     uint64_t failures;
@@ -321,6 +324,24 @@ typedef struct basic_auth {
     char *realm;
 } basic_auth_t;
 
+/* rate limiting (ratelimit.c) */
+typedef struct ratelimit ratelimit_t;
+ratelimit_t *ratelimit_new(double rate, double burst, int max_keys);
+void         ratelimit_free(ratelimit_t *rl);
+int          ratelimit_check(ratelimit_t *rl, const char *key, double now, double *retry_after);
+void         ratelimit_stats(const ratelimit_t *rl, uint64_t *hits, uint64_t *limited, int *keys);
+double       ratelimit_rate(const ratelimit_t *rl);
+
+typedef struct rate_limit_cfg {
+    char  *name;        /* zone name for metrics */
+    char  *key;         /* placeholder template, default {remote_ip} */
+    double rate;        /* requests per second */
+    double burst;
+    int    status;      /* default 429 */
+    int    max_keys;
+    ratelimit_t *rl;    /* runtime table */
+} rate_limit_cfg_t;
+
 typedef struct file_server {
     char *root;
     char **index;  int nindex;
@@ -341,6 +362,7 @@ typedef struct route {
     rewrite_t *rw; int nrw;
     basic_auth_t *auth;
     file_server_t *files;
+    rate_limit_cfg_t *rl;
 } route_t;
 
 enum tls_mode { TLS_NONE = 0, TLS_FILES, TLS_INTERNAL, TLS_AUTO };
@@ -366,6 +388,7 @@ typedef struct server {
     hdr_op_t *hdr_down; int n_hdr_down;   /* `header` directive: all responses */
     hdr_op_t *hdr_up;   int n_hdr_up;     /* `request_header`: all proxied requests */
     basic_auth_t *auth;                   /* server-wide basic_auth */
+    rate_limit_cfg_t *rl;                 /* server-wide rate limit */
     char   *encode;      /* "gzip zstd br" or NULL */
     int     encode_min;
     int     redirect_https;   /* http listener that redirects to https (auto https) */

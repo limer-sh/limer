@@ -365,7 +365,7 @@ cat > "$TMP/uptls-admin.conf" <<CFG
 CFG
 $BIN run -c "$TMP/uptls-admin.conf" >/dev/null 2>&1 & UP2=$!; PIDS+=($UP2)
 wait_port 9787; sleep 1
-expect_contains "active health checks over tls report up" "$(curl -s http://127.0.0.1:9787/upstreams)" '"address":"127.0.0.1:9703","weight":1,"healthy":true'
+expect_contains "active health checks over tls report up" "$(curl -s http://127.0.0.1:9787/upstreams)" '"address":"127.0.0.1:9703","weight":1,"drained":false,"healthy":true'
 kill -TERM $UP $UP2; wait $UP $UP2 2>/dev/null
 
 echo "# http/2"
@@ -421,6 +421,90 @@ CFG
 else
     echo "  skip - built without HTTP/2"
 fi
+
+echo "# rate limiting"
+cat > "$TMP/rl.conf" <<CFG
+{
+    admin 127.0.0.1:9791
+    log_level warn
+}
+:9790 {
+    rate_limit site 1000r/s
+
+    route {
+        match path /limited
+        rate_limit strict {
+            key {remote_ip}
+            rate 2r/s
+            burst 3
+        }
+        respond "ok"
+    }
+    route {
+        match path /perkey
+        rate_limit perkey {
+            key {header.X-Api-Key}
+            rate 60r/m
+            burst 2
+            status 503
+        }
+        respond "ok"
+    }
+    route {
+        match path /json
+        rate_limit json {
+            key {json.tenant}
+            rate 1r/s
+            burst 1
+        }
+        respond "ok"
+    }
+    respond "free"
+}
+CFG
+$BIN run -c "$TMP/rl.conf" >/dev/null 2>&1 & RLP=$!; PIDS+=($RLP)
+wait_port 9790
+codes=$(for i in 1 2 3 4 5; do curl -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:9790/limited; done)
+expect_eq "burst allows 3 then limits" "$codes" "200 200 200 429 429 "
+expect_contains "429 carries Retry-After" "$(curl -s -D - -o /dev/null http://127.0.0.1:9790/limited)" "Retry-After: 1"
+sleep 1.1
+expect_eq "tokens refill over time" "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9790/limited)" "200"
+a=$(for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code} ' -H 'X-Api-Key: a' http://127.0.0.1:9790/perkey; done)
+b=$(for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code} ' -H 'X-Api-Key: b' http://127.0.0.1:9790/perkey; done)
+expect_eq "per-key limit: key a" "$a" "200 200 503 "
+expect_eq "per-key limit: key b is independent" "$b" "200 200 503 "
+j=$(for t in x x y; do curl -s -o /dev/null -w '%{http_code} ' -X POST -d "{\"tenant\":\"$t\"}" http://127.0.0.1:9790/json; done)
+expect_eq "json field as rate limit key" "$j" "200 429 200 "
+expect_eq "unlimited route unaffected" "$(curl -s http://127.0.0.1:9790/other)" "free"
+expect_contains "rate limit metrics" "$(curl -s http://127.0.0.1:9791/metrics)" 'limer_rate_limit_total{worker="0",zone="strict",result="limited"}'
+kill -TERM $RLP; wait $RLP 2>/dev/null
+
+echo "# sticky sessions"
+cat > "$TMP/sticky.conf" <<CFG
+{
+    log_level warn
+}
+:9792 {
+    reverse_proxy 127.0.0.1:9701 127.0.0.1:9702 {
+        lb_policy sticky_cookie session
+    }
+}
+CFG
+$BIN run -c "$TMP/sticky.conf" >/dev/null 2>&1 & STP=$!; PIDS+=($STP)
+wait_port 9792
+hdr=$(curl -s -D - -o /dev/null http://127.0.0.1:9792/)
+expect_contains "first response sets the sticky cookie" "$hdr" "Set-Cookie: session="
+expect_contains "cookie attributes" "$hdr" "Path=/; HttpOnly"
+cookie=$(grep -i '^Set-Cookie' <<<"$hdr" | sed 's/Set-Cookie: //; s/;.*//' | tr -d '\r')
+first=$(curl -s -b "$cookie" http://127.0.0.1:9792/)
+same=1
+for i in 1 2 3 4 5 6; do [ "$(curl -s -b "$cookie" http://127.0.0.1:9792/)" = "$first" ] || same=0; done
+[ $same = 1 ] && ok "requests with the cookie stay on one upstream" || fail "requests with the cookie stay on one upstream"
+expect_not_contains "no Set-Cookie when the cookie already matches" "$(curl -s -D - -o /dev/null -b "$cookie" http://127.0.0.1:9792/)" "Set-Cookie"
+both=$(for i in 1 2 3 4 5 6; do echo "$(curl -s http://127.0.0.1:9792/)"; done | sort -u | wc -l)
+expect_eq "cookie-less requests are spread" "$both" "2"
+expect_contains "unknown cookie value gets a fresh assignment" "$(curl -s -D - -o /dev/null -b 'session=0000000000000000' http://127.0.0.1:9792/)" "Set-Cookie: session="
+kill -TERM $STP; wait $STP 2>/dev/null
 
 echo "# reload keeps virtual hosts"
 sed -i 's/respond "two"/respond "two-v2"/' "$TMP/Limerfile"

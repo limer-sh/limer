@@ -407,7 +407,7 @@ expect_contains "admin /health" "$(curl -s $A/health)" '"status":"ok"'
 ups=$(curl -s $A/upstreams)
 expect_contains "admin /upstreams lists pools" "$ups" '"name":"orders"'
 expect_contains "admin /upstreams shows hash key" "$ups" '"hash_key":{"source":"json","name":"customer.id"}'
-expect_contains "admin /upstreams marks sick upstream" "$ups" '"address":"127.0.0.1:9131","weight":1,"healthy":false'
+expect_contains "admin /upstreams marks sick upstream" "$ups" '"address":"127.0.0.1:9131","weight":1,"drained":false,"healthy":false'
 expect_contains "admin /metrics" "$(curl -s $A/metrics)" 'limer_upstream_healthy{worker="0",pool="sick",upstream="127.0.0.1:9131"} 0'
 expect_contains "admin /config" "$(curl -s $A/config)" "route orders"
 expect_eq "admin unknown -> 404" "$(H $A/nope)" "404"

@@ -1089,6 +1089,78 @@ TEST(test_balance)
 }
 
 /* ------------------------------------------------------------------ */
+TEST(test_ratelimit)
+{
+    ratelimit_t *rl = ratelimit_new(2.0, 3.0, 4);
+    double retry = 0;
+    /* burst of 3, then limited */
+    CHECK(ratelimit_check(rl, "a", 100.0, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 100.0, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 100.0, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 100.0, &retry) == 0 && retry > 0.49 && retry < 0.51);
+    /* independent keys */
+    CHECK(ratelimit_check(rl, "b", 100.0, &retry) == 1);
+    /* refill: 0.5s -> one token */
+    CHECK(ratelimit_check(rl, "a", 100.5, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 100.5, &retry) == 0);
+    /* never exceeds burst after a long idle */
+    CHECK(ratelimit_check(rl, "a", 1000.0, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 1000.0, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 1000.0, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 1000.0, &retry) == 0);
+    /* table cap: more keys than max_keys evicts idle ones, service continues */
+    for (int i = 0; i < 50; i++) {
+        char k[16];
+        snprintf(k, sizeof k, "k%d", i);
+        CHECK(ratelimit_check(rl, k, 2000.0 + i, &retry) == 1);
+    }
+    uint64_t hits, limited;
+    int keys;
+    ratelimit_stats(rl, &hits, &limited, &keys);
+    CHECK(keys <= 4 && hits == 61 && limited == 3);
+    CHECK(ratelimit_rate(rl) == 2.0);
+    ratelimit_free(rl);
+
+    /* config forms */
+    config_t *c = cfg_ok(":1 {\n rate_limit 5r/s\n route {\n  match path /x\n  rate_limit zone1 {\n   key {header.X-Key}\n   rate 120r/m\n   burst 10\n   status 503\n   max_keys 50\n  }\n  respond ok\n }\n}\n");
+    if (c) {
+        server_t *s = c->servers[0];
+        CHECK(s->rl && s->rl->rate == 5 && s->rl->burst == 5 && s->rl->status == 429);
+        CHECK_STR(s->rl->key, "{remote_ip}");
+        rate_limit_cfg_t *r = s->routes[0]->rl;
+        CHECK(r && r->rate == 2 && r->burst == 10 && r->status == 503 && r->max_keys == 50);
+        CHECK_STR(r->name, "zone1");
+        CHECK_STR(r->key, "{header.X-Key}");
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n rate_limit {\n  key {remote_ip}\n }\n respond ok\n}\n", "needs a rate");
+    cfg_bad(":1 {\n rate_limit {\n  rate fast\n }\n respond ok\n}\n", "invalid rate");
+    cfg_bad(":1 {\n rate_limit 1r/s {\n  bogus 1\n }\n respond ok\n}\n", "unknown rate_limit option");
+
+    /* sticky cookie policy */
+    c = cfg_ok(":1 {\n reverse_proxy 127.0.0.1:1 127.0.0.1:2 {\n  lb_policy sticky_cookie sess\n }\n}\n");
+    if (c) {
+        pool_t *p = c->servers[0]->routes[0]->pool;
+        CHECK(p->policy == LB_STICKY && p->key.src == KS_COOKIE);
+        CHECK_STR(p->key.name, "sess");
+        CHECK(strlen(p->ups[0]->sticky_id) == 16 && strcmp(p->ups[0]->sticky_id, p->ups[1]->sticky_id) != 0);
+        /* selection follows the cookie, falls back otherwise */
+        tctx_t t;
+        char raw[128];
+        snprintf(raw, sizeof raw, "GET / HTTP/1.1\r\nCookie: sess=%s\r\n\r\n", p->ups[1]->sticky_id);
+        tctx_init(&t, raw, "1.1.1.1");
+        int idx;
+        char why[64];
+        CHECK(pool_select(p, &t.ctx, 0, 0, &idx, why, sizeof why) == p->ups[1] && strcmp(why, "sticky_cookie") == 0);
+        p->ups[1]->drained = 1;
+        CHECK(pool_select(p, &t.ctx, 0, 0, &idx, why, sizeof why) == p->ups[0]); /* drained -> reassigned */
+        CHECK(strstr(why, "new") != NULL);
+        http_req_free(&t.req);
+        config_unref(c);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 int main(void)
 {
     log_level = LOG_ERROR;
@@ -1101,6 +1173,7 @@ int main(void)
     test_config_run();
     test_match_run();
     test_balance_run();
+    test_ratelimit_run();
     printf("unit tests: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
