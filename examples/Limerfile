@@ -9,12 +9,16 @@
 {
     workers auto              # worker processes (default 1)
     admin 127.0.0.1:2019      # admin API: /health /upstreams /metrics /config /reload
+                              #   POST /upstreams/<host:port>/drain|undrain|weight/<n>, /overrides
     log_level info            # debug | info | warn | error
     max_connections auto      # per worker; auto = half the descriptor limit
     pidfile /tmp/limer.pid    # enables `limer reload` and `limer stop`
     grace 10s                 # how long to drain connections on shutdown
     email {$ACME_EMAIL:admin@example.com}   # ACME account contact for automatic HTTPS
     storage /var/lib/limer    # certificates and ACME state
+    acme_challenge http-01    # or tls-alpn-01 (port 443 only) or dns-01 (wildcards):
+    # acme_dns_script /etc/limer/dns-hook.sh   # called: present|cleanup <domain> <txt>
+    # acme_dns_propagation 30s
 }
 
 # Snippets can be imported anywhere; {args.N} are substituted.
@@ -74,6 +78,18 @@ example.com, www.example.com {
         }
     }
 
+    route login {
+        match path /login
+        rate_limit login {            # token bucket per client ip
+            key {remote_ip}
+            rate 5r/m
+            burst 5
+        }
+        reverse_proxy 10.0.0.10:8080 10.0.0.11:8080 {
+            lb_policy sticky_cookie session   # same browser -> same upstream
+        }
+    }
+
     route admin {
         match path /admin/*
         match remote_ip 10.0.0.0/8 192.168.0.0/16
@@ -111,6 +127,11 @@ api.example.com {
     reverse_proxy https://10.0.7.10:8443 {
         tls_server_name backend.internal   # name to verify (system CA store, or tls_trusted_ca_certs <pem>)
     }
+}
+
+# --- gRPC: HTTP/2 to the upstreams, trailers pass through ------------------
+grpc.example.com {
+    reverse_proxy h2c://10.0.8.10:50051 h2c://10.0.8.11:50051   # h2:// for TLS upstreams
 }
 
 # --- Local development: self-signed certificate, no ACME -------------------
