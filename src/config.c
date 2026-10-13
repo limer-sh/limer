@@ -702,6 +702,7 @@ static void config_free(config_t *c)
     free(c->acme_ca);
     free(c->acme_ca_root);
     free(c->acme_email);
+    free(c->acme_dns_script);
     free(c);
 }
 
@@ -2155,6 +2156,27 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
                 return -1;
             free(cfg->acme_ca_root);
             cfg->acme_ca_root = xstrdup(c->args[1]);
+        } else if (strcaseeq(k, "acme_challenge")) {
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            if (strcaseeq(c->args[1], "http-01") || strcaseeq(c->args[1], "http"))
+                cfg->acme_challenge = 0;
+            else if (strcaseeq(c->args[1], "tls-alpn-01") || strcaseeq(c->args[1], "tls-alpn"))
+                cfg->acme_challenge = 1;
+            else if (strcaseeq(c->args[1], "dns-01") || strcaseeq(c->args[1], "dns"))
+                cfg->acme_challenge = 2;
+            else
+                FAIL("line %d: acme_challenge accepts http-01, tls-alpn-01 or dns-01", c->line);
+        } else if (strcaseeq(k, "acme_dns_script")) {
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            if (access(c->args[1], X_OK) != 0)
+                FAIL("line %d: acme_dns_script '%s' is not executable", c->line, c->args[1]);
+            free(cfg->acme_dns_script);
+            cfg->acme_dns_script = xstrdup(c->args[1]);
+        } else if (strcaseeq(k, "acme_dns_propagation")) {
+            if (want_args(c, 1, 1, err, errlen) < 0 || arg_duration(c, 1, &cfg->acme_dns_propagation, err, errlen) < 0)
+                return -1;
         } else if (strcaseeq(k, "auto_https")) {
             if (want_args(c, 1, 1, err, errlen) < 0)
                 return -1;
@@ -2327,6 +2349,7 @@ static config_t *config_parse_in(const char *text, const char *path, const char 
     cfg->grace = 10;
     cfg->http_port = 80;
     cfg->https_port = 443;
+    cfg->acme_dns_propagation = 10;
     cfg->path = xstrdup(path ? path : "<inline>");
     cfg->text = xstrdup(text);
 

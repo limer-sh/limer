@@ -27,7 +27,10 @@ jobs:
           curl -sSL -o /tmp/pebble.tar.gz https://github.com/letsencrypt/pebble/releases/latest/download/pebble-linux-amd64.tar.gz
           tar xzf /tmp/pebble.tar.gz -C /tmp
           sudo install -m 0755 "$(find /tmp/pebble-linux-amd64 -type f -name pebble)" /usr/local/bin/pebble
-          echo "127.0.0.1 limer.test www.limer.test" | sudo tee -a /etc/hosts
+          curl -sSL -o /tmp/challtestsrv.tar.gz https://github.com/letsencrypt/pebble/releases/latest/download/pebble-challtestsrv-linux-amd64.tar.gz
+          tar xzf /tmp/challtestsrv.tar.gz -C /tmp
+          sudo install -m 0755 "$(find /tmp/pebble-challtestsrv-linux-amd64 -type f -name pebble-challtestsrv)" /usr/local/bin/pebble-challtestsrv
+          echo "127.0.0.1 limer.test www.limer.test alpn.limer.test dns.limer.test" | sudo tee -a /etc/hosts
       - name: Automatic HTTPS (ACME) tests
         run: make acme
       - name: Security tests

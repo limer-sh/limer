@@ -80,7 +80,8 @@ security: $(BIN)
 features: $(BIN)
 	./tests/run_features.sh
 
-# Needs a `pebble` binary (PEBBLE=/path) and `127.0.0.1 limer.test www.limer.test` in /etc/hosts; skips otherwise.
+# Needs `pebble` (PEBBLE=/path), optionally `pebble-challtestsrv` (CHALLTESTSRV=/path) for dns-01,
+# and `127.0.0.1 limer.test www.limer.test alpn.limer.test dns.limer.test` in /etc/hosts; skips otherwise.
 acme: $(BIN)
 	./tests/run_acme.sh
 

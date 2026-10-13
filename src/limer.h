@@ -416,6 +416,9 @@ typedef struct config {
     char    *acme_ca_root;      /* PEM bundle to trust for the ACME CA (testing) */
     char    *acme_email;
     int      acme_disabled;     /* auto_https off */
+    int      acme_challenge;    /* 0 http-01, 1 tls-alpn-01, 2 dns-01 */
+    char    *acme_dns_script;   /* "script present|cleanup <domain> <txt>" for dns-01 */
+    double   acme_dns_propagation; /* wait after "present" */
     int      refs;
 } config_t;
 
@@ -501,6 +504,8 @@ int  tls_init_pool_client(pool_t *p, char *err, size_t errlen);  /* client conte
 void tls_free_pool_client(pool_t *p);
 #ifdef LIMER_TLS
 void tls_set_sni_resolver(SSL_CTX *(*fn)(SSL *, const char *));
+/* tls-alpn-01: resolver returns 1 and the key authorisation for a name under validation */
+void tls_set_acme_resolver(int (*fn)(SSL *, const char *name, char *keyauth, size_t n));
 #endif
 /* basic auth */
 int  auth_verify(const basic_auth_t *a, const char *authorization_header);
