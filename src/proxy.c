@@ -19,6 +19,7 @@
 #include <strings.h>
 #include <sys/epoll.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <sys/un.h>
@@ -3114,6 +3115,10 @@ static void do_reload(void)
     config_t *old = g_cfg;
     g_cfg = cfg;
     retire_config(old);
+    if (g_worker_id == 0) {
+        acme_manager_stop();
+        acme_manager_start(cfg);
+    }
     LOGI("configuration reloaded");
 }
 
@@ -3149,6 +3154,13 @@ static void begin_shutdown(void)
 static void tick(void)
 {
     g_now = now_mono();
+    if (g_worker_id == 0) {
+        /* reap the certificate manager if it exited; restart it later via reload */
+        int status;
+        pid_t p;
+        while ((p = waitpid(-1, &status, WNOHANG)) > 0)
+            LOGW("child process %d exited unexpectedly", (int)p);
+    }
     if (g_reload_flag) {
         g_reload_flag = 0;
         do_reload();
@@ -3269,6 +3281,9 @@ int proxy_run(config_t *cfg, int worker_id)
         return 1;
     }
 
+    if (worker_id == 0)
+        acme_manager_start(cfg);
+
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     struct itimerspec its;
     its.it_interval.tv_sec = 0;
@@ -3308,6 +3323,8 @@ int proxy_run(config_t *cfg, int worker_id)
     }
 
     /* teardown */
+    if (worker_id == 0)
+        acme_manager_stop();
     while (g_conns)
         conn_close(g_conns);
     while (g_uconns)

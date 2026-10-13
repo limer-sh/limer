@@ -71,8 +71,12 @@ security: $(BIN)
 features: $(BIN)
 	./tests/run_features.sh
 
-# Everything: unit tests, parser fuzzing, integration, feature and security suites.
-check: unit fuzz integration features security
+# Needs a `pebble` binary (PEBBLE=/path) and `127.0.0.1 limer.test www.limer.test` in /etc/hosts; skips otherwise.
+acme: $(BIN)
+	./tests/run_acme.sh
+
+# Everything: unit tests, parser fuzzing, integration, feature, ACME and security suites.
+check: unit fuzz integration features acme security
 
 # The same suites with sanitizers enabled (slower; rebuilds everything).
 check-asan:
@@ -87,4 +91,4 @@ install: $(BIN)
 clean:
 	rm -rf build $(BIN) tests/tmp
 
-.PHONY: all unit fuzz integration features security check check-asan install clean
+.PHONY: all unit fuzz integration features acme security check check-asan install clean
