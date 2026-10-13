@@ -23,6 +23,15 @@ override CFLAGS += -DLIMER_ENCODE $(shell pkg-config --cflags zlib libzstd libbr
 LDLIBS += $(shell pkg-config --libs zlib libzstd libbrotlienc 2>/dev/null)
 endif
 
+# HTTP/2 needs libnghttp2 (auto-detected; requires TLS for ALPN).
+H2 ?= $(shell pkg-config --exists libnghttp2 2>/dev/null && echo 1 || echo 0)
+ifeq ($(H2),1)
+ifeq ($(TLS),1)
+override CFLAGS += -DLIMER_H2 $(shell pkg-config --cflags libnghttp2 2>/dev/null)
+LDLIBS += $(shell pkg-config --libs libnghttp2 2>/dev/null)
+endif
+endif
+
 # `make SAN=1` builds everything with AddressSanitizer + UBSan.
 ifeq ($(SAN),1)
 override CFLAGS  += -fsanitize=address,undefined -fno-omit-frame-pointer -O1
