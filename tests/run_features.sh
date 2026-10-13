@@ -607,11 +607,95 @@ CFG
     okc=$(for i in $(seq 1 20); do python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost >/dev/null 2>&1 & done; wait; echo done)
     expect_eq "20 parallel grpc calls complete" "$okc" "done"
     expect_contains "grpc calls succeeded after concurrency" "$(python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost 2>&1)" "pong:hello"
+    # streamed request bodies: bidirectional ping-pong and client streaming
+    expect_contains "grpc bidirectional streaming (50 ping-pong messages)" "$(python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost --chat 50 2>&1)" "chat 50 replies, last=echo:m49, extra=0"
+    expect_contains "grpc bidirectional streaming over h2c" "$(python3 tests/grpc_service.py call 127.0.0.1:9796 --chat 20 2>&1)" "chat 20 replies, last=echo:m19"
+    expect_contains "grpc client streaming (2000 messages)" "$(python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost --sum 2000 2>&1)" "sum:1999000 count=2000"
     expect_eq "no errors logged" "$(grep -c "error" $TMP/grpc.log)" "0"
     kill -TERM $GP; wait $GP 2>/dev/null
 else
     echo "  skip - HTTP/2 build or grpcio not available"
 fi
+
+echo "# streaming request bodies"
+cat > "$TMP/stream.conf" <<CFG
+{
+    log_level warn
+    admin off
+}
+:9798 {
+    request_body {
+        max_size 100m
+    }
+    route {
+        match path /echo
+        match json kind == x
+        reverse_proxy 127.0.0.1:9702
+    }
+    reverse_proxy 127.0.0.1:9701
+}
+:9799 {
+    request_body {
+        max_size 100m
+        mode buffer
+    }
+    reverse_proxy 127.0.0.1:9701
+}
+:9800 {
+    max_body 100k
+    reverse_proxy 127.0.0.1:9701
+}
+https://localhost:9801 {
+    tls internal
+    request_body {
+        max_size 100m
+    }
+    reverse_proxy 127.0.0.1:9701
+}
+CFG
+$BIN run -c "$TMP/stream.conf" >/dev/null 2>"$TMP/stream.log" & SP=$!; PIDS+=($SP)
+wait_port 9798; wait_port 9801
+head -c 20000000 /dev/urandom > "$TMP/upload.bin"
+SUM=$(sha256sum "$TMP/upload.bin" | cut -d' ' -f1)
+r=$(curl -s --data-binary @"$TMP/upload.bin" -H 'Content-Type: application/octet-stream' http://127.0.0.1:9798/upload)
+expect_contains "20 MB upload streamed with Content-Length" "$r" "\"body_len\": 20000000"
+expect_contains "streamed upload intact" "$r" "$SUM"
+expect_contains "Content-Length framing preserved" "$r" "\"chunked\": false"
+r=$(curl -s --data-binary @"$TMP/upload.bin" -H 'Transfer-Encoding: chunked' http://127.0.0.1:9798/upload)
+expect_contains "chunked upload streamed as chunked" "$r" "\"chunked\": true"
+expect_contains "chunked streamed upload intact" "$r" "$SUM"
+# a route that inspects the body forces buffering: the upstream sees a Content-Length
+r=$(curl -s -H 'Transfer-Encoding: chunked' -H 'Content-Type: application/json' --data-binary '{"kind":"x"}' http://127.0.0.1:9798/echo)
+expect_contains "json matcher still routes on the body" "$r" "\"name\": \"b\""
+expect_contains "body-inspecting route buffers (Content-Length upstream)" "$r" "\"Content-Length\": \"12\""
+r=$(curl -s -H 'Transfer-Encoding: chunked' --data-binary 'plain' http://127.0.0.1:9798/echo)
+expect_contains "non-matching body falls through, still buffered because of route order" "$r" "\"Content-Length\": \"5\""
+r=$(curl -s -H 'Transfer-Encoding: chunked' --data-binary 'plain' http://127.0.0.1:9799/echo)
+expect_contains "request_body mode buffer forces buffering" "$r" "\"Content-Length\": \"5\""
+# streaming still enforces max_body
+r=$(H -H 'Transfer-Encoding: chunked' --data-binary @"$TMP/big.txt" http://127.0.0.1:9800/upload)
+expect_eq "max_body enforced while streaming a chunked body" "$r" "413"
+r=$(H --data-binary @"$TMP/big.txt" http://127.0.0.1:9800/upload)
+expect_eq "max_body enforced on Content-Length up front" "$r" "413"
+r=$(H --data-binary 'small' http://127.0.0.1:9800/upload)
+expect_eq "small bodies still fine" "$r" "200"
+# upstream answers before reading the body: client gets the answer, nothing is poisoned
+r=$(curl -s -D - --data-binary @"$TMP/upload.bin" http://127.0.0.1:9798/early)
+expect_contains "early upstream response delivered" "$r" "HTTP/1.1 413"
+expect_contains "early response closes the client connection" "$r" "Connection: close"
+expect_eq "proxy healthy after early response" "$(H http://127.0.0.1:9798/get)" "200"
+# HTTP/2 clients stream too, with and without content-length
+r=$(curl -sk --http2 --data-binary @"$TMP/upload.bin" https://localhost:9801/upload)
+expect_contains "h2 upload streamed to an http/1.1 upstream" "$r" "$SUM"
+expect_contains "h2 upload keeps its Content-Length" "$r" "\"content_length\": \"20000000\""
+r=$(curl -sk --http2 -H 'Transfer-Encoding: chunked' --data-binary @"$TMP/upload.bin" https://localhost:9801/upload)
+expect_contains "h2 upload without content-length is chunked upstream" "$r" "\"chunked\": true"
+expect_contains "h2 chunked upload intact" "$r" "$SUM"
+# many concurrent uploads
+okc=$( (for i in $(seq 1 8); do curl -s --data-binary @"$TMP/upload.bin" http://127.0.0.1:9798/upload | grep -c "$SUM" & done; wait) | tr -d '\n')
+expect_eq "8 concurrent 20 MB uploads intact" "$okc" "11111111"
+expect_eq "no errors logged" "$(grep -c "error" $TMP/stream.log)" "0"
+kill -TERM $SP; wait $SP 2>/dev/null
 
 echo "# reload keeps virtual hosts"
 sed -i 's/respond "two"/respond "two-v2"/' "$TMP/Limerfile"

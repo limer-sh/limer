@@ -160,6 +160,10 @@ typedef struct uconn {
     int32_t h2u_stream_id;
     int h2u_submitted, h2u_head_done, h2u_dirty, h2u_trailers, h2u_skip, h2u_failed, h2u_stream_open;
     size_t h2u_unconsumed;
+    int h2u_req_deferred, h2u_want_pump;
+    /* streamed request body */
+    int req_eof;                /* the whole request body has been handed over */
+    int body_chunked_out;       /* we frame the streamed body as chunked for an HTTP/1.1 upstream */
     struct uconn *idle_next;
     struct uconn *prev, *next;      /* global list */
     int dead;
@@ -207,6 +211,11 @@ typedef struct conn {
     int expect_sent;
     int upstream_reusable;      /* response framing allows pooling the upstream conn */
     int set_sticky;             /* add the sticky-session cookie to the response */
+    int body_stream;            /* the request body is forwarded as it arrives */
+    int body_done;              /* ... and has been forwarded completely */
+    int body_sent;              /* some body bytes reached the upstream: no retries */
+    size_t body_seen;           /* body bytes received so far (streaming) */
+    size_t h2_unconsumed;       /* HTTP/2 flow-control bytes not yet released */
     int resp_committed;         /* some response bytes reached the socket */
     size_t resp_head_mark;      /* wbuf readable length before the response head */
     int pre_head_close;         /* close_after_write before the head was built */
@@ -222,7 +231,8 @@ typedef struct conn {
     void *h2;
     struct conn *h2_parent;
     int32_t h2_stream_id;
-    int h2_submitted, h2_eof, h2_deferred, h2_chunked, h2_detached;
+    int h2_submitted, h2_eof, h2_deferred, h2_chunked, h2_detached, h2_body_started, h2_req_raw;
+    int64_t h2_req_clen;        /* content-length announced by the HTTP/2 client, -1 if none */
     chunk_state_t h2_cs;
     buf_t h2_body, h2_hdrs, h2_cookie, h2_reqbody, h2_trailers;
     size_t h2_reqlen;
@@ -282,6 +292,7 @@ static void reap_graveyard(void)
 
 static void conn_close(conn_t *c);
 static void conn_process(conn_t *c);
+static void conn_pump_body(conn_t *c);
 #ifdef LIMER_H2
 #define H2_SEND_HIGH (1024 * 1024)
 struct h2u_session;
@@ -290,6 +301,8 @@ static void h2u_submit(uconn_t *uc);
 static void h2u_detach(uconn_t *uc);
 static void h2u_consumed(uconn_t *uc, size_t n);
 static void h2u_resume(uconn_t *uc);
+static void h2u_body_resume(uconn_t *uc);
+static void h2_stream_consumed(conn_t *st, size_t n);
 static void h2u_tick(void);
 static void h2u_retire_config(config_t *old);
 static void uconn_on_response_data(uconn_t *uc);
@@ -764,6 +777,10 @@ static void conn_reset_request(conn_t *c)
     c->expect_sent = 0;
     c->upstream_reusable = 0;
     c->set_sticky = 0;
+    c->body_stream = 0;
+    c->body_done = 0;
+    c->body_sent = 0;
+    c->body_seen = 0;
     c->resp_committed = 0;
     c->resp_head_mark = 0;
     c->pre_head_close = 0;
@@ -805,8 +822,10 @@ static void conn_update_mask(conn_t *c)
             m |= EPOLLIN;
         break;
     case CS_UPSTREAM:
-        /* keep watching for pipelined data / disconnect, with a cap */
-        if (!c->rd_eof && buf_readable(&c->rbuf) < RBUF_PIPELINE_CAP)
+        /* keep watching for pipelined data / disconnect, with a cap; while the
+         * request body streams, stop reading when the upstream side is backed up */
+        if (!c->rd_eof && buf_readable(&c->rbuf) < RBUF_PIPELINE_CAP &&
+            !(c->body_stream && !c->body_done && c->uc && buf_readable(&c->uc->wbuf) >= WBUF_HIGH_WATER))
             m |= EPOLLIN;
         break;
     case CS_TUNNEL:
@@ -1125,6 +1144,8 @@ static void conn_next_request(conn_t *c)
 {
     conn_log_access(c);
     c->requests++;
+    if (c->body_stream && !c->body_done)
+        c->close_after_write = 1; /* the rest of the request body is still in flight */
     if (c->resp_status >= 100 && c->resp_status < 600)
         g_stats.resp_class[c->resp_status / 100]++;
 #ifdef LIMER_H2
@@ -1375,6 +1396,8 @@ static void uconn_fail(uconn_t *uc, const char *reason, int status, int retryabl
         c->up->active--;
         c->up = NULL;
     }
+    if (c->body_stream && c->body_sent)
+        retryable = 0; /* part of the streamed body is gone with the connection */
     if (c->resp_head_sent && !c->resp_committed && c->state == CS_UPSTREAM) {
         /* the response head is still only buffered: drop it and answer with an error */
         c->wbuf.len = c->wbuf.off + c->resp_head_mark;
@@ -1446,7 +1469,23 @@ static void build_upstream_request(conn_t *c, uconn_t *uc)
         hlist_add(&h, "Connection", "Upgrade");
     else
         hlist_add(&h, "Connection", p->keepalive_idle > 0 ? "keep-alive" : "close");
-    if (has_body || buf_readable(&r->body) > 0) {
+    uc->req_eof = 1;
+    uc->body_chunked_out = 0;
+    if (c->body_stream) {
+        /* the body follows as it arrives: keep the client's framing for HTTP/1.1
+         * upstreams, send raw DATA frames to HTTP/2 ones */
+        uc->req_eof = 0;
+        if (r->chunked) {
+            if (!uc->h2u) {
+                hlist_add(&h, "Transfer-Encoding", "chunked");
+                uc->body_chunked_out = 1;
+            }
+        } else {
+            char tmp[32];
+            snprintf(tmp, sizeof tmp, "%lld", (long long)r->content_length);
+            hlist_add(&h, "Content-Length", tmp);
+        }
+    } else if (has_body || buf_readable(&r->body) > 0) {
         char tmp[32];
         snprintf(tmp, sizeof tmp, "%zu", buf_readable(&r->body));
         hlist_add(&h, "Content-Length", tmp);
@@ -1606,7 +1645,7 @@ static void build_client_response_head(conn_t *c, uconn_t *uc)
         if (c->req.minor >= 1)
             c->out_chunked = 1;
     }
-    int keep = c->req.keep_alive && !g_shutting_down && !tunnel;
+    int keep = c->req.keep_alive && !g_shutting_down && !tunnel && !(c->body_stream && !c->body_done);
     if (c->enc) {
         if (!c->out_chunked)
             keep = 0;
@@ -1691,7 +1730,7 @@ static void conn_response_done(conn_t *c)
         c->up = NULL;
     }
     if (uc) {
-        uconn_release(uc, c->upstream_reusable);
+        uconn_release(uc, c->upstream_reusable && (!c->body_stream || c->body_done));
     }
     c->deadline = 0;
     conn_next_request(c);
@@ -1820,6 +1859,8 @@ static void uconn_on_response_data(uconn_t *uc)
         }
         uc->head_done = 1;
         c->deadline = 0;
+        if (c->body_stream && !c->body_done)
+            c->close_after_write = 1; /* cannot resynchronise an HTTP/1.1 connection mid-body */
         c->resp_head_mark = buf_readable(&c->wbuf);
         c->pre_head_close = c->close_after_write;
         build_client_response_head(c, uc);
@@ -1930,6 +1971,11 @@ static void uconn_cb(ev_t *e, uint32_t events)
             ev_mod(&uc->ev, m);
             if (uc->state == US_TUNNEL && c)
                 conn_update_mask(c); /* resume client reads */
+            if (c && c->body_stream && !c->body_done) {
+                conn_pump_body(c);
+                if (uc->dead || c->dead)
+                    return;
+            }
         }
     }
 
@@ -2127,11 +2173,9 @@ static void conn_respond_unauthorized(conn_t *c, const basic_auth_t *a)
 static void conn_serve_files(conn_t *c, route_t *r);
 static void file_pump(conn_t *c);
 
-static void conn_dispatch(conn_t *c)
+static void conn_ctx_init(conn_t *c)
 {
-    http_req_t *r = &c->req;
-    g_stats.requests++;
-    c->ctx.req = r;
+    c->ctx.req = &c->req;
     c->ctx.peer = (struct sockaddr *)&c->peer;
     c->ctx.peerlen = c->peerlen;
     snprintf(c->ctx.peer_ip, sizeof c->ctx.peer_ip, "%s", c->peer_ip);
@@ -2140,6 +2184,138 @@ static void conn_dispatch(conn_t *c)
 #else
     c->ctx.tls = 0;
 #endif
+}
+
+/*
+ * Can this request's body be forwarded as it arrives? Only when the request
+ * will be proxied and nothing on the way (matchers, hash keys, rate-limit keys,
+ * header placeholders) needs to look at the body. Routes are tried in order, so
+ * an earlier route whose non-body matchers pass and whose body matchers would
+ * decide forces buffering; one that already fails on path/host/... does not.
+ */
+static int conn_can_stream_body(conn_t *c)
+{
+    http_req_t *r = &c->req;
+    if (!(r->chunked || r->content_length > 0) || r->upgrade)
+        return 0;
+    if (c->srv->body_mode == 1 || c->srv->needs_body || c->srv->is_admin || c->srv->redirect_https)
+        return 0;
+    conn_ctx_init(c);
+    for (int i = 0; i < c->srv->nroutes; i++) {
+        route_t *rt = c->srv->routes[i];
+        int m = route_prematch(rt, &c->ctx);
+        if (m == 2)
+            return 0; /* only the body can tell whether this route matches */
+        if (m == 1)
+            return rt->kind == ROUTE_PROXY;
+    }
+    return 0;
+}
+
+/* Append a piece of the streamed request body to the upstream's send buffer. */
+static void uconn_body_write(uconn_t *uc, const char *data, size_t n)
+{
+    if (uc->body_chunked_out) {
+        buf_printf(&uc->wbuf, "%zx\r\n", n);
+        buf_append(&uc->wbuf, data, n);
+        buf_puts(&uc->wbuf, "\r\n");
+    } else {
+        buf_append(&uc->wbuf, data, n);
+    }
+}
+
+/* Push what was appended to the upstream; the connect path flushes it later if still connecting. */
+static void uconn_body_flush(uconn_t *uc)
+{
+#ifdef LIMER_H2
+    if (uc->h2u) {
+        h2u_body_resume(uc);
+        return;
+    }
+#endif
+    if (!uc->connected || uc->ev.fd < 0)
+        return;
+    conn_t *c = uc->c;
+    int rc = uc_flush(uc);
+    if (rc < 0) {
+        uconn_fail(uc, "write failed", 502, 0);
+        return;
+    }
+    ev_mod(&uc->ev, EPOLLRDHUP | ((c && c->upstream_paused) ? 0 : EPOLLIN) | (rc == 0 ? EPOLLOUT : 0));
+}
+
+/* Forward buffered request-body bytes from the client to the upstream (streaming mode). */
+static void conn_pump_body(conn_t *c)
+{
+    if (!c->body_stream || c->body_done || c->state != CS_UPSTREAM || c->dead)
+        return;
+    uconn_t *uc = c->uc;
+    if (!uc)
+        return;
+    if (buf_readable(&uc->wbuf) >= WBUF_HIGH_WATER)
+        return; /* the upstream is behind: leave the bytes in rbuf and stop reading */
+    http_req_t *r = &c->req;
+    size_t avail = buf_readable(&c->rbuf);
+    size_t forwarded = 0;
+    int done = 0;
+    if (r->chunked) {
+        size_t consumed = 0;
+        buf_reset(&c->dechunk);
+        if (http_chunk_scan(&r->cs, buf_rptr(&c->rbuf), avail, &consumed, &c->dechunk) < 0) {
+            conn_send_error(c, 400, "malformed chunked body", 1);
+            return;
+        }
+        buf_consume(&c->rbuf, consumed);
+        forwarded = buf_readable(&c->dechunk);
+        c->body_seen += forwarded;
+        if (c->body_seen > c->srv->max_body) {
+            buf_reset(&c->dechunk);
+            conn_send_error(c, 413, "request body exceeds max_body", 1);
+            return;
+        }
+        if (forwarded)
+            uconn_body_write(uc, buf_rptr(&c->dechunk), forwarded);
+        buf_reset(&c->dechunk);
+        done = r->cs.done;
+    } else {
+        size_t need = (size_t)r->content_length - c->body_seen;
+        size_t take = avail < need ? avail : need;
+        if (take) {
+            uconn_body_write(uc, buf_rptr(&c->rbuf), take);
+            buf_consume(&c->rbuf, take);
+            c->body_seen += take;
+            forwarded = take;
+        }
+        done = c->body_seen == (size_t)r->content_length;
+    }
+    if (forwarded) {
+        c->body_sent = 1;
+        if (c->pool)
+            c->deadline = g_now + c->pool->response_timeout;
+#ifdef LIMER_H2
+        if (c->h2_parent)
+            h2_stream_consumed(c, forwarded);
+#endif
+    }
+    if (done) {
+        c->body_done = 1;
+        uc->req_eof = 1;
+        if (uc->body_chunked_out)
+            buf_puts(&uc->wbuf, "0\r\n\r\n");
+    }
+    if (forwarded || done) {
+        uconn_body_flush(uc);
+        if (c->dead)
+            return;
+    }
+    conn_update_mask(c);
+}
+
+static void conn_dispatch(conn_t *c)
+{
+    http_req_t *r = &c->req;
+    g_stats.requests++;
+    conn_ctx_init(c);
     if (c->srv->is_admin) {
         admin_handle(c);
         return;
@@ -2338,6 +2514,23 @@ static void conn_process(conn_t *c)
                 if (c->dead)
                     return;
             }
+            if (conn_can_stream_body(c)) {
+                /* hand the request over now; the body follows as it is read */
+                c->body_stream = 1;
+                conn_dispatch(c);
+                if (c->dead)
+                    return;
+                if (c->state == CS_UPSTREAM) {
+                    conn_pump_body(c);
+                    if (c->dead)
+                        return;
+                }
+                if (c->state == CS_HEAD)
+                    continue;
+                c->in_process = 0;
+                conn_update_mask(c);
+                return;
+            }
         }
         if (c->state == CS_BODY) {
             http_req_t *r = &c->req;
@@ -2509,6 +2702,13 @@ static void conn_on_readable(conn_t *c)
         return;
     }
     if (c->state == CS_UPSTREAM) {
+        if (c->body_stream && !c->body_done) {
+            conn_pump_body(c);
+            if (c->dead || c->state != CS_UPSTREAM)
+                return;
+            if (c->body_done)
+                return; /* mask already set */
+        }
         if (c->rd_eof) {
             /* client gave up while we wait for the upstream */
             LOGD("client %s disconnected while waiting for upstream", c->peer_str);
