@@ -133,7 +133,7 @@ enum resp_mode {
     RM_CLOSE,        /* until upstream closes                  */
 };
 
-enum uconn_state { US_CONNECTING = 0, US_ACTIVE, US_IDLE, US_TUNNEL };
+enum uconn_state { US_CONNECTING = 0, US_HANDSHAKE, US_ACTIVE, US_IDLE, US_TUNNEL };
 
 struct conn;
 
@@ -144,6 +144,9 @@ typedef struct uconn {
     config_t *cfg;
     struct conn *c;
     int state;
+#ifdef LIMER_TLS
+    SSL *ssl;
+#endif
     buf_t rbuf, wbuf;
     http_resp_t resp;
     int head_done;
@@ -220,6 +223,10 @@ typedef struct hc_conn {
     config_t *cfg;
     buf_t rbuf, wbuf;
     int connected;
+    int handshaking;
+#ifdef LIMER_TLS
+    SSL *ssl;
+#endif
     double deadline;
 } hc_conn_t;
 
@@ -354,6 +361,80 @@ static int fd_flush(int fd, buf_t *b)
     }
     return 1;
 }
+
+/* TLS-aware variants used for upstream and health-check sockets. */
+#ifdef LIMER_TLS
+static ssize_t ssl_read_into(SSL *ssl, buf_t *b)
+{
+    if (buf_reserve(b, READ_CHUNK) < 0)
+        return -2;
+    ERR_clear_error();
+    int r = SSL_read(ssl, buf_wptr(b), (int)buf_wavail(b));
+    if (r > 0) {
+        buf_commit(b, (size_t)r);
+        return r;
+    }
+    int e = SSL_get_error(ssl, r);
+    if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+        return -1;
+    if (e == SSL_ERROR_ZERO_RETURN || (e == SSL_ERROR_SYSCALL && r == 0))
+        return 0;
+    return -2;
+}
+
+static int ssl_flush(SSL *ssl, buf_t *b)
+{
+    while (buf_readable(b) > 0) {
+        ERR_clear_error();
+        int r = SSL_write(ssl, buf_rptr(b), (int)buf_readable(b));
+        if (r > 0) {
+            buf_consume(b, (size_t)r);
+            continue;
+        }
+        int e = SSL_get_error(ssl, r);
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+            return 0;
+        return -1;
+    }
+    return 1;
+}
+
+/* 1 done, 0 wants more I/O (mask set), -1 failed */
+static int ssl_handshake_step(SSL *ssl, uint32_t *want_mask)
+{
+    ERR_clear_error();
+    int r = SSL_do_handshake(ssl);
+    if (r == 1)
+        return 1;
+    int e = SSL_get_error(ssl, r);
+    if (e == SSL_ERROR_WANT_READ) {
+        *want_mask = EPOLLIN;
+        return 0;
+    }
+    if (e == SSL_ERROR_WANT_WRITE) {
+        *want_mask = EPOLLOUT;
+        return 0;
+    }
+    return -1;
+}
+
+static SSL *upstream_ssl_new(pool_t *p, upstream_t *u, int fd)
+{
+    if (!p->client_ctx)
+        return NULL;
+    SSL *ssl = SSL_new(p->client_ctx);
+    if (!ssl)
+        return NULL;
+    SSL_set_fd(ssl, fd);
+    const char *name = p->tls_server_name ? p->tls_server_name : u->host;
+    if (!is_ip_literal(name))
+        SSL_set_tlsext_host_name(ssl, name);
+    if (!p->tls_insecure)
+        SSL_set1_host(ssl, name);
+    SSL_set_connect_state(ssl);
+    return ssl;
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Placeholders                                                        */
@@ -1016,9 +1097,31 @@ static void idle_unlink(uconn_t *uc)
     }
 }
 
+static ssize_t uc_read(uconn_t *uc)
+{
+#ifdef LIMER_TLS
+    if (uc->ssl)
+        return ssl_read_into(uc->ssl, &uc->rbuf);
+#endif
+    return fd_read(uc->ev.fd, &uc->rbuf);
+}
+
+static int uc_flush(uconn_t *uc)
+{
+#ifdef LIMER_TLS
+    if (uc->ssl)
+        return ssl_flush(uc->ssl, &uc->wbuf);
+#endif
+    return fd_flush(uc->ev.fd, &uc->wbuf);
+}
+
 static void uconn_destroy(ev_t *e)
 {
     uconn_t *uc = (uconn_t *)e;
+#ifdef LIMER_TLS
+    if (uc->ssl)
+        SSL_free(uc->ssl);
+#endif
     buf_free(&uc->rbuf);
     buf_free(&uc->wbuf);
     http_resp_free(&uc->resp);
@@ -1291,7 +1394,7 @@ static void conn_try_upstream(conn_t *c)
     if (uc->state == US_ACTIVE || uc->connected) {
         uc->state = US_ACTIVE;
         c->deadline = g_now + p->response_timeout;
-        int rc = fd_flush(uc->ev.fd, &uc->wbuf);
+        int rc = uc_flush(uc);
         if (rc < 0) {
             uconn_fail(uc, "write failed", 502, uc->reused || method_idempotent(c->req.method));
             return;
@@ -1445,7 +1548,7 @@ static void conn_start_tunnel(conn_t *c, uconn_t *uc)
     conn_flush(c);
     if (c->dead)
         return;
-    int rc = fd_flush(uc->ev.fd, &uc->wbuf);
+    int rc = uc_flush(uc);
     if (rc < 0) {
         conn_close(c);
         return;
@@ -1575,22 +1678,65 @@ static void uconn_cb(ev_t *e, uint32_t events)
                 uconn_fail(uc, reason, 502, 1);
                 return;
             }
-            uc->state = US_ACTIVE;
-            uc->connected = 1;
-            if (c)
-                c->deadline = g_now + uc->pool->response_timeout;
-            int rc = fd_flush(uc->ev.fd, &uc->wbuf);
-            if (rc < 0) {
-                uconn_fail(uc, "write failed", 502, 1);
+#ifdef LIMER_TLS
+            if (uc->up->tls) {
+                uc->ssl = upstream_ssl_new(uc->pool, uc->up, uc->ev.fd);
+                if (!uc->ssl) {
+                    uconn_fail(uc, "tls: cannot create session", 502, 0);
+                    return;
+                }
+                uc->state = US_HANDSHAKE;
+                ev_mod(&uc->ev, EPOLLIN | EPOLLOUT);
+                /* fall through to the handshake step below */
+            } else
+#endif
+            {
+                uc->state = US_ACTIVE;
+                uc->connected = 1;
+                if (c)
+                    c->deadline = g_now + uc->pool->response_timeout;
+                int rc = uc_flush(uc);
+                if (rc < 0) {
+                    uconn_fail(uc, "write failed", 502, 1);
+                    return;
+                }
+                ev_mod(&uc->ev, EPOLLIN | EPOLLRDHUP | (rc == 0 ? EPOLLOUT : 0));
                 return;
             }
-            ev_mod(&uc->ev, EPOLLIN | EPOLLRDHUP | (rc == 0 ? EPOLLOUT : 0));
+        } else {
+            return;
         }
+    }
+#ifdef LIMER_TLS
+    if (uc->state == US_HANDSHAKE) {
+        uint32_t want = EPOLLIN;
+        int hs = ssl_handshake_step(uc->ssl, &want);
+        if (hs < 0) {
+            char reason[200];
+            snprintf(reason, sizeof reason, "tls handshake: %s", ERR_reason_error_string(ERR_peek_last_error()) ? ERR_reason_error_string(ERR_peek_last_error()) : "failed");
+            uconn_fail(uc, reason, 502, 0);
+            return;
+        }
+        if (hs == 0) {
+            ev_mod(&uc->ev, want);
+            return;
+        }
+        uc->state = US_ACTIVE;
+        uc->connected = 1;
+        if (c)
+            c->deadline = g_now + uc->pool->response_timeout;
+        int rc = uc_flush(uc);
+        if (rc < 0) {
+            uconn_fail(uc, "write failed", 502, 1);
+            return;
+        }
+        ev_mod(&uc->ev, EPOLLIN | EPOLLRDHUP | (rc == 0 ? EPOLLOUT : 0));
         return;
     }
+#endif
 
     if (events & EPOLLOUT) {
-        int rc = fd_flush(uc->ev.fd, &uc->wbuf);
+        int rc = uc_flush(uc);
         if (rc < 0) {
             if (uc->state == US_TUNNEL) {
                 if (c)
@@ -1620,7 +1766,7 @@ static void uconn_cb(ev_t *e, uint32_t events)
         if (c->upstream_paused && !(events & (EPOLLHUP | EPOLLERR)))
             return;
         for (;;) {
-            ssize_t r = fd_read(uc->ev.fd, &uc->rbuf);
+            ssize_t r = uc_read(uc);
             if (r > 0) {
                 uc->got_bytes = 1;
                 if (uc->state == US_TUNNEL) {
@@ -2082,7 +2228,7 @@ static void conn_on_readable(conn_t *c)
             ssize_t r = conn_read_raw(c, buf_wptr(&c->uc->wbuf), buf_wavail(&c->uc->wbuf));
             if (r > 0) {
                 buf_commit(&c->uc->wbuf, (size_t)r);
-                int rc = fd_flush(c->uc->ev.fd, &c->uc->wbuf);
+                int rc = uc_flush(c->uc);
                 if (rc < 0) {
                     conn_finish(c);
                     return;
@@ -2446,6 +2592,10 @@ fail:
 static void hc_destroy(ev_t *e)
 {
     hc_conn_t *h = (hc_conn_t *)e;
+#ifdef LIMER_TLS
+    if (h->ssl)
+        SSL_free(h->ssl);
+#endif
     buf_free(&h->rbuf);
     buf_free(&h->wbuf);
     config_unref(h->cfg);
@@ -2494,9 +2644,42 @@ static void hc_cb(ev_t *e, uint32_t events)
             return;
         }
         h->connected = 1;
+#ifdef LIMER_TLS
+        if (h->up->tls) {
+            h->ssl = upstream_ssl_new(h->pool, h->up, h->ev.fd);
+            if (!h->ssl) {
+                hc_finish(h, 0, "tls: cannot create session");
+                return;
+            }
+            h->handshaking = 1;
+        }
+#endif
     }
-    if (events & EPOLLOUT || !h->connected) {
-        int rc = fd_flush(h->ev.fd, &h->wbuf);
+#ifdef LIMER_TLS
+    if (h->handshaking) {
+        uint32_t want = EPOLLIN;
+        int hs = ssl_handshake_step(h->ssl, &want);
+        if (hs < 0) {
+            char d[96];
+            snprintf(d, sizeof d, "tls handshake: %s", ERR_reason_error_string(ERR_peek_last_error()) ? ERR_reason_error_string(ERR_peek_last_error()) : "failed");
+            hc_finish(h, 0, d);
+            return;
+        }
+        if (hs == 0) {
+            ev_mod(&h->ev, want);
+            return;
+        }
+        h->handshaking = 0;
+        events |= EPOLLOUT; /* send the request now */
+    }
+#endif
+    if (events & EPOLLOUT) {
+        int rc;
+#ifdef LIMER_TLS
+        rc = h->ssl ? ssl_flush(h->ssl, &h->wbuf) : fd_flush(h->ev.fd, &h->wbuf);
+#else
+        rc = fd_flush(h->ev.fd, &h->wbuf);
+#endif
         if (rc < 0) {
             hc_finish(h, 0, "write failed");
             return;
@@ -2504,7 +2687,12 @@ static void hc_cb(ev_t *e, uint32_t events)
         ev_mod(&h->ev, EPOLLIN | EPOLLRDHUP | (rc == 0 ? EPOLLOUT : 0));
     }
     if (events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) {
-        ssize_t r = fd_read(h->ev.fd, &h->rbuf);
+        ssize_t r;
+#ifdef LIMER_TLS
+        r = h->ssl ? ssl_read_into(h->ssl, &h->rbuf) : fd_read(h->ev.fd, &h->rbuf);
+#else
+        r = fd_read(h->ev.fd, &h->rbuf);
+#endif
         if (r == -1)
             return;
         if (r == -2) {
@@ -3186,7 +3374,7 @@ static void tick(void)
             case CS_UPSTREAM:
                 if (c->uc) {
                     uconn_t *uc = c->uc;
-                    int connecting = uc->state == US_CONNECTING;
+                    int connecting = uc->state == US_CONNECTING || uc->state == US_HANDSHAKE;
                     uconn_fail(uc, connecting ? "connect timeout" : "response timeout", 504,
                                connecting || (!uc->got_bytes && (uc->reused || method_idempotent(c->req.method))));
                 } else {

@@ -623,6 +623,9 @@ static void pool_free(pool_t *p)
     free(p->health_host);
     hdr_ops_free(p->hdr_up, p->n_hdr_up);
     hdr_ops_free(p->hdr_down, p->n_hdr_down);
+    free(p->tls_server_name);
+    free(p->tls_ca);
+    tls_free_pool_client(p);
     free(p);
 }
 
@@ -739,11 +742,13 @@ static int pool_add_upstream(pool_t *p, const char *spec, int line, char *err, s
 {
     if (p->nups >= 64)
         FAIL("line %d: at most 64 upstreams per pool", line);
-    if (str_has_prefix(spec, "https://"))
-        FAIL("line %d: upstream '%s': TLS to upstreams is not supported", line, spec);
     upstream_t *u = xcalloc(1, sizeof *u);
     u->weight = 1;
-    if (parse_hostport(spec, &u->host, &u->port, 80) < 0) {
+    if (str_has_prefix(spec, "https://")) {
+        u->tls = 1;
+        spec += 8;
+    }
+    if (parse_hostport(spec, &u->host, &u->port, u->tls ? 443 : 80) < 0) {
         free(u);
         FAIL("line %d: invalid upstream address '%s'", line, spec);
     }
@@ -990,8 +995,27 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
     } else if (strcaseeq(k, "preserve_host")) {
         if (want_args(d, 1, 1, err, errlen) < 0 || arg_bool(d, 1, &p->preserve_host, err, errlen) < 0)
             return -1;
+    } else if (strcaseeq(k, "tls")) {
+        /* `tls` inside a transport block: use TLS for every upstream of the pool */
+        if (d->nargs > 1)
+            FAIL("line %d: 'tls' takes no arguments here", d->line);
+        for (int i = 0; i < p->nups; i++)
+            p->ups[i]->tls = 1;
+        p->total_weight = -1; /* flag for pool_finalize: upstreams added later are TLS too */
+    } else if (strcaseeq(k, "tls_insecure_skip_verify")) {
+        p->tls_insecure = 1;
+    } else if (strcaseeq(k, "tls_server_name")) {
+        if (want_args(d, 1, 1, err, errlen) < 0)
+            return -1;
+        free(p->tls_server_name);
+        p->tls_server_name = xstrdup(d->args[1]);
+    } else if (strcaseeq(k, "tls_trusted_ca_certs")) {
+        if (want_args(d, 1, 1, err, errlen) < 0)
+            return -1;
+        free(p->tls_ca);
+        p->tls_ca = xstrdup(d->args[1]);
     } else if (strcaseeq(k, "transport")) {
-        /* Caddy compatibility: transport http { keepalive_idle_conns N ... } */
+        /* Caddy compatibility: transport http { keepalive_idle_conns N; tls; ... } */
         for (int i = 0; i < d->nkids; i++) {
             int h = 0;
             node_t *c = d->kids[i];
@@ -1015,6 +1039,16 @@ static int pool_finalize(pool_t *p, int line, char *err, size_t errlen)
 {
     if (p->nups == 0)
         FAIL("line %d: '%s' has no upstreams (use 'to host:port ...')", line, p->name);
+    int pool_tls = p->total_weight == -1;
+    int any_tls = 0;
+    for (int i = 0; i < p->nups; i++) {
+        if (pool_tls)
+            p->ups[i]->tls = 1;
+        if (p->ups[i]->tls)
+            any_tls = 1;
+    }
+    if (any_tls && tls_init_pool_client(p, err, errlen) < 0)
+        return -1;
     p->total_weight = 0;
     for (int i = 0; i < p->nups; i++)
         p->total_weight += p->ups[i]->weight;

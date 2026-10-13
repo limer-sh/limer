@@ -246,6 +246,7 @@ typedef struct upstream {
     char *host;
     int   port;
     int   weight;
+    int   tls;                /* connect with TLS (https:// upstream) */
     struct sockaddr_storage addr;
     socklen_t addrlen;
     int   resolved;
@@ -291,6 +292,12 @@ typedef struct pool {
     hdr_op_t *hdr_up;   int n_hdr_up;
     hdr_op_t *hdr_down; int n_hdr_down;
     int   preserve_host;      /* pass Host header through (default on) */
+    int   tls_insecure;       /* skip upstream certificate verification */
+    char *tls_server_name;    /* SNI / verification name for upstream TLS */
+    char *tls_ca;             /* PEM bundle to trust for upstream TLS */
+#ifdef LIMER_TLS
+    SSL_CTX *client_ctx;      /* for https upstreams */
+#endif
 } pool_t;
 
 enum route_kind { ROUTE_PROXY = 0, ROUTE_RESPOND, ROUTE_REDIRECT, ROUTE_ERROR, ROUTE_ABORT, ROUTE_FILES };
@@ -461,6 +468,8 @@ int  tls_init_server(server_t *s, char *err, size_t errlen);   /* from files */
 int  tls_init_internal(server_t *s, char *err, size_t errlen); /* self-signed for its hosts */
 int  tls_load_pem(server_t *s, const char *cert, const char *key, char *err, size_t errlen);
 void tls_free_server(server_t *s);
+int  tls_init_pool_client(pool_t *p, char *err, size_t errlen);  /* client context for https upstreams */
+void tls_free_pool_client(pool_t *p);
 #ifdef LIMER_TLS
 void tls_set_sni_resolver(SSL_CTX *(*fn)(SSL *, const char *));
 #endif

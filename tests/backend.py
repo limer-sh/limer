@@ -23,6 +23,7 @@ PORT = int(sys.argv[1])
 NAME = sys.argv[2]
 SLOW = 0.0
 FAIL_HEALTH = False
+TLS = None
 args = sys.argv[3:]
 while args:
     a = args.pop(0)
@@ -30,6 +31,8 @@ while args:
         SLOW = float(args.pop(0))
     elif a == "--fail-health":
         FAIL_HEALTH = True
+    elif a == "--tls":
+        TLS = (args.pop(0), args.pop(0))  # cert, key
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -137,4 +140,10 @@ class Server(ThreadingHTTPServer):
 
 
 if __name__ == "__main__":
-    Server(("127.0.0.1", PORT), Handler).serve_forever()
+    srv = Server(("127.0.0.1", PORT), Handler)
+    if TLS:
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(TLS[0], TLS[1])
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    srv.serve_forever()

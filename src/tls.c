@@ -193,6 +193,44 @@ void tls_free_server(server_t *s)
     }
 }
 
+int tls_init_pool_client(pool_t *p, char *err, size_t errlen)
+{
+    tls_lib_init();
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        snprintf(err, errlen, "tls: SSL_CTX_new failed");
+        return -1;
+    }
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    if (p->tls_insecure) {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    } else {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        if (p->tls_ca) {
+            if (SSL_CTX_load_verify_locations(ctx, p->tls_ca, NULL) != 1) {
+                snprintf(err, errlen, "tls: cannot load tls_trusted_ca_certs '%s': %s", p->tls_ca, tls_last_error());
+                SSL_CTX_free(ctx);
+                return -1;
+            }
+        } else {
+            SSL_CTX_set_default_verify_paths(ctx);
+        }
+    }
+    if (p->client_ctx)
+        SSL_CTX_free(p->client_ctx);
+    p->client_ctx = ctx;
+    return 0;
+}
+
+void tls_free_pool_client(pool_t *p)
+{
+    if (p->client_ctx) {
+        SSL_CTX_free(p->client_ctx);
+        p->client_ctx = NULL;
+    }
+}
+
 #else
 
 int tls_init_server(server_t *s, char *err, size_t errlen)
@@ -216,6 +254,18 @@ int tls_load_pem(server_t *s, const char *cert, const char *key, char *err, size
 void tls_free_server(server_t *s)
 {
     (void)s;
+}
+
+int tls_init_pool_client(pool_t *p, char *err, size_t errlen)
+{
+    (void)p;
+    snprintf(err, errlen, "tls: this build has no TLS support (https upstreams unavailable)");
+    return -1;
+}
+
+void tls_free_pool_client(pool_t *p)
+{
+    (void)p;
 }
 
 #endif
