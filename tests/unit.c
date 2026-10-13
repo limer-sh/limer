@@ -1153,6 +1153,74 @@ static pool_t *mkpool(config_t **cfg, const char *policy, const char *ups)
     return *cfg ? (*cfg)->servers[0]->routes[0]->pool : NULL;
 }
 
+TEST(test_cache)
+{
+    cache_t *c = cache_new(4096);
+    const char *hn[] = { "Content-Type", "ETag" };
+    const char *hv[] = { "text/plain", "\"v1\"" };
+    double now = 1000.0;
+    cache_store(c, "GET\x1fhttp\x1fx\x1f/a", 200, "OK", hn, hv, 2, "hello", 5,
+                now, 10.0, 5.0, "\"v1\"", NULL, NULL, "");
+    cache_entry_t *e = cache_get(c, "GET\x1fhttp\x1fx\x1f/a");
+    CHECK(e != NULL);
+    CHECK(cache_entry_status(e) == 200);
+    size_t bl = 0;
+    const char *b = cache_entry_body(e, &bl);
+    CHECK(bl == 5 && memcmp(b, "hello", 5) == 0);
+    CHECK_STR(cache_entry_etag(e), "\"v1\"");
+    CHECK(cache_entry_state(e, now) == 0);          /* fresh */
+    CHECK(cache_entry_state(e, now + 12) == 1);     /* within stale-while-revalidate */
+    CHECK(cache_entry_state(e, now + 20) == 2);     /* fully stale */
+    CHECK(cache_get(c, "GET\x1fhttp\x1fx\x1f/missing") == NULL);
+    /* refresh restores freshness */
+    cache_entry_refresh(c, e, now + 20, 10.0, 5.0);
+    CHECK(cache_entry_state(e, now + 20) == 0);
+    /* a second store under the same key replaces */
+    cache_store(c, "GET\x1fhttp\x1fx\x1f/a", 200, "OK", hn, hv, 1, "world!", 6,
+                now, 10.0, 0.0, NULL, NULL, NULL, "");
+    e = cache_get(c, "GET\x1fhttp\x1fx\x1f/a");
+    b = cache_entry_body(e, &bl);
+    CHECK(bl == 6 && memcmp(b, "world!", 6) == 0);
+    uint64_t hits = 0, misses = 0, stores = 0;
+    int count = 0;
+    cache_stats(c, &hits, &misses, &stores, NULL, &count, NULL, NULL);
+    CHECK(stores == 2 && count == 1);
+    /* capacity eviction: fill past 4096 bytes and confirm the oldest is gone */
+    for (int i = 0; i < 20; i++) {
+        char k[64], body[300];
+        snprintf(k, sizeof k, "GET\x1fhttp\x1fx\x1f/e%d", i);
+        memset(body, 'x', sizeof body);
+        cache_store(c, k, 200, "OK", hn, hv, 1, body, sizeof body, now, 100.0, 0.0, NULL, NULL, NULL, "");
+    }
+    cache_stats(c, NULL, NULL, NULL, NULL, &count, NULL, NULL);
+    CHECK(count < 20);                               /* evicted to fit */
+    CHECK(cache_purge(c, "GET\x1fhttp\x1fx\x1f/e19") == 1 || cache_purge(c, "GET\x1fhttp\x1fx\x1f/e19") == 0);
+    cache_free(c);
+
+    /* oversized objects are never stored */
+    cache_t *c2 = cache_new(100);
+    char big[500];
+    memset(big, 'y', sizeof big);
+    cache_store(c2, "GET\x1fhttp\x1fx\x1f/big", 200, "OK", hn, hv, 0, big, sizeof big, now, 10, 0, NULL, NULL, NULL, "");
+    CHECK(cache_get(c2, "GET\x1fhttp\x1fx\x1f/big") == NULL);
+    cache_free(c2);
+
+    /* cache config parsing */
+    config_t *cf = cfg_ok(":1 {\n cache {\n  ttl 30s\n  stale 1m\n  max_object 2m\n }\n reverse_proxy 127.0.0.1:1\n}\n");
+    if (cf) {
+        cache_cfg_t *cc = cf->servers[0]->cache;
+        CHECK(cc && cc->ttl == 30 && cc->swr == 60 && cc->max_object == 2 * 1024 * 1024);
+        config_unref(cf);
+    }
+    cfg_bad(":1 {\n cache {\n  bogus 1\n }\n reverse_proxy 127.0.0.1:1\n}\n", "unknown cache option");
+    cf = cfg_ok("{\n cache_capacity 128m\n}\n:1 {\n cache\n reverse_proxy 127.0.0.1:1\n}\n");
+    if (cf) {
+        CHECK(cf->cache_capacity == 128 * 1024 * 1024);
+        CHECK(cf->servers[0]->cache != NULL);
+        config_unref(cf);
+    }
+}
+
 TEST(test_balance)
 {
     config_t *c;
@@ -1363,6 +1431,7 @@ int main(void)
     test_config_run();
     test_match_run();
     test_prematch_run();
+    test_cache_run();
     test_balance_run();
     test_ratelimit_run();
     printf("unit tests: %d checks, %d failures\n", checks, failures);

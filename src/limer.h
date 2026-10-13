@@ -380,6 +380,43 @@ typedef struct rate_limit_cfg {
     ratelimit_t *rl;    /* runtime table */
 } rate_limit_cfg_t;
 
+typedef struct cache_cfg {
+    double ttl;           /* default freshness when the response has none (0 = only cache if it says so) */
+    double swr;           /* stale-while-revalidate window */
+    size_t max_object;    /* largest response body to store */
+    int    methods_head;  /* cache HEAD as well as GET (default yes) */
+} cache_cfg_t;
+
+/* cache.c: per-worker in-memory response cache */
+typedef struct cache cache_t;
+typedef struct cache_entry cache_entry_t;
+cache_t *cache_new(size_t capacity);
+void     cache_free(cache_t *c);
+cache_entry_t *cache_get(cache_t *c, const char *key);
+void     cache_touch_stats(cache_t *c, int hit);
+int      cache_entry_state(const cache_entry_t *e, double now);   /* 0 fresh, 1 serve-stale, 2 stale */
+double   cache_entry_age(const cache_entry_t *e, double now);
+int      cache_entry_status(const cache_entry_t *e);
+const char *cache_entry_reason(const cache_entry_t *e);
+const char *cache_entry_body(const cache_entry_t *e, size_t *len);
+const char *cache_entry_etag(const cache_entry_t *e);
+const char *cache_entry_last_modified(const cache_entry_t *e);
+int      cache_entry_nhdr(const cache_entry_t *e);
+const char *cache_entry_hdr_name(const cache_entry_t *e, int i);
+const char *cache_entry_hdr_value(const cache_entry_t *e, int i);
+const char *cache_entry_vary(const cache_entry_t *e);
+const char *cache_entry_vary_val(const cache_entry_t *e);
+void     cache_entry_set_revalidating(cache_entry_t *e, int v);
+void     cache_entry_refresh(cache_t *c, cache_entry_t *e, double now, double ttl, double swr);
+void     cache_store(cache_t *c, const char *key, int status, const char *reason,
+                     const char *const *hdr_names, const char *const *hdr_values, int nhdr,
+                     const char *body, size_t body_len, double now, double ttl, double swr,
+                     const char *etag, const char *last_modified, const char *vary, const char *vary_val);
+void     cache_stats(cache_t *c, uint64_t *hits, uint64_t *misses, uint64_t *stores, uint64_t *evictions,
+                     int *count, size_t *bytes, size_t *capacity);
+int      cache_purge(cache_t *c, const char *key);
+void     cache_clear(cache_t *c);
+
 typedef struct file_server {
     char *root;
     char **index;  int nindex;
@@ -401,6 +438,7 @@ typedef struct route {
     basic_auth_t *auth;
     file_server_t *files;
     rate_limit_cfg_t *rl;
+    cache_cfg_t *cache;     /* response caching for this route */
     int       needs_body;   /* a matcher, hash key or placeholder reads the request body */
 } route_t;
 
@@ -433,6 +471,7 @@ typedef struct server {
     hdr_op_t *hdr_up;   int n_hdr_up;     /* `request_header`: all proxied requests */
     basic_auth_t *auth;                   /* server-wide basic_auth */
     rate_limit_cfg_t *rl;                 /* server-wide rate limit */
+    cache_cfg_t *cache;                   /* server-wide response caching */
     char   *encode;      /* "gzip zstd br" or NULL */
     int     encode_min;
     int     redirect_https;   /* http listener that redirects to https (auto https) */
@@ -464,6 +503,7 @@ typedef struct config {
     double   acme_dns_propagation; /* wait after "present" */
     char   **resolvers;       /* DNS servers for upstream lookups (ip[:port]); empty = system */
     int      nresolvers;
+    size_t   cache_capacity;  /* total response cache size per worker (0 = default) */
     int      refs;
 } config_t;
 

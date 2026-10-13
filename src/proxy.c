@@ -213,6 +213,19 @@ typedef struct conn {
     int expect_sent;
     int upstream_reusable;      /* response framing allows pooling the upstream conn */
     int set_sticky;             /* add the sticky-session cookie to the response */
+    cache_cfg_t *cache_cfg;     /* effective response-cache config, or NULL */
+    char *cache_key;            /* owned cache key for this request */
+    int   cache_capture;        /* capturing the response for the cache */
+    buf_t cache_body;           /* captured identity body */
+    size_t cache_cap_max;       /* give up capturing beyond this */
+    int   cache_status;
+    char *cache_reason;
+    char **cap_hname; char **cap_hval; int cap_nh;  /* captured end-to-end headers */
+    double cap_ttl, cap_swr;
+    char *cap_etag, *cap_lm, *cap_vary, *cap_vary_val;
+    int   revalidating;         /* this upstream fetch is a conditional revalidation */
+    cache_entry_t *reval_entry; /* the stale entry being revalidated (fresh-lookup safe: single turn) */
+    int   cache_sink;           /* detached background refresh: discard the client response */
     int body_stream;            /* the request body is forwarded as it arrives */
     int body_done;              /* ... and has been forwarded completely */
     int body_sent;              /* some body bytes reached the upstream: no retries */
@@ -297,6 +310,15 @@ static void conn_close(conn_t *c);
 static void conn_process(conn_t *c);
 static void conn_pump_body(conn_t *c);
 static const tls_client_info_t *conn_client_cert(conn_t *c);
+static cache_t *g_cache;
+static int cache_try_serve(conn_t *c);
+static void cache_capture_reset(conn_t *c);
+static void cache_maybe_store(conn_t *c);
+static void conn_spawn_refresh(conn_t *parent);
+static void conn_sink_close(conn_t *c);
+static void cache_consider_response(conn_t *c, http_resp_t *r);
+static void conn_serve_cached(conn_t *c, cache_entry_t *e, double now, int x_cache_stale);
+static double response_declared_ttl(http_resp_t *r);
 #ifdef LIMER_H2
 #define H2_SEND_HIGH (1024 * 1024)
 struct h2u_session;
@@ -822,14 +844,16 @@ static void conn_reset_request(conn_t *c)
     c->file_off = c->file_remaining = 0;
     c->lb_why[0] = 0;
     c->got_request_bytes = 0;
+    cache_capture_reset(c);
+    c->cache_cfg = NULL;
 }
 
 /* Compute the epoll interest set from the connection's state. */
 static void conn_update_mask(conn_t *c)
 {
     uint32_t m = 0;
-    if (c->h2_parent)
-        return; /* streams have no socket */
+    if (c->h2_parent || c->cache_sink)
+        return; /* no socket of their own */
 #ifdef LIMER_TLS
     if (c->tls_handshaking) {
         /* mask set by the handshake code */
@@ -931,6 +955,8 @@ static void conn_destroy(ev_t *e)
         close(c->file_fd);
     buf_free(&c->rbuf);
     buf_free(&c->wbuf);
+    buf_free(&c->cache_body);
+    cache_capture_reset(c);
     http_req_free(&c->req);
     config_unref(c->cfg);
     free(c);
@@ -1007,6 +1033,10 @@ static void conn_resume_upstream(conn_t *c)
 
 static void conn_flush(conn_t *c)
 {
+    if (c->cache_sink) {
+        buf_reset(&c->wbuf);
+        return;
+    }
 #ifdef LIMER_H2
     if (c->h2_parent) {
         h2_stream_flush(c);
@@ -1057,6 +1087,12 @@ static void conn_body_write_raw(conn_t *c, const void *d, size_t n)
 /* flush: 0 buffer, 1 sync flush (streaming), 2 finish */
 static void conn_body_emit(conn_t *c, const void *d, size_t n, int flush)
 {
+    if (c->cache_capture && n) {
+        if (buf_readable(&c->cache_body) + n > c->cache_cap_max)
+            c->cache_capture = 0; /* too big: give up caching this response */
+        else
+            buf_append(&c->cache_body, d, n);
+    }
     if (!c->enc) {
         conn_body_write_raw(c, d, n);
         return;
@@ -1492,6 +1528,12 @@ static void build_upstream_request(conn_t *c, uconn_t *uc)
         hlist_add(&h, "Connection", "Upgrade");
     else
         hlist_add(&h, "Connection", p->keepalive_idle > 0 ? "keep-alive" : "close");
+    if (c->revalidating) {
+        if (c->cap_etag)
+            hlist_add(&h, "If-None-Match", c->cap_etag);
+        else if (c->cap_lm)
+            hlist_add(&h, "If-Modified-Since", c->cap_lm);
+    }
     uc->req_eof = 1;
     uc->body_chunked_out = 0;
     if (c->body_stream) {
@@ -1720,6 +1762,7 @@ static void build_client_response_head(conn_t *c, uconn_t *uc)
     pool_t *p = c->pool;
     int is_head = strcmp(c->req.method, "HEAD") == 0;
     int tunnel = r->status == 101;
+    cache_consider_response(c, r);
 
     /* framing */
     if (tunnel) {
@@ -1727,7 +1770,7 @@ static void build_client_response_head(conn_t *c, uconn_t *uc)
     } else if (is_head || r->status / 100 == 1 || r->status == 204 || r->status == 304) {
         c->resp_mode = RM_NONE;
     } else if (r->chunked) {
-        c->resp_mode = c->req.minor >= 1 ? RM_CHUNKED : RM_DECHUNK;
+        c->resp_mode = (c->req.minor >= 1 && !c->cache_cfg) ? RM_CHUNKED : RM_DECHUNK;
     } else if (r->content_length >= 0) {
         c->resp_mode = RM_LENGTH;
         c->resp_remaining = r->content_length;
@@ -1810,6 +1853,8 @@ static void build_client_response_head(conn_t *c, uconn_t *uc)
         snprintf(ck, sizeof ck, "%s=%s; Path=/; HttpOnly%s", p->key.name, c->up->sticky_id, c->ctx.tls ? "; Secure" : "");
         hlist_add(&h, "Set-Cookie", ck);
     }
+    if (c->cache_cfg && !tunnel && !c->cache_sink)
+        hlist_add(&h, "X-Cache", c->revalidating ? "REVALIDATED" : "MISS");
     if (c->srv->n_hdr_down)
         hlist_apply_ops(&h, c->srv->hdr_down, c->srv->n_hdr_down, c);
     hlist_apply_ops(&h, p->hdr_down, p->n_hdr_down, c);
@@ -1829,6 +1874,15 @@ static void conn_response_done(conn_t *c)
     upstream_t *u = c->up;
     pool_t *p = c->pool;
     conn_body_finish(c);
+    cache_maybe_store(c);
+    if (c->reval_entry)
+        cache_entry_set_revalidating(c->reval_entry, 0);
+    if (c->cache_sink) {
+        if (u) { u->active--; c->up = NULL; }
+        if (uc) uconn_release(uc, 0);
+        conn_sink_close(c);
+        return;
+    }
     if (u) {
         if (p->unhealthy_5xx && c->resp_status >= 500 && c->resp_status <= 599)
             upstream_report_failure(p, u, g_now, "5xx response");
@@ -1963,6 +2017,36 @@ static void uconn_on_response_data(uconn_t *uc)
         }
         if (uc->resp.status == 101 && !c->req.upgrade) {
             uconn_fail(uc, "unexpected 101 response", 502, 0);
+            return;
+        }
+        if (uc->resp.status == 304 && c->revalidating && c->reval_entry && g_cache) {
+            /* the stored body is still valid: refresh its freshness and serve it */
+            double nttl = response_declared_ttl(&uc->resp);
+            if (nttl < 0)
+                nttl = c->cache_cfg->ttl;
+            if (nttl <= 0)
+                nttl = 60; /* a validated entry stays usable for a short while */
+            cache_entry_refresh(g_cache, c->reval_entry, g_now, nttl, c->cache_cfg->swr);
+            uc->head_done = 1;
+            if (c->cache_sink) {
+                upstream_t *u2 = c->up;
+                if (u2) { upstream_report_success(c->pool, u2); u2->active--; c->up = NULL; }
+                uconn_release(uc, 0); /* close, never pool: the sink conn is about to be freed */
+                conn_sink_close(c);
+                return;
+            }
+            cache_entry_t *e = cache_get(g_cache, c->cache_key);
+            if (e) {
+                conn_serve_cached(c, e, g_now, 0);
+            } else {
+                conn_send_error(c, 502, "cache entry vanished during revalidation", 0);
+                return;
+            }
+            upstream_t *u2 = c->up;
+            if (u2) { upstream_report_success(c->pool, u2); u2->active--; c->up = NULL; }
+            uconn_release(uc, uc->resp.keep_alive);
+            c->deadline = 0;
+            conn_next_request(c);
             return;
         }
         uc->head_done = 1;
@@ -2444,6 +2528,438 @@ static void conn_pump_body(conn_t *c)
     conn_update_mask(c);
 }
 
+static void cache_clear_captured_headers(conn_t *c)
+{
+    for (int i = 0; i < c->cap_nh; i++) { free(c->cap_hname[i]); free(c->cap_hval[i]); }
+    free(c->cap_hname); c->cap_hname = NULL;
+    free(c->cap_hval); c->cap_hval = NULL;
+    c->cap_nh = 0;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Response cache                                                      */
+/* ------------------------------------------------------------------ */
+
+/* Find a Cache-Control directive value; returns 1 if present (value optional). */
+static int cc_directive(const char *cc, const char *name, double *num)
+{
+    if (!cc)
+        return 0;
+    size_t nl = strlen(name);
+    for (const char *p = cc; *p;) {
+        while (*p == ' ' || *p == ',' || *p == '\t')
+            p++;
+        if (strncasecmp(p, name, nl) == 0 && (p[nl] == 0 || p[nl] == ',' || p[nl] == ' ' || p[nl] == '=')) {
+            if (num && p[nl] == '=')
+                *num = atof(p + nl + 1);
+            return 1;
+        }
+        while (*p && *p != ',')
+            p++;
+    }
+    return 0;
+}
+
+static void cache_build_key(conn_t *c, buf_t *out)
+{
+    char host[256];
+    host_only(http_hdr_get(c->req.hdrs, c->req.nhdr, "Host"), host, sizeof host);
+    buf_printf(out, "%s\x1f%s\x1f%s\x1f%s", c->req.method, c->ctx.tls ? "https" : "http",
+               host[0] ? host : "-", c->req.uri);
+    buf_append(out, "", 1);
+}
+
+/* Values of the request headers named in `vary`, joined; "" when vary is NULL. */
+static void cache_vary_values(conn_t *c, const char *vary, buf_t *out)
+{
+    if (!vary || !*vary)
+        return;
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s", vary);
+    char *save = NULL;
+    for (char *t = strtok_r(tmp, ", \t", &save); t; t = strtok_r(NULL, ", \t", &save)) {
+        const char *v = http_hdr_get(c->req.hdrs, c->req.nhdr, t);
+        buf_printf(out, "%s=%s;", t, v ? v : "");
+    }
+}
+
+/* freshness (seconds) a response declares for itself; -1 if none */
+static double response_declared_ttl(http_resp_t *r)
+{
+    const char *cc = http_hdr_get(r->hdrs, r->nhdr, "Cache-Control");
+    double num = 0;
+    if (cc_directive(cc, "no-cache", NULL))
+        return 0;
+    if (cc_directive(cc, "s-maxage", &num) || cc_directive(cc, "max-age", &num))
+        return num;
+    const char *exp = http_hdr_get(r->hdrs, r->nhdr, "Expires");
+    if (exp) {
+        const char *date = http_hdr_get(r->hdrs, r->nhdr, "Date");
+        time_t e = http_date_parse(exp);
+        time_t d = date ? http_date_parse(date) : (time_t)now_wall();
+        if (e > 0)
+            return (double)(e - (d > 0 ? d : (time_t)now_wall()));
+    }
+    return -1;
+}
+
+static int request_cacheable(conn_t *c)
+{
+    const char *m = c->req.method;
+    int is_get = strcmp(m, "GET") == 0;
+    int is_head = strcmp(m, "HEAD") == 0;
+    if (!is_get && !(is_head && c->cache_cfg->methods_head))
+        return 0;
+    if (http_hdr_get(c->req.hdrs, c->req.nhdr, "Range"))
+        return 0;
+    const char *cc = http_hdr_get(c->req.hdrs, c->req.nhdr, "Cache-Control");
+    if (cc_directive(cc, "no-store", NULL))
+        return 0;
+    /* an Authorization header makes the response private unless it says otherwise;
+     * we only serve such responses from cache when they were stored as public */
+    return 1;
+}
+
+static void cache_capture_reset(conn_t *c)
+{
+    free(c->cache_key); c->cache_key = NULL;
+    c->cache_capture = 0;
+    buf_reset(&c->cache_body);
+    free(c->cache_reason); c->cache_reason = NULL;
+    for (int i = 0; i < c->cap_nh; i++) { free(c->cap_hname[i]); free(c->cap_hval[i]); }
+    free(c->cap_hname); c->cap_hname = NULL;
+    free(c->cap_hval); c->cap_hval = NULL;
+    c->cap_nh = 0;
+    free(c->cap_etag); c->cap_etag = NULL;
+    free(c->cap_lm); c->cap_lm = NULL;
+    free(c->cap_vary); c->cap_vary = NULL;
+    free(c->cap_vary_val); c->cap_vary_val = NULL;
+    c->revalidating = 0;
+    c->reval_entry = NULL;
+}
+
+static void conn_sink_close(conn_t *c)
+{
+    if (c->dead)
+        return;
+    c->dead = 1;
+    if (c->uc) {
+        c->uc->c = NULL;
+        uconn_close(c->uc);
+        c->uc = NULL;
+    }
+    if (c->reval_entry)
+        cache_entry_set_revalidating(c->reval_entry, 0);
+    http_req_free(&c->req);
+    buf_free(&c->rbuf); buf_free(&c->wbuf); buf_free(&c->enc_out); buf_free(&c->dechunk);
+    buf_free(&c->cache_body);
+    cache_capture_reset(c);
+    if (c->enc) encoder_free(c->enc);
+    if (c->cfg) config_unref(c->cfg);
+    free(c);
+}
+
+/* Fire a detached background revalidation that updates the cache entry for `key`. */
+static void conn_spawn_refresh(conn_t *parent)
+{
+    if (!parent->route || parent->route->kind != ROUTE_PROXY || !parent->route->pool)
+        return;
+    conn_t *c = xcalloc(1, sizeof *c);
+    c->ev.fd = -1;
+    c->cache_sink = 1;
+    c->srv = parent->srv;
+    c->cfg = parent->cfg;
+    config_ref(c->cfg);
+    c->cache_cfg = parent->cache_cfg;
+    c->route = parent->route;
+    snprintf(c->listen_addr, sizeof c->listen_addr, "%s", parent->listen_addr);
+    memcpy(&c->peer, &parent->peer, sizeof c->peer);
+    c->peerlen = parent->peerlen;
+    snprintf(c->peer_ip, sizeof c->peer_ip, "%s", parent->peer_ip);
+    snprintf(c->peer_str, sizeof c->peer_str, "%s", parent->peer_str);
+    buf_init(&c->rbuf); buf_init(&c->wbuf); buf_init(&c->enc_out); buf_init(&c->dechunk);
+    buf_init(&c->cache_body);
+    c->file_fd = -1;
+    /* synthesize a conditional GET for the same target */
+    char host[256];
+    host_only(http_hdr_get(parent->req.hdrs, parent->req.nhdr, "Host"), host, sizeof host);
+    buf_t head;
+    buf_init(&head);
+    buf_printf(&head, "GET %s HTTP/1.1\r\n", parent->req.uri);
+    buf_printf(&head, "Host: %s\r\n", host[0] ? host : "-");
+    const char *e_etag = parent->cap_etag, *e_lm = parent->cap_lm;
+    /* use the stale entry's validators if present */
+    cache_entry_t *stale = cache_get(g_cache, parent->cache_key);
+    if (stale) {
+        if (cache_entry_etag(stale)) buf_printf(&head, "If-None-Match: %s\r\n", cache_entry_etag(stale));
+        else if (cache_entry_last_modified(stale)) buf_printf(&head, "If-Modified-Since: %s\r\n", cache_entry_last_modified(stale));
+        c->reval_entry = stale;
+        c->revalidating = (cache_entry_etag(stale) || cache_entry_last_modified(stale));
+    }
+    (void)e_etag; (void)e_lm;
+    buf_puts(&head, "\r\n");
+    http_req_init(&c->req);
+    size_t consumed = 0;
+    if (http_parse_request_head(&c->req, buf_rptr(&head), buf_readable(&head), &consumed) != 1) {
+        buf_free(&head);
+        conn_sink_close(c);
+        return;
+    }
+    buf_free(&head);
+    c->cache_key = xstrdup(parent->cache_key);
+    conn_ctx_init(c);
+    c->pool = c->route->pool;
+    c->tried = 0;
+    c->attempts = 0;
+    c->state = CS_UPSTREAM;
+    conn_try_upstream(c);
+}
+
+/* Write a cached entry as this client's response (framing + compression applied). */
+static void conn_serve_cached(conn_t *c, cache_entry_t *e, double now, int x_cache_stale)
+{
+    int status = cache_entry_status(e);
+    size_t blen;
+    const char *body = cache_entry_body(e, &blen);
+    int is_head = c->req.method && strcmp(c->req.method, "HEAD") == 0;
+
+    /* client revalidation against stored validators */
+    const char *inm = http_hdr_get(c->req.hdrs, c->req.nhdr, "If-None-Match");
+    const char *ims = http_hdr_get(c->req.hdrs, c->req.nhdr, "If-Modified-Since");
+    const char *etag = cache_entry_etag(e), *lm = cache_entry_last_modified(e);
+    int not_modified = 0;
+    if (inm && etag && (strcmp(inm, "*") == 0 || strstr(inm, etag)))
+        not_modified = 1;
+    else if (ims && lm && !inm) {
+        time_t a = http_date_parse(ims), b = http_date_parse(lm);
+        if (a > 0 && b > 0 && b <= a)
+            not_modified = 1;
+    }
+
+    hlist_t h = { 0 };
+    for (int i = 0; i < cache_entry_nhdr(e); i++) {
+        const char *n = cache_entry_hdr_name(e, i);
+        if (strcasecmp(n, "Content-Length") == 0 || strcasecmp(n, "Transfer-Encoding") == 0 ||
+            strcasecmp(n, "Connection") == 0 || strcasecmp(n, "Age") == 0 ||
+            strcasecmp(n, "Content-Encoding") == 0 || http_hdr_is_hop_by_hop(n))
+            continue; /* framing/encoding are recomputed for this client */
+        hlist_add(&h, n, cache_entry_hdr_value(e, i));
+    }
+    char agebuf[32];
+    snprintf(agebuf, sizeof agebuf, "%.0f", cache_entry_age(e, now));
+    hlist_add(&h, "Age", agebuf);
+    hlist_add(&h, "X-Cache", x_cache_stale ? "STALE" : "HIT");
+    hlist_add(&h, "Server", "limer");
+    if (c->srv->n_hdr_down)
+        hlist_apply_ops(&h, c->srv->hdr_down, c->srv->n_hdr_down, c);
+
+    if (not_modified) {
+        buf_printf(&c->wbuf, "HTTP/1.1 304 Not Modified\r\n");
+        hlist_add(&h, "Connection", c->req.keep_alive ? "keep-alive" : "close");
+        hlist_write(&h, &c->wbuf);
+        buf_puts(&c->wbuf, "\r\n");
+        hlist_free(&h);
+        c->resp_status = 304;
+        c->resp_head_sent = 1;
+        if (!c->req.keep_alive)
+            c->close_after_write = 1;
+        return;
+    }
+
+    /* compression for this client */
+    const char *ctype = NULL;
+    for (int i = 0; i < cache_entry_nhdr(e); i++)
+        if (strcasecmp(cache_entry_hdr_name(e, i), "Content-Type") == 0)
+            ctype = cache_entry_hdr_value(e, i);
+    buf_t packed;
+    buf_init(&packed);
+    const char *encname = is_head ? NULL : conn_pick_encoding(c, ctype, (int64_t)blen, status, NULL);
+    const char *out_body = body;
+    size_t out_len = blen;
+    if (encname) {
+        encoder_t *enc = encoder_new(encname);
+        if (enc && encoder_write(enc, body, blen, &packed, 2) == 0) {
+            out_body = buf_rptr(&packed);
+            out_len = buf_readable(&packed);
+            hlist_add(&h, "Content-Encoding", encname);
+            hlist_add(&h, "Vary", "Accept-Encoding");
+        }
+        encoder_free(enc);
+    }
+    int keep = c->req.keep_alive && !g_shutting_down;
+    char clbuf[32];
+    snprintf(clbuf, sizeof clbuf, "%zu", out_len);
+    hlist_add(&h, "Content-Length", clbuf);
+    hlist_add(&h, "Connection", keep ? "keep-alive" : "close");
+    buf_printf(&c->wbuf, "HTTP/1.1 %d %s\r\n", status,
+               cache_entry_reason(e) && *cache_entry_reason(e) ? cache_entry_reason(e) : http_status_reason(status));
+    hlist_write(&h, &c->wbuf);
+    buf_puts(&c->wbuf, "\r\n");
+    if (!is_head && out_len)
+        buf_append(&c->wbuf, out_body, out_len);
+    hlist_free(&h);
+    buf_free(&packed);
+    c->resp_status = status;
+    c->resp_bytes = is_head ? 0 : out_len;
+    c->resp_head_sent = 1;
+    if (!keep)
+        c->close_after_write = 1;
+}
+
+/* Returns 1 if the request was served from cache (fresh or serve-stale). */
+static int cache_try_serve(conn_t *c)
+{
+    if (!g_cache || !c->cache_cfg || !request_cacheable(c))
+        return 0;
+    buf_t key;
+    buf_init(&key);
+    cache_build_key(c, &key);
+    cache_entry_t *e = cache_get(g_cache, buf_rptr(&key));
+    if (e) {
+        /* match the stored variant against this request's Vary'd headers */
+        const char *vary = cache_entry_vary(e);
+        int match = 1;
+        if (vary && *vary) {
+            buf_t vv;
+            buf_init(&vv);
+            cache_vary_values(c, vary, &vv);
+            buf_append(&vv, "", 1);
+            const char *sv = cache_entry_vary_val(e);
+            match = sv && strcmp(sv, buf_rptr(&vv)) == 0;
+            buf_free(&vv);
+        }
+        int state = cache_entry_state(e, g_now);
+        if (match && state == 0) {
+            cache_touch_stats(g_cache, 1);
+            conn_serve_cached(c, e, g_now, 0);
+            c->state = CS_LOCAL;
+            buf_free(&key);
+            conn_next_request(c);
+            return 1;
+        }
+        if (match && state == 1) {
+            /* serve stale now, refresh in the background */
+            cache_touch_stats(g_cache, 1);
+            conn_serve_cached(c, e, g_now, 1);
+            c->state = CS_LOCAL;
+            cache_entry_set_revalidating(e, 1);
+            free(c->cache_key);
+            c->cache_key = xstrdup(buf_rptr(&key));
+            conn_spawn_refresh(c);
+            buf_free(&key);
+            conn_next_request(c);
+            return 1;
+        }
+        if (match && state == 2 && (cache_entry_etag(e) || cache_entry_last_modified(e))) {
+            /* stale: revalidate conditionally on this connection */
+            c->revalidating = 1;
+            c->reval_entry = e;
+            if (cache_entry_etag(e)) { free(c->cap_etag); c->cap_etag = xstrdup(cache_entry_etag(e)); }
+            if (cache_entry_last_modified(e)) { free(c->cap_lm); c->cap_lm = xstrdup(cache_entry_last_modified(e)); }
+        }
+    }
+    cache_touch_stats(g_cache, 0);
+    /* remember the key so the response (if cacheable) is stored */
+    free(c->cache_key);
+    c->cache_key = xstrdup(buf_rptr(&key));
+    buf_free(&key);
+    return 0;
+}
+
+/* Decide whether an upstream response may be cached; set up capture if so. */
+static void cache_consider_response(conn_t *c, http_resp_t *r)
+{
+    if (!g_cache || !c->cache_cfg || !c->cache_key)
+        return;
+    int status = r->status;
+    if (!(status == 200 || status == 203 || status == 204 || status == 300 ||
+          status == 301 || status == 308 || status == 404 || status == 410))
+        return;
+    const char *cc = http_hdr_get(r->hdrs, r->nhdr, "Cache-Control");
+    if (cc_directive(cc, "no-store", NULL) || cc_directive(cc, "private", NULL))
+        return;
+    if (http_hdr_get(r->hdrs, r->nhdr, "Set-Cookie"))
+        return;
+    const char *vary = http_hdr_get(r->hdrs, r->nhdr, "Vary");
+    if (vary && strchr(vary, '*'))
+        return;
+    /* an Authorization'd request is only cacheable if the response is explicitly public */
+    if (http_hdr_get(c->req.hdrs, c->req.nhdr, "Authorization") && !cc_directive(cc, "public", NULL))
+        return;
+    /* freshness */
+    double ttl = -1, num = 0;
+    if (cc_directive(cc, "s-maxage", &num))
+        ttl = num;
+    else if (cc_directive(cc, "max-age", &num))
+        ttl = num;
+    else {
+        const char *exp = http_hdr_get(r->hdrs, r->nhdr, "Expires");
+        const char *date = http_hdr_get(r->hdrs, r->nhdr, "Date");
+        if (exp) {
+            time_t e = http_date_parse(exp);
+            time_t d = date ? http_date_parse(date) : (time_t)now_wall();
+            if (e > 0)
+                ttl = (double)(e - (d > 0 ? d : (time_t)now_wall()));
+        }
+    }
+    if (cc_directive(cc, "no-cache", NULL))
+        ttl = 0; /* store, but always revalidate */
+    if (ttl < 0)
+        ttl = c->cache_cfg->ttl; /* configured default; 0 means do not cache */
+    if (ttl <= 0 && !cc_directive(cc, "no-cache", NULL))
+        return;
+    if (ttl < 0)
+        ttl = 0;
+
+    /* snapshot the end-to-end headers and validators */
+    cache_clear_captured_headers(c);
+    c->cache_status = status;
+    free(c->cache_reason);
+    c->cache_reason = r->reason && *r->reason ? xstrdup(r->reason) : NULL;
+    c->cap_ttl = ttl;
+    c->cap_swr = c->cache_cfg->swr;
+    for (int i = 0; i < r->nhdr; i++) {
+        const char *n = r->hdrs[i].name;
+        if (http_hdr_is_hop_by_hop(n) || strcasecmp(n, "Content-Length") == 0 ||
+            strcasecmp(n, "Transfer-Encoding") == 0 || strcasecmp(n, "Content-Encoding") == 0 ||
+            strcasecmp(n, "Set-Cookie") == 0)
+            continue;
+        c->cap_hname = xrealloc(c->cap_hname, sizeof(char *) * (size_t)(c->cap_nh + 1));
+        c->cap_hval = xrealloc(c->cap_hval, sizeof(char *) * (size_t)(c->cap_nh + 1));
+        c->cap_hname[c->cap_nh] = xstrdup(n);
+        c->cap_hval[c->cap_nh] = xstrdup(r->hdrs[i].value);
+        c->cap_nh++;
+    }
+    const char *etag = http_hdr_get(r->hdrs, r->nhdr, "ETag");
+    const char *lm = http_hdr_get(r->hdrs, r->nhdr, "Last-Modified");
+    if (etag) { free(c->cap_etag); c->cap_etag = xstrdup(etag); }
+    if (lm) { free(c->cap_lm); c->cap_lm = xstrdup(lm); }
+    if (vary) { free(c->cap_vary); c->cap_vary = xstrdup(vary); }
+    buf_t vv;
+    buf_init(&vv);
+    cache_vary_values(c, vary, &vv);
+    buf_append(&vv, "", 1);
+    free(c->cap_vary_val);
+    c->cap_vary_val = xstrdup(buf_rptr(&vv));
+    buf_free(&vv);
+    c->cache_capture = 1;
+    c->cache_cap_max = c->cache_cfg->max_object;
+    buf_reset(&c->cache_body);
+}
+
+static void cache_maybe_store(conn_t *c)
+{
+    if (!c->cache_capture || !c->cache_key || !g_cache)
+        return;
+    if (buf_readable(&c->cache_body) > c->cache_cap_max)
+        return; /* overflowed while capturing */
+    cache_store(g_cache, c->cache_key, c->cache_status, c->cache_reason,
+                (const char *const *)c->cap_hname, (const char *const *)c->cap_hval, c->cap_nh,
+                buf_rptr(&c->cache_body), buf_readable(&c->cache_body),
+                g_now, c->cap_ttl, c->cap_swr, c->cap_etag, c->cap_lm, c->cap_vary, c->cap_vary_val);
+}
+
 static void conn_dispatch(conn_t *c)
 {
     http_req_t *r = &c->req;
@@ -2568,6 +3084,9 @@ static void conn_dispatch(conn_t *c)
         c->pool = route->pool;
         c->tried = 0;
         c->attempts = 0;
+        c->cache_cfg = route->cache ? route->cache : c->srv->cache;
+        if (c->cache_cfg && !c->cache_sink && cache_try_serve(c))
+            return;
         if (route->pool->mirror &&
             (route->pool->mirror_sample >= 100 || (double)(random() % 10000) < route->pool->mirror_sample * 100.0))
             conn_fire_mirror(c, route->pool->mirror);
@@ -4013,6 +4532,24 @@ static void admin_metrics(buf_t *b)
             }
         }
     }
+    if (g_cache) {
+        uint64_t hits = 0, misses = 0, stores = 0, evict = 0;
+        int count = 0;
+        size_t bytes = 0, cap = 0;
+        cache_stats(g_cache, &hits, &misses, &stores, &evict, &count, &bytes, &cap);
+        buf_puts(b, "# HELP limer_cache_hits_total Responses served from the cache.\n# TYPE limer_cache_hits_total counter\n");
+        buf_printf(b, "limer_cache_hits_total{worker=\"%d\"} %llu\n", g_worker_id, (unsigned long long)hits);
+        buf_puts(b, "# HELP limer_cache_misses_total Requests that missed the cache.\n# TYPE limer_cache_misses_total counter\n");
+        buf_printf(b, "limer_cache_misses_total{worker=\"%d\"} %llu\n", g_worker_id, (unsigned long long)misses);
+        buf_puts(b, "# HELP limer_cache_stores_total Responses written to the cache.\n# TYPE limer_cache_stores_total counter\n");
+        buf_printf(b, "limer_cache_stores_total{worker=\"%d\"} %llu\n", g_worker_id, (unsigned long long)stores);
+        buf_puts(b, "# HELP limer_cache_evictions_total Entries evicted for capacity.\n# TYPE limer_cache_evictions_total counter\n");
+        buf_printf(b, "limer_cache_evictions_total{worker=\"%d\"} %llu\n", g_worker_id, (unsigned long long)evict);
+        buf_puts(b, "# HELP limer_cache_entries Current number of cached entries.\n# TYPE limer_cache_entries gauge\n");
+        buf_printf(b, "limer_cache_entries{worker=\"%d\"} %d\n", g_worker_id, count);
+        buf_puts(b, "# HELP limer_cache_bytes Current cache size in bytes.\n# TYPE limer_cache_bytes gauge\n");
+        buf_printf(b, "limer_cache_bytes{worker=\"%d\"} %zu\n", g_worker_id, bytes);
+    }
 }
 
 static int g_master_pid;
@@ -4473,6 +5010,8 @@ int proxy_run(config_t *cfg, int worker_id)
     g_timer_ev.fd = tfd;
     g_timer_ev.cb = timer_cb;
     ev_add(&g_timer_ev, EPOLLIN);
+    if (!g_cache)
+        g_cache = cache_new(cfg->cache_capacity ? cfg->cache_capacity : 64 * 1024 * 1024);
     int rfd = resolver_start();
     if (rfd < 0) {
         LOGE("cannot start the resolver thread: %s", strerror(errno));
@@ -4523,6 +5062,8 @@ int proxy_run(config_t *cfg, int worker_id)
 #endif
     ev_del(&g_resolver_ev);
     resolver_stop();
+    cache_free(g_cache);
+    g_cache = NULL;
     {
         /* drop lookups that were still in flight */
         resolve_job_t *job = resolver_take_done();
