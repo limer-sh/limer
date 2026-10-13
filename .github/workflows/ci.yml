@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: build, unit, fuzz, integration, security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev pkg-config python3 curl valgrind
+      - name: Build
+        run: make
+      - name: Unit tests
+        run: make unit
+      - name: Parser fuzzing
+        run: make fuzz FUZZ_ITERS=200000
+      - name: Integration tests
+        run: make integration
+      - name: Security tests
+        run: make security
+      - name: Build without TLS
+        run: make clean && make TLS=0 && ./limer version
+
+  sanitizers:
+    name: suites under ASan/UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev pkg-config python3 curl
+      - name: Sanitized build and suites
+        run: make check-asan
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1

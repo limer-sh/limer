@@ -316,6 +316,7 @@ typedef struct config {
     server_t **servers;
     int      nservers;
     int      workers;
+    int      max_connections;   /* per worker, 0 = unlimited */
     char    *admin_addr;
     char    *pidfile;
     int      log_level;

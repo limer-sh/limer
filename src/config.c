@@ -201,6 +201,11 @@ static int parse_block(toks_t *t, int *i, node_t *parent, int nested, char *err,
         node_t *d = parse_directive(t, i, err, errlen);
         if (!d)
             return -1;
+        if (d->nargs == 0 && nested) {
+            snprintf(err, errlen, "line %d: unexpected '{' (a block needs a directive name)", d->line);
+            node_free(d);
+            return -1;
+        }
         parent->kids = xrealloc(parent->kids, sizeof(node_t *) * (size_t)(parent->nkids + 1));
         parent->kids[parent->nkids++] = d;
     }
@@ -1074,6 +1079,9 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
             else if (strcaseeq(lv, "warn") || strcaseeq(lv, "warning")) cfg->log_level = LOG_WARN;
             else if (strcaseeq(lv, "error")) cfg->log_level = LOG_ERROR;
             else FAIL("line %d: unknown log level '%s'", c->line, lv);
+        } else if (strcaseeq(k, "max_connections")) {
+            if (want_args(c, 1, 1, err, errlen) < 0 || arg_int(c, 1, &cfg->max_connections, 0, 10000000, err, errlen) < 0)
+                return -1;
         } else if (strcaseeq(k, "pidfile")) {
             if (want_args(c, 1, 1, err, errlen) < 0)
                 return -1;

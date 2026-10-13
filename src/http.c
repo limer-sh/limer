@@ -209,19 +209,12 @@ static int framing(hdr_t *hdrs, int nhdr, int64_t *clen, int *chunked)
     int seen_cl = 0;
     for (int i = 0; i < nhdr; i++) {
         if (strcasecmp(hdrs[i].name, "Transfer-Encoding") == 0) {
-            /* only "chunked" (as the final coding) is supported */
-            const char *v = hdrs[i].value;
-            size_t l = strlen(v);
-            const char *last = v + l;
-            while (last > v && (last[-1] == ' ' || last[-1] == '\t'))
-                last--;
-            const char *start = last;
-            while (start > v && start[-1] != ',' && start[-1] != ' ')
-                start--;
-            if ((size_t)(last - start) == 7 && strncasecmp(start, "chunked", 7) == 0)
-                *chunked = 1;
-            else
+            /* Only the exact coding "chunked" is supported. Anything else
+             * (unknown codings, "gzip, chunked", repeated headers) is rejected
+             * so both ends always agree on where a message ends. */
+            if (*chunked || strcasecmp(hdrs[i].value, "chunked") != 0)
                 return -1;
+            *chunked = 1;
         } else if (strcasecmp(hdrs[i].name, "Content-Length") == 0) {
             int64_t n;
             if (parse_content_length(hdrs[i].value, &n) < 0)
@@ -253,6 +246,8 @@ int http_parse_request_head(http_req_t *r, const char *data, size_t len, size_t 
     }
     if (hl > HTTP_MAX_HEAD)
         return -2;
+    if (memchr(data, 0, hl))
+        return -1; /* NUL bytes are never valid in a message head */
 
     r->raw = xstrndup(data, hl);
     r->raw_len = hl;
@@ -327,6 +322,8 @@ int http_parse_response_head(http_resp_t *r, const char *data, size_t len, size_
     }
     if (hl > HTTP_MAX_HEAD)
         return -2;
+    if (memchr(data, 0, hl))
+        return -1;
     r->raw = xstrndup(data, hl);
     r->raw_len = hl;
     char *p = r->raw;

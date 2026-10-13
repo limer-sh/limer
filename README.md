@@ -68,7 +68,7 @@ zero-downtime config reloads, and an admin API.
 ```
 make            # builds ./limer; TLS is enabled when OpenSSL is found
 make TLS=0      # force a build without OpenSSL
-make check      # integration tests (needs python3 and curl)
+make check      # unit tests, parser fuzzing, integration and security suites
 make install    # installs to /usr/local/bin
 ```
 
@@ -227,6 +227,67 @@ With `workers N`, a master process supervises `N` workers that each own all
 listeners via `SO_REUSEPORT`, restarts crashed workers, and forwards `SIGHUP`
 and `SIGTERM`.
 
+## Testing
+
+`make check` runs four suites; `make check-asan` runs the same suites on a
+build instrumented with AddressSanitizer and UndefinedBehaviorSanitizer. The
+GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
+
+| Target | What it covers |
+|---|---|
+| `make unit` | `tests/unit.c`: buffers, duration/size/address parsing, CIDR matching, globbing, the request and response head parsers (including every smuggling guard), the chunked decoder fed byte by byte, the JSON path extractor (escapes, surrogates, duplicates, nesting limits), the Limerfile parser (structure and ~40 rejected inputs), matchers and key extraction, and every balancing policy (weights, stickiness, minimal key movement, passive failure accounting). |
+| `make fuzz` | `tests/fuzz.c`: a mutation fuzzer that drives the HTTP parsers, chunked decoder, JSON extractor, form/cookie extraction and config parser with mutated seeds and checks their invariants. `FUZZ_ITERS=N` and a seed argument make runs reproducible. Two crashes were found and fixed this way. |
+| `make integration` | `tests/run_tests.sh`: end-to-end behaviour against Python backends: routing, hashing, weights, framing, keep-alive, pipelining, timeouts, retries, health checks, WebSocket upgrade, admin API, reload, graceful stop, TLS and multi-worker mode. |
+| `make security` | `tests/security_tests.py`: the black-box security suite described below. |
+
+## Security
+
+Limer sits in front of your application, so it is strict about HTTP framing
+and defensive about everything a client or upstream can send. The security
+suite (`make security`) exercises each of these against a running instance,
+including a scripted hostile upstream and a wire-level fuzz round, and
+verifies the proxy keeps serving after every attack.
+
+- **Request smuggling**: a message with both `Content-Length` and
+  `Transfer-Encoding`, conflicting `Content-Length` values, any transfer
+  coding other than exactly `chunked`, whitespace before a header colon,
+  obsolete line folding, or a non-numeric length is rejected with `400` and
+  the connection is closed, so nothing after it can be interpreted as a
+  second request. Bodies are always re-framed with a fresh `Content-Length`
+  upstream; trailers are dropped.
+- **Malformed input**: NUL bytes and control characters in heads, invalid
+  header names, HTTP/0.9 or HTTP/2 request lines and binary garbage are
+  rejected. Absolute-form targets are normalised to origin-form before being
+  sent upstream.
+- **Limits**: request heads above 64 KiB (`431`), more than 128 headers,
+  bodies above `max_body` (`413`, checked before buffering and again while
+  decoding chunks), chunk sizes that overflow, slow clients (`408` after
+  `read_timeout`), silent keep-alive connections (`idle_timeout`),
+  `max_connections` per worker, and accept backoff when the process runs out
+  of file descriptors. JSON nesting is capped so a hostile body cannot
+  exhaust the stack; response bodies are streamed with backpressure instead
+  of buffered.
+- **Header hygiene**: hop-by-hop headers (`Connection`, `Keep-Alive`, `TE`,
+  `Trailer`, `Transfer-Encoding`, `Upgrade`, `Proxy-*`) and any header
+  nominated by `Connection` are stripped in both directions. `X-Forwarded-For`
+  is appended to, while `X-Real-IP`, `X-Forwarded-Proto` and
+  `X-Forwarded-Host` are always set by the proxy, so clients cannot spoof
+  them. Header values can never contain CR or LF, so placeholders cannot
+  split responses.
+- **Hostile upstreams**: responses with conflicting framing, invalid chunk
+  sizes, NUL bytes, oversized heads, bogus status lines, unsolicited `101`s
+  or a closed connection become a clean `502`. A bodiless response that
+  still advertises a body is never pooled, so stray bytes cannot poison the
+  next request on that connection.
+- **Admin API isolation**: the admin endpoints exist only on the `admin`
+  listener. Bind it to localhost or a management network; anyone who can
+  reach it can read the configuration and trigger reloads.
+- **Memory safety**: the suites run clean under AddressSanitizer,
+  UndefinedBehaviorSanitizer and Valgrind, and the fuzzer runs on every CI
+  build.
+
+Reports of security issues are welcome as GitHub issues on this repository.
+
 ## Layout
 
 ```
@@ -239,7 +300,8 @@ src/json.c     JSON path extraction
 src/match.c    matchers and key extraction
 src/balance.c  balancing policies, passive health accounting
 src/tls.c      OpenSSL glue
-tests/         integration suite (`make check`) and a test backend
+tests/         unit tests, parser fuzzer, integration and security suites, test backend
+.github/       CI workflow (normal and sanitized builds)
 examples/      annotated Limerfiles
 ```
 
