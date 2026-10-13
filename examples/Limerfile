@@ -129,9 +129,53 @@ api.example.com {
     }
 }
 
-# --- gRPC: HTTP/2 to the upstreams, trailers pass through ------------------
+# --- gRPC: HTTP/2 to the upstreams, trailers and streaming pass through ----
 grpc.example.com {
     reverse_proxy h2c://10.0.8.10:50051 h2c://10.0.8.11:50051   # h2:// for TLS upstreams
+}
+
+# --- Dynamic upstreams from DNS (re-resolved on an interval) ---------------
+discovery.example.com {
+    reverse_proxy {
+        dynamic srv _grpc._tcp.svc.internal   # or: dynamic a backends.internal 8080
+        refresh 10s
+        lb_policy least_conn
+    }
+}
+
+# --- Mutual TLS: ask clients for a certificate, expose who they are --------
+# For strict verification use `mode require_and_verify` with
+# `trusted_ca_cert_file <ca.pem>`, and present a client certificate to the
+# upstream with `tls_client_auth <cert.pem> <key.pem>` (both need real files).
+secure.example.com {
+    tls internal {
+        client_auth {
+            mode request
+        }
+    }
+    header X-Client-CN {tls_client_subject}
+    header X-Client-Verified {tls_client_verified}
+    reverse_proxy https://10.0.9.10:8443 {
+        tls_server_name backend.internal
+    }
+}
+
+# --- Canary split + request mirroring + response caching -------------------
+www.example.com {
+    encode zstd gzip
+    cache {
+        ttl 1m           # assume this freshness when the response gives none
+        stale 30s        # serve stale while a background refresh runs
+    }
+    route {
+        match split 5 cookie session    # 5% of sessions, stable per user
+        reverse_proxy 10.0.10.10:8080
+    }
+    reverse_proxy 10.0.10.20:8080 10.0.10.21:8080 {
+        mirror 10.0.10.30:8080 {
+            sample 10            # tee 10% of traffic to a shadow pool
+        }
+    }
 }
 
 # --- Local development: self-signed certificate, no ACME -------------------
