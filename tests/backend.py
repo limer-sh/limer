@@ -42,6 +42,18 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _body(self):
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            out = b""
+            while True:
+                line = self.rfile.readline().strip()
+                n = int(line.split(b";")[0], 16) if line else 0
+                if n == 0:
+                    # trailers (if any) up to the blank line
+                    while self.rfile.readline().strip():
+                        pass
+                    return out
+                out += self.rfile.read(n)
+                self.rfile.readline()
         n = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(n) if n else b""
 
@@ -57,8 +69,17 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def handle_any(self):
-        body = self._body()
         path = self.path.split("?")[0]
+        if path == "/early":
+            # answer without reading the body (the proxy must not reuse the connection);
+            # linger a little so the response is read before the reset
+            self.close_connection = True
+            self.wfile.write(b"HTTP/1.1 413 Payload Too Large\r\nX-Backend: " + NAME.encode() +
+                             b"\r\nContent-Length: 5\r\nConnection: close\r\n\r\nearly")
+            self.wfile.flush()
+            time.sleep(0.5)
+            return
+        body = self._body()
         if path == "/healthz":
             if FAIL_HEALTH:
                 self._send(503, b"unhealthy")
@@ -73,6 +94,12 @@ class Handler(BaseHTTPRequestHandler):
                 "body": body.decode("utf-8", "replace"),
                 "body_len": len(body),
             }
+            self._send(200, json.dumps(doc).encode(), "application/json")
+        elif path == "/upload":
+            import hashlib
+            doc = {"name": NAME, "body_len": len(body), "sha256": hashlib.sha256(body).hexdigest(),
+                   "chunked": "chunked" in (self.headers.get("Transfer-Encoding") or "").lower(),
+                   "content_length": self.headers.get("Content-Length")}
             self._send(200, json.dumps(doc).encode(), "application/json")
         elif path == "/chunked":
             self.send_response(200)

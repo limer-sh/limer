@@ -1652,6 +1652,7 @@ static int route_finish(server_t *s, route_t *r, pool_t *p, char *root_hint, con
         }
     }
     free(root_hint);
+    route_compute_needs_body(r);
     s->routes = xrealloc(s->routes, sizeof(route_t *) * (size_t)(s->nroutes + 1));
     s->routes[s->nroutes++] = r;
     return 0;
@@ -2043,6 +2044,16 @@ static int parse_server(config_t *cfg, node_t *d, char *err, size_t errlen)
                             snprintf(err, errlen, "line %d: invalid size '%s'", kk->line, kk->args[1]);
                             rc = -1;
                         }
+                    } else if (strcaseeq(kk->args[0], "mode") && kk->nargs == 2) {
+                        /* mode stream (default: stream unless something reads the body) | buffer */
+                        if (strcaseeq(kk->args[1], "stream") || strcaseeq(kk->args[1], "auto"))
+                            s->body_mode = 0;
+                        else if (strcaseeq(kk->args[1], "buffer"))
+                            s->body_mode = 1;
+                        else {
+                            snprintf(err, errlen, "line %d: request_body mode accepts stream or buffer", kk->line);
+                            rc = -1;
+                        }
                     } else {
                         snprintf(err, errlen, "line %d: unknown request_body option '%s'", kk->line, kk->args[0]);
                         rc = -1;
@@ -2121,6 +2132,10 @@ static int parse_server(config_t *cfg, node_t *d, char *err, size_t errlen)
         server_free(s);
         FAIL("line %d: site block has no handlers (reverse_proxy, route, respond, file_server, ...)", d->line);
     }
+    s->needs_body = (s->rl && template_needs_body(s->rl->key)) ? 1 : 0;
+    for (int i = 0; i < s->n_hdr_up; i++)
+        if (template_needs_body(s->hdr_up[i].value))
+            s->needs_body = 1;
     cfg->servers = xrealloc(cfg->servers, sizeof(server_t *) * (size_t)(cfg->nservers + 1));
     cfg->servers[cfg->nservers++] = s;
     return 0;

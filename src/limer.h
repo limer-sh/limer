@@ -368,6 +368,7 @@ typedef struct route {
     basic_auth_t *auth;
     file_server_t *files;
     rate_limit_cfg_t *rl;
+    int       needs_body;   /* a matcher, hash key or placeholder reads the request body */
 } route_t;
 
 enum tls_mode { TLS_NONE = 0, TLS_FILES, TLS_INTERNAL, TLS_AUTO };
@@ -381,6 +382,8 @@ typedef struct server {
     route_t **routes;
     int     nroutes;
     size_t  max_body;
+    int     body_mode;   /* 0 stream when nothing reads the body, 1 always buffer */
+    int     needs_body;  /* a site-level rate limit key or request_header reads the body */
     double  read_timeout;
     double  idle_timeout;
     int     access_log;
@@ -454,6 +457,10 @@ typedef struct req_ctx {
 int  key_extract(const keysrc_t *k, const req_ctx_t *ctx, buf_t *out);
 int  matcher_eval(const matcher_t *m, const req_ctx_t *ctx);
 int  route_matches(const route_t *r, const req_ctx_t *ctx);
+int  route_prematch(const route_t *r, const req_ctx_t *ctx);  /* 0 no match, 1 match, 2 the body decides */
+int  keysrc_needs_body(const keysrc_t *k);
+int  template_needs_body(const char *tmpl);   /* placeholder string reads {json.*}, {form.*} or {body} */
+int  route_compute_needs_body(route_t *r);
 
 /* ------------------------------------------------------------------ */
 /* Balancing                                                           */

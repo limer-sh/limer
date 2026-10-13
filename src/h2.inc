@@ -238,6 +238,7 @@ static int h2_on_begin_headers(nghttp2_session *ng, const nghttp2_frame *frame, 
     buf_init(&st->h2_hdrs);
     buf_init(&st->h2_reqbody);
     st->file_fd = -1;
+    st->h2_req_clen = -1;
     http_req_init(&st->req);
     st->state = CS_HEAD;
     st->deadline = g_now + st->srv->read_timeout;
@@ -267,6 +268,16 @@ static int h2_on_header(nghttp2_session *ng, const nghttp2_frame *frame, const u
             snprintf(st->h2_authority, sizeof st->h2_authority, "%.*s", (int)valuelen, value);
         return 0;
     }
+    if (namelen == 14 && memcmp(name, "content-length", 14) == 0) {
+        /* kept as the body's framing so HTTP/1.1 upstreams see a Content-Length */
+        char tmp[24];
+        snprintf(tmp, sizeof tmp, "%.*s", (int)(valuelen < 23 ? valuelen : 23), value);
+        char *end = NULL;
+        long long v = strtoll(tmp, &end, 10);
+        if (end && *end == 0 && v >= 0)
+            st->h2_req_clen = v;
+        return 0;
+    }
     /* headers that have no meaning in HTTP/2 or that we regenerate */
     if ((namelen == 14 && memcmp(name, "content-length", 14) == 0) ||
         (namelen == 17 && memcmp(name, "transfer-encoding", 17) == 0) ||
@@ -292,21 +303,68 @@ static int h2_on_header(nghttp2_session *ng, const nghttp2_frame *frame, const u
     return 0;
 }
 
+/*
+ * Request bodies: DATA frames are appended to the stream's rbuf as HTTP/1.1
+ * chunks behind a synthesized "Transfer-Encoding: chunked" head, so the
+ * normal pipeline buffers or streams them exactly like an HTTP/1.1 request.
+ * Flow-control credit is handed back as the bytes are consumed: immediately
+ * while buffering (bounded by max_body), or once forwarded while streaming.
+ */
+static void h2_stream_body_progress(conn_t *st)
+{
+    if (st->dead)
+        return;
+    if (st->state == CS_HEAD || st->state == CS_BODY)
+        conn_process(st);
+    else if (st->state == CS_UPSTREAM && st->body_stream && !st->body_done)
+        conn_pump_body(st);
+}
+
 static int h2_on_data_chunk(nghttp2_session *ng, uint8_t flags, int32_t stream_id, const uint8_t *data, size_t len, void *user_data)
 {
     (void)flags; (void)user_data;
     conn_t *st = nghttp2_session_get_stream_user_data(ng, stream_id);
-    if (!st)
+    if (!st || st->dead)
         return 0;
     st->h2_reqlen += len;
-    if (st->h2_reqlen <= st->srv->max_body)
-        buf_append(&st->h2_reqbody, data, len);
+    if (st->state == CS_UPSTREAM && st->body_stream) {
+        st->h2_unconsumed += len; /* released by conn_pump_body once forwarded */
+    } else {
+        nghttp2_session_consume(ng, stream_id, len);
+        if (st->state != CS_HEAD && st->state != CS_BODY)
+            return 0; /* response already sent (or buffering finished): drop the rest */
+    }
+    if (st->h2_req_raw) {
+        buf_append(&st->rbuf, data, len);
+    } else {
+        buf_printf(&st->rbuf, "%zx\r\n", len);
+        buf_append(&st->rbuf, data, len);
+        buf_puts(&st->rbuf, "\r\n");
+    }
     return 0;
 }
 
-static void h2_dispatch_stream(conn_t *st)
+/* Streamed-body bytes were forwarded upstream: give the client window credit back. */
+static void h2_stream_consumed(conn_t *st, size_t n)
 {
-    /* synthesize an HTTP/1.1 request for the normal pipeline */
+    conn_t *parent = st->h2_parent;
+    h2_session_t *s = parent ? parent->h2 : NULL;
+    if (!s || s->closing || st->h2_detached)
+        return;
+    if (n > st->h2_unconsumed)
+        n = st->h2_unconsumed;
+    if (n == 0)
+        return;
+    st->h2_unconsumed -= n;
+    nghttp2_session_consume(s->ng, st->h2_stream_id, n);
+    s->want_send = 1;
+    if (!s->in_callback)
+        h2_session_send(parent);
+}
+
+static void h2_dispatch_stream(conn_t *st, int has_body)
+{
+    /* synthesize an HTTP/1.1 request head for the normal pipeline */
     if (!st->h2_method[0] || !st->h2_path[0]) {
         conn_send_error(st, 400, "missing :method or :path", 0);
         return;
@@ -321,25 +379,38 @@ static void h2_dispatch_stream(conn_t *st)
         buf_append(&st->rbuf, buf_rptr(&st->h2_cookie), buf_readable(&st->h2_cookie));
         buf_puts(&st->rbuf, "\r\n");
     }
-    if (st->h2_reqlen > 0 || strcmp(st->h2_method, "POST") == 0 || strcmp(st->h2_method, "PUT") == 0 || strcmp(st->h2_method, "PATCH") == 0)
-        buf_printf(&st->rbuf, "Content-Length: %zu\r\n", st->h2_reqlen);
+    if (has_body && st->h2_req_clen >= 0) {
+        buf_printf(&st->rbuf, "Content-Length: %lld\r\n", (long long)st->h2_req_clen);
+        st->h2_req_raw = 1; /* DATA frames are appended as-is */
+    } else if (has_body)
+        buf_puts(&st->rbuf, "Transfer-Encoding: chunked\r\n");
+    else if (strcmp(st->h2_method, "POST") == 0 || strcmp(st->h2_method, "PUT") == 0 || strcmp(st->h2_method, "PATCH") == 0)
+        buf_puts(&st->rbuf, "Content-Length: 0\r\n");
     buf_puts(&st->rbuf, "\r\n");
-    buf_append(&st->rbuf, buf_rptr(&st->h2_reqbody), buf_readable(&st->h2_reqbody));
-    buf_reset(&st->h2_reqbody);
     buf_reset(&st->h2_hdrs);
     buf_reset(&st->h2_cookie);
-    st->rd_eof = 1; /* nothing more will arrive for this stream */
+    st->h2_body_started = 1;
+    if (!has_body)
+        st->rd_eof = 1; /* nothing more will arrive for this stream */
     conn_process(st);
 }
 
 static int h2_on_frame_recv(nghttp2_session *ng, const nghttp2_frame *frame, void *user_data)
 {
     (void)user_data;
-    if ((frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_REQUEST) || frame->hd.type == NGHTTP2_DATA) {
-        if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
-            conn_t *st = nghttp2_session_get_stream_user_data(ng, frame->hd.stream_id);
-            if (st && !st->dead)
-                h2_dispatch_stream(st);
+    if (frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+        conn_t *st = nghttp2_session_get_stream_user_data(ng, frame->hd.stream_id);
+        if (st && !st->dead)
+            h2_dispatch_stream(st, !(frame->hd.flags & NGHTTP2_FLAG_END_STREAM));
+    } else if (frame->hd.type == NGHTTP2_DATA) {
+        conn_t *st = nghttp2_session_get_stream_user_data(ng, frame->hd.stream_id);
+        if (st && !st->dead && st->h2_body_started) {
+            if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
+                if (!st->h2_req_raw && (st->state == CS_HEAD || st->state == CS_BODY || (st->state == CS_UPSTREAM && st->body_stream)))
+                    buf_puts(&st->rbuf, "0\r\n\r\n");
+                st->rd_eof = 1;
+            }
+            h2_stream_body_progress(st);
         }
     }
     return 0;
@@ -376,7 +447,11 @@ static int h2_session_start(conn_t *c)
     nghttp2_session_callbacks_set_on_stream_close_callback(cb, h2_on_stream_close);
     h2_session_t *s = xcalloc(1, sizeof *s);
     s->c = c;
-    int rc = nghttp2_session_server_new(&s->ng, cb, s);
+    nghttp2_option *opt;
+    nghttp2_option_new(&opt);
+    nghttp2_option_set_no_auto_window_update(opt, 1);
+    int rc = nghttp2_session_server_new2(&s->ng, cb, s, opt);
+    nghttp2_option_del(opt);
     nghttp2_session_callbacks_del(cb);
     if (rc != 0) {
         free(s);
@@ -387,6 +462,7 @@ static int h2_session_start(conn_t *c)
         { NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, HTTP_MAX_HEAD },
     };
     nghttp2_submit_settings(s->ng, NGHTTP2_FLAG_NONE, iv, 2);
+    nghttp2_session_set_local_window_size(s->ng, NGHTTP2_FLAG_NONE, 0, 4 * 1024 * 1024);
     c->h2 = s;
     c->state = CS_H2;
     c->deadline = g_now + c->srv->idle_timeout;

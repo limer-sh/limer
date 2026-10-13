@@ -665,6 +665,34 @@ TEST(test_config)
         config_unref(c);
     }
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 {\n  transport http {\n   versions h3\n  }\n }\n}\n", "versions accepts");
+    /* request body streaming decisions */
+    c = cfg_ok(":1 {\n request_body {\n  max_size 1m\n  mode buffer\n }\n reverse_proxy 127.0.0.1:1\n}\n"
+               ":2 {\n request_body {\n  mode stream\n }\n"
+               " route a {\n  match path /a\n  reverse_proxy 127.0.0.1:1\n }\n"
+               " route b {\n  match json kind == x\n  reverse_proxy 127.0.0.1:1\n }\n"
+               " route c {\n  match path /c\n  reverse_proxy 127.0.0.1:1 127.0.0.1:2 {\n   lb_policy hash form cart\n  }\n }\n"
+               " route d {\n  match path /d\n  reverse_proxy 127.0.0.1:1 {\n   header_up X-Tenant {json.tenant}\n  }\n }\n"
+               " route e {\n  match path /e\n  rate_limit {\n   key {form.user}\n   rate 1r/s\n  }\n  reverse_proxy 127.0.0.1:1\n }\n"
+               " route f {\n  match path /f\n  header X-Len {header.Content-Length}\n  reverse_proxy 127.0.0.1:1 {\n   lb_policy hash header X-Id\n  }\n }\n}\n"
+               ":3 {\n rate_limit {\n  key {json.tenant}\n  rate 1r/s\n }\n reverse_proxy 127.0.0.1:1\n}\n"
+               ":4 {\n request_header X-Kind {json.kind}\n reverse_proxy 127.0.0.1:1\n}\n");
+    if (c) {
+        CHECK(c->servers[0]->body_mode == 1 && c->servers[0]->max_body == 1024 * 1024);
+        server_t *s2 = c->servers[1];
+        CHECK(s2->body_mode == 0 && !s2->needs_body);
+        CHECK(!s2->routes[0]->needs_body);
+        CHECK(s2->routes[1]->needs_body);  /* json matcher */
+        CHECK(s2->routes[2]->needs_body);  /* hash form */
+        CHECK(s2->routes[3]->needs_body);  /* header_up placeholder */
+        CHECK(s2->routes[4]->needs_body);  /* rate limit key */
+        CHECK(!s2->routes[5]->needs_body); /* header-only placeholders and hash */
+        CHECK(c->servers[2]->needs_body);  /* site rate limit on a json key */
+        CHECK(c->servers[3]->needs_body);  /* site request_header on a json key */
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n request_body {\n  mode sometimes\n }\n reverse_proxy 127.0.0.1:1\n}\n", "mode accepts");
+    CHECK(template_needs_body("{json.a}") && template_needs_body("x{form.b}y") && template_needs_body("{body}"));
+    CHECK(!template_needs_body("{header.X}") && !template_needs_body("{query.q}{cookie.c}") && !template_needs_body(NULL));
 #endif
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:99999\n}\n", "invalid upstream address");
     cfg_bad(":1 {\n reverse_proxy no.such.host.invalid:80\n}\n", "cannot resolve");
@@ -903,6 +931,32 @@ static int route_from(config_t **cfg_out, const char *match_lines, const req_ctx
     int res = route_matches(c->servers[0]->routes[0], ctx);
     config_unref(c);
     return res;
+}
+
+static int prematch_from(const char *match_lines, const req_ctx_t *ctx)
+{
+    char text[2048];
+    snprintf(text, sizeof text, ":1 {\n route {\n%s\n  reverse_proxy 127.0.0.1:1\n }\n}\n", match_lines);
+    config_t *c = cfg_ok(text);
+    if (!c)
+        return -1;
+    int res = route_prematch(c->servers[0]->routes[0], ctx);
+    config_unref(c);
+    return res;
+}
+
+TEST(test_prematch)
+{
+    tctx_t t;
+    tctx_init(&t, "POST /api/orders HTTP/1.1\r\nHost: shop.example.com\r\nX-Tenant: acme\r\n\r\n{\"type\":\"order\"}", "10.2.3.4");
+    CHECK(prematch_from("  match path /api/*", &t.ctx) == 1);
+    CHECK(prematch_from("  match path /other/*", &t.ctx) == 0);
+    CHECK(prematch_from("  match json type == order", &t.ctx) == 2);
+    CHECK(prematch_from("  match path /api/*\n  match json type == order", &t.ctx) == 2);
+    CHECK(prematch_from("  match path /other/*\n  match json type == order", &t.ctx) == 0); /* path already fails */
+    CHECK(prematch_from("  match header X-Tenant acme\n  match form a == b", &t.ctx) == 2);
+    CHECK(prematch_from("  match method GET\n  match body ~ x", &t.ctx) == 0);
+    http_req_free(&t.req);
 }
 
 TEST(test_match)
@@ -1210,6 +1264,7 @@ int main(void)
     test_json_run();
     test_config_run();
     test_match_run();
+    test_prematch_run();
     test_balance_run();
     test_ratelimit_run();
     printf("unit tests: %d checks, %d failures\n", checks, failures);

@@ -28,6 +28,7 @@ typedef struct h2u_session {
     uconn_t **streams;
     int nstreams, cap;
     int in_callback;
+    int sending;
     int dead;
     double idle_since;
     struct h2u_session *next;   /* global list */
@@ -183,9 +184,31 @@ static ssize_t h2u_req_read(nghttp2_session *ng, int32_t stream_id, uint8_t *buf
     if (n)
         memcpy(buf, buf_rptr(&uc->wbuf), n);
     buf_consume(&uc->wbuf, n);
-    if (buf_readable(&uc->wbuf) == 0)
-        *flags |= NGHTTP2_DATA_FLAG_EOF;
+    if (buf_readable(&uc->wbuf) == 0) {
+        if (uc->req_eof) {
+            *flags |= NGHTTP2_DATA_FLAG_EOF;
+        } else if (n == 0) {
+            uc->h2u_req_deferred = 1; /* resumed when more of the streamed body arrives */
+            return NGHTTP2_ERR_DEFERRED;
+        }
+    }
+    if (!uc->req_eof && uc->c && buf_readable(&uc->wbuf) < WBUF_LOW_WATER)
+        uc->h2u_want_pump = 1; /* room for more: pull from the client after this send */
     return (ssize_t)n;
+}
+
+/* More streamed request-body bytes (or its end) were appended to uc->wbuf. */
+static void h2u_body_resume(uconn_t *uc)
+{
+    h2u_session_t *s = uc->h2u;
+    if (!s || s->dead || !s->ng || !uc->h2u_submitted || uc->dead)
+        return;
+    if (uc->h2u_req_deferred) {
+        uc->h2u_req_deferred = 0;
+        nghttp2_session_resume_data(s->ng, uc->h2u_stream_id);
+    }
+    if (!s->in_callback)
+        h2u_session_send(s);
 }
 
 static void h2u_submit(uconn_t *uc)
@@ -225,7 +248,7 @@ static void h2u_submit(uconn_t *uc)
     nghttp2_data_provider prd;
     prd.source.ptr = uc;
     prd.read_callback = h2u_req_read;
-    int has_body = buf_readable(&uc->wbuf) > 0;
+    int has_body = buf_readable(&uc->wbuf) > 0 || !uc->req_eof;
     int32_t id = nghttp2_submit_request(s->ng, NULL, nva, (size_t)n, has_body ? &prd : NULL, uc);
     free(nva);
     http_req_free(&req);
@@ -296,28 +319,49 @@ static void h2u_session_fail(h2u_session_t *s, const char *reason)
 
 static void h2u_session_send(h2u_session_t *s)
 {
-    if (s->dead || s->state != 2)
+    if (s->dead || s->state != 2 || s->sending)
         return;
-    for (;;) {
-        const uint8_t *data;
-        ssize_t n = nghttp2_session_mem_send(s->ng, &data);
-        if (n <= 0)
-            break;
-        buf_append(&s->wbuf, data, (size_t)n);
-        if (buf_readable(&s->wbuf) > WBUF_HIGH_WATER)
-            break;
-    }
-    int rc;
+    s->sending = 1;
+    for (int round = 0; round < 4; round++) {
+        for (;;) {
+            const uint8_t *data;
+            ssize_t n = nghttp2_session_mem_send(s->ng, &data);
+            if (n <= 0)
+                break;
+            buf_append(&s->wbuf, data, (size_t)n);
+            if (buf_readable(&s->wbuf) > WBUF_HIGH_WATER)
+                break;
+        }
+        int rc;
 #ifdef LIMER_TLS
-    rc = s->ssl ? ssl_flush(s->ssl, &s->wbuf) : fd_flush(s->ev.fd, &s->wbuf);
+        rc = s->ssl ? ssl_flush(s->ssl, &s->wbuf) : fd_flush(s->ev.fd, &s->wbuf);
 #else
-    rc = fd_flush(s->ev.fd, &s->wbuf);
+        rc = fd_flush(s->ev.fd, &s->wbuf);
 #endif
-    if (rc < 0) {
-        h2u_session_fail(s, "HTTP/2 upstream write failed");
-        return;
+        if (rc < 0) {
+            s->sending = 0;
+            h2u_session_fail(s, "HTTP/2 upstream write failed");
+            return;
+        }
+        ev_mod(&s->ev, EPOLLIN | EPOLLRDHUP | (buf_readable(&s->wbuf) ? EPOLLOUT : 0));
+        /* streams whose request body drained can take more from their clients */
+        int pumped = 0;
+        for (int i = 0; i < s->nstreams; i++) {
+            uconn_t *uc = s->streams[i];
+            if (!uc->h2u_want_pump)
+                continue;
+            uc->h2u_want_pump = 0;
+            if (uc->c && !uc->dead && uc->c->body_stream && !uc->c->body_done) {
+                conn_pump_body(uc->c);
+                pumped = 1;
+                if (s->dead)
+                    return;
+            }
+        }
+        if (!pumped || buf_readable(&s->wbuf) > 0)
+            break;
     }
-    ev_mod(&s->ev, EPOLLIN | EPOLLRDHUP | (buf_readable(&s->wbuf) ? EPOLLOUT : 0));
+    s->sending = 0;
 }
 
 /* Process streams that received frames. */
