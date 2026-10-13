@@ -665,6 +665,7 @@ static void route_free(route_t *r)
     auth_free(r->auth);
     files_free(r->files);
     rl_cfg_free(r->rl);
+    free(r->cache);
     free(r);
 }
 
@@ -690,6 +691,7 @@ static void server_free(server_t *s)
     hdr_ops_free(s->hdr_up, s->n_hdr_up);
     auth_free(s->auth);
     rl_cfg_free(s->rl);
+    free(s->cache);
     free(s->encode);
     if (s->log_fd > 2)
         close(s->log_fd);
@@ -1379,6 +1381,52 @@ static void config_resolve_dynamic(config_t *cfg)
 /* Matchers and route-level directives                                 */
 /* ------------------------------------------------------------------ */
 
+static int parse_cache(cache_cfg_t **out, node_t *d, char *err, size_t errlen)
+{
+    cache_cfg_t *cc = xcalloc(1, sizeof *cc);
+    cc->max_object = 1024 * 1024;   /* 1 MiB */
+    cc->methods_head = 1;
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *k = d->kids[i];
+        const char *n = k->args[0];
+        int rc = 0;
+        if (strcaseeq(n, "ttl") || strcaseeq(n, "default_ttl")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0)
+                rc = arg_duration(k, 1, &cc->ttl, err, errlen);
+        } else if (strcaseeq(n, "stale") || strcaseeq(n, "stale_while_revalidate")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0)
+                rc = arg_duration(k, 1, &cc->swr, err, errlen);
+        } else if (strcaseeq(n, "max_object") || strcaseeq(n, "max_object_size")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0 && parse_size(k->args[1], &cc->max_object) < 0) {
+                snprintf(err, errlen, "line %d: invalid size '%s'", k->line, k->args[1]);
+                rc = -1;
+            }
+        } else if (strcaseeq(n, "methods")) {
+            if ((rc = want_args(k, 1, -1, err, errlen)) == 0) {
+                cc->methods_head = 0;
+                for (int a = 1; a < k->nargs; a++) {
+                    if (strcaseeq(k->args[a], "HEAD"))
+                        cc->methods_head = 1;
+                    else if (!strcaseeq(k->args[a], "GET")) {
+                        snprintf(err, errlen, "line %d: cache only caches GET and HEAD", k->line);
+                        rc = -1;
+                    }
+                }
+            }
+        } else {
+            snprintf(err, errlen, "line %d: unknown cache option '%s'", k->line, n);
+            rc = -1;
+        }
+        if (rc < 0) {
+            free(cc);
+            return -1;
+        }
+    }
+    free(*out);
+    *out = cc;
+    return 0;
+}
+
 static void route_add_matcher(route_t *r, const matcher_t *m)
 {
     r->m = xrealloc(r->m, sizeof(matcher_t) * (size_t)(r->nm + 1));
@@ -1887,6 +1935,9 @@ static int parse_route_directive(route_t *r, pool_t *p, node_t *c, char **root_h
     }
     if (strcaseeq(k, "rate_limit")) {
         return parse_rate_limit(&r->rl, c, err, errlen) < 0 ? -1 : 1;
+    }
+    if (strcaseeq(k, "cache")) {
+        return parse_cache(&r->cache, c, err, errlen) < 0 ? -1 : 1;
     }
     if (strcaseeq(k, "header") || strcaseeq(k, "header_down")) {
         return add_hdr_ops(&p->hdr_down, &p->n_hdr_down, c, err, errlen) < 0 ? -1 : 1;
@@ -2424,6 +2475,8 @@ static int parse_server(config_t *cfg, node_t *d, char *err, size_t errlen)
             rc = parse_basic_auth(&s->auth, c, err, errlen);
         } else if (strcaseeq(k, "rate_limit")) {
             rc = parse_rate_limit(&s->rl, c, err, errlen);
+        } else if (strcaseeq(k, "cache")) {
+            rc = parse_cache(&s->cache, c, err, errlen);
         } else if (strcaseeq(k, "encode")) {
             if ((rc = want_args(c, 0, -1, err, errlen)) == 0) {
                 buf_t b;
@@ -2570,6 +2623,11 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
         } else if (strcaseeq(k, "acme_dns_propagation")) {
             if (want_args(c, 1, 1, err, errlen) < 0 || arg_duration(c, 1, &cfg->acme_dns_propagation, err, errlen) < 0)
                 return -1;
+        } else if (strcaseeq(k, "cache_capacity") || strcaseeq(k, "cache_size")) {
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            if (parse_size(c->args[1], &cfg->cache_capacity) < 0)
+                FAIL("line %d: invalid cache_capacity '%s'", c->line, c->args[1]);
         } else if (strcaseeq(k, "resolvers")) {
             if (want_args(c, 1, 4, err, errlen) < 0)
                 return -1;

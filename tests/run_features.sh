@@ -697,6 +697,82 @@ expect_eq "8 concurrent 20 MB uploads intact" "$okc" "11111111"
 expect_eq "no errors logged" "$(grep -c "error" $TMP/stream.log)" "0"
 kill -TERM $SP; wait $SP 2>/dev/null
 
+echo "# response caching"
+python3 tests/cacheback.py 9730 & PIDS+=($!)
+wait_port 9730
+cat > "$TMP/cache.conf" <<CFG
+{
+    admin 127.0.0.1:9792
+    log_level warn
+}
+:9823 {
+    encode gzip
+    cache {
+        stale 3s
+        max_object 1m
+    }
+    reverse_proxy 127.0.0.1:9730
+}
+:9824 {
+    reverse_proxy 127.0.0.1:9730
+}
+CFG
+$BIN run -c "$TMP/cache.conf" >/dev/null 2>"$TMP/cache.log" & CAP=$!; PIDS+=($CAP)
+wait_port 9823; wait_port 9792
+# a max-age response is a MISS then a HIT with the same body
+a=$(curl -s -D "$TMP/h1" http://127.0.0.1:9823/maxage); b=$(curl -s -D "$TMP/h2" http://127.0.0.1:9823/maxage)
+expect_eq "max-age response is served identically on the second request" "$a" "$b"
+expect_contains "first request is a MISS" "$(cat "$TMP/h1")" "X-Cache: MISS"
+expect_contains "second request is a HIT" "$(cat "$TMP/h2")" "X-Cache: HIT"
+expect_contains "a cache hit carries an Age header" "$(cat "$TMP/h2")" "Age:"
+# a site without a cache block does not cache
+c=$(curl -s http://127.0.0.1:9824/maxage); d=$(curl -s http://127.0.0.1:9824/maxage)
+[ "$c" != "$d" ] && ok "a site without cache does not serve stale copies" || fail "no-cache site" "both '$c'"
+# s-maxage is honoured
+expect_eq "s-maxage cached" "$(curl -s http://127.0.0.1:9823/smaxage)" "$(curl -s http://127.0.0.1:9823/smaxage)"
+# no-store, private and Set-Cookie responses are never cached
+x=$(curl -s http://127.0.0.1:9823/nostore); y=$(curl -s http://127.0.0.1:9823/nostore)
+[ "$x" != "$y" ] && ok "no-store is never cached" || fail "no-store" "both '$x'"
+x=$(curl -s http://127.0.0.1:9823/private); y=$(curl -s http://127.0.0.1:9823/private)
+[ "$x" != "$y" ] && ok "private is never cached" || fail "private" "both '$x'"
+x=$(curl -s http://127.0.0.1:9823/setcookie); y=$(curl -s http://127.0.0.1:9823/setcookie)
+[ "$x" != "$y" ] && ok "Set-Cookie responses are never cached" || fail "set-cookie" "both '$x'"
+# HEAD is served from the cache populated by a GET's sibling, and never returns a body
+curl -s http://127.0.0.1:9823/maxage >/dev/null
+expect_eq "HEAD returns no body" "$(curl -s -I http://127.0.0.1:9823/maxage | grep -ic '^body-')" "0"
+# compression is applied per client from one stored identity copy
+curl -s -o /dev/null http://127.0.0.1:9823/large   # populate
+g=$(curl -s -D - -o /dev/null -H 'Accept-Encoding: gzip' http://127.0.0.1:9823/large)
+expect_contains "a cached response is gzip-encoded for a client that asks" "$g" "Content-Encoding: gzip"
+expect_contains "the gzip-served cached response is still a HIT" "$g" "X-Cache: HIT"
+expect_eq "an identity client gets the cached body intact" "$(curl -s http://127.0.0.1:9823/large | head -c 5)" "LARGE"
+# a client conditional request against a cached entry gets 304
+et=$(curl -s -o /dev/null http://127.0.0.1:9823/etag; curl -s -D - -o /dev/null http://127.0.0.1:9823/etag | grep -i '^ETag' | tr -d '
+')
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'If-None-Match: "v1"' http://127.0.0.1:9823/etag)
+expect_eq "client revalidation against a cached ETag returns 304" "$code" "304"
+# Vary: different variants are kept apart
+va=$(curl -s -H 'X-Variant: a' http://127.0.0.1:9823/vary)
+expect_contains "a Vary request is cached per variant value" "$va" "variant=a-"
+expect_eq "the same variant is a hit" "$(curl -s -H 'X-Variant: a' http://127.0.0.1:9823/vary)" "$va"
+vb=$(curl -s -H 'X-Variant: b' http://127.0.0.1:9823/vary)
+expect_contains "a different Vary value is not served the stored variant" "$vb" "variant=b-"
+expect_eq "the new variant is now the cached one" "$(curl -s -H 'X-Variant: b' http://127.0.0.1:9823/vary)" "$vb"
+# stale-while-revalidate: once max-age=1 expires the stale copy is served while a refresh runs
+base=$(curl -s http://127.0.0.1:9730/hits)   # bump nothing; just reach the backend directly
+hits_before=$(curl -s http://127.0.0.1:9730/hits)
+curl -s -o /dev/null http://127.0.0.1:9823/etag   # store (etag, max-age=1)
+sleep 1.3
+sc=$(curl -s -D - http://127.0.0.1:9823/etag)
+expect_contains "a stale entry within the window is served as STALE" "$sc" "X-Cache: STALE"
+sleep 0.5   # let the background revalidation finish
+# after revalidation the entry is fresh again (served as HIT, not STALE)
+expect_contains "the background refresh makes it fresh again" "$(curl -s -D - http://127.0.0.1:9823/etag)" "X-Cache: HIT"
+# metrics expose cache counters
+expect_contains "metrics expose cache hits" "$(curl -s http://127.0.0.1:9792/metrics)" "limer_cache_hits_total"
+expect_eq "no errors logged" "$(grep -c ' error ' $TMP/cache.log)" "0"
+kill -TERM $CAP 2>/dev/null; wait $CAP 2>/dev/null
+
 echo "# traffic splitting and request mirroring"
 python3 tests/backend.py 9708 stable & PIDS+=($!)
 python3 tests/backend.py 9709 canary & PIDS+=($!)
