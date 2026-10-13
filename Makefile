@@ -16,8 +16,15 @@ CFLAGS += -DLIMER_TLS $(shell pkg-config --cflags openssl 2>/dev/null)
 LDLIBS += $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
 endif
 
+# `make SAN=1` builds everything with AddressSanitizer + UBSan.
+ifeq ($(SAN),1)
+CFLAGS  += -fsanitize=address,undefined -fno-omit-frame-pointer -O1
+LDFLAGS += -fsanitize=address,undefined
+endif
+
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:src/%.c=build/%.o)
+LIBOBJ := $(filter-out build/main.o,$(OBJ))
 BIN := limer
 
 all: $(BIN)
@@ -33,14 +40,41 @@ build:
 
 -include $(OBJ:.o=.d)
 
+# ---------------------------------------------------------------- tests
+
+build/unit: tests/unit.c $(LIBOBJ)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/unit.c $(LIBOBJ) $(LDLIBS)
+
+build/fuzz: tests/fuzz.c $(LIBOBJ)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ tests/fuzz.c $(LIBOBJ) $(LDLIBS)
+
+unit: build/unit
+	./build/unit
+
+FUZZ_ITERS ?= 50000
+fuzz: build/fuzz
+	./build/fuzz $(FUZZ_ITERS)
+
+integration: $(BIN)
+	./tests/run_tests.sh
+
+security: $(BIN)
+	python3 tests/security_tests.py
+
+# Everything: unit tests, parser fuzzing, integration and security suites.
+check: unit fuzz integration security
+
+# The same suites with sanitizers enabled (slower; rebuilds everything).
+check-asan:
+	$(MAKE) clean
+	$(MAKE) SAN=1 check
+	$(MAKE) clean
+
 install: $(BIN)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
 
-check: $(BIN)
-	./tests/run_tests.sh
-
 clean:
-	rm -rf build $(BIN)
+	rm -rf build $(BIN) tests/tmp
 
-.PHONY: all install check clean
+.PHONY: all unit fuzz integration security check check-asan install clean

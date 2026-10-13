@@ -104,6 +104,7 @@ typedef struct listener {
     server_t *srv;
     config_t *cfg;
     char *addr;
+    double paused_until;    /* accept() backs off after EMFILE/ENFILE */
     struct listener *next;
 } listener_t;
 
@@ -188,6 +189,9 @@ typedef struct conn {
     int upstream_paused;
     int expect_sent;
     int upstream_reusable;      /* response framing allows pooling the upstream conn */
+    int resp_committed;         /* some response bytes reached the socket */
+    size_t resp_head_mark;      /* wbuf readable length before the response head */
+    int pre_head_close;         /* close_after_write before the head was built */
     char lb_why[128];
     int in_process;
     int dead;
@@ -430,14 +434,6 @@ static void hlist_del(hlist_t *h, const char *name)
     h->n = w;
 }
 
-static const char *hlist_get(hlist_t *h, const char *name)
-{
-    for (int i = 0; i < h->n; i++)
-        if (strcasecmp(h->name[i], name) == 0)
-            return h->value[i];
-    return NULL;
-}
-
 static void hlist_free(hlist_t *h)
 {
     for (int i = 0; i < h->n; i++) {
@@ -520,6 +516,9 @@ static void conn_reset_request(conn_t *c)
     c->upstream_paused = 0;
     c->expect_sent = 0;
     c->upstream_reusable = 0;
+    c->resp_committed = 0;
+    c->resp_head_mark = 0;
+    c->pre_head_close = 0;
     c->lb_why[0] = 0;
     c->got_request_bytes = 0;
 }
@@ -631,6 +630,8 @@ static void conn_flush(conn_t *c)
         ssize_t r = conn_write_raw(c, buf_rptr(&c->wbuf), buf_readable(&c->wbuf));
         if (r > 0) {
             buf_consume(&c->wbuf, (size_t)r);
+            if (c->resp_head_sent)
+                c->resp_committed = 1;
             continue;
         }
         if (r == -1)
@@ -911,6 +912,15 @@ static void uconn_fail(uconn_t *uc, const char *reason, int status, int retryabl
         c->up->active--;
         c->up = NULL;
     }
+    if (c->resp_head_sent && !c->resp_committed && c->state == CS_UPSTREAM) {
+        /* the response head is still only buffered: drop it and answer with an error */
+        c->wbuf.len = c->wbuf.off + c->resp_head_mark;
+        c->resp_head_sent = 0;
+        c->resp_status = 0;
+        c->resp_bytes = 0;
+        c->close_after_write = c->pre_head_close;
+        retryable = 0; /* the upstream did respond, just badly */
+    }
     if (c->resp_head_sent) {
         LOGW("upstream %s failed mid-response: %s", u->hostport, reason);
         c->close_after_write = 1;
@@ -936,7 +946,11 @@ static void build_upstream_request(conn_t *c, uconn_t *uc)
     pool_t *p = c->pool;
     buf_t *out = &uc->wbuf;
     buf_reset(out);
-    buf_printf(out, "%s %s HTTP/1.1\r\n", r->method, r->uri);
+    /* always send the origin-form target, even if the client used absolute-form */
+    if (str_has_prefix(r->uri, "http://") || str_has_prefix(r->uri, "https://"))
+        buf_printf(out, "%s %s%s%s HTTP/1.1\r\n", r->method, r->path, *r->query ? "?" : "", r->query);
+    else
+        buf_printf(out, "%s %s HTTP/1.1\r\n", r->method, r->uri);
 
     hlist_t h = { 0 };
     const char *conn_hdr = http_hdr_get(r->hdrs, r->nhdr, "Connection");
@@ -952,8 +966,10 @@ static void build_upstream_request(conn_t *c, uconn_t *uc)
     for (int i = 0; i < r->nhdr; i++) {
         const char *n = r->hdrs[i].name;
         if (strcasecmp(n, "Host") == 0 || strcasecmp(n, "Content-Length") == 0 ||
-            strcasecmp(n, "Expect") == 0 || strcasecmp(n, "X-Forwarded-For") == 0)
-            continue;
+            strcasecmp(n, "Expect") == 0 || strcasecmp(n, "X-Forwarded-For") == 0 ||
+            strcasecmp(n, "X-Forwarded-Proto") == 0 || strcasecmp(n, "X-Forwarded-Host") == 0 ||
+            strcasecmp(n, "X-Real-IP") == 0)
+            continue; /* framing headers are regenerated; forwarding headers are proxy-owned */
         if (http_hdr_is_hop_by_hop(n)) {
             if (r->upgrade && strcasecmp(n, "Upgrade") == 0)
                 hlist_add(&h, n, r->hdrs[i].value);
@@ -986,12 +1002,10 @@ static void build_upstream_request(conn_t *c, uconn_t *uc)
         hlist_add(&h, "X-Forwarded-For", buf_rptr(&xff));
         buf_free(&xff);
     }
-    if (!hlist_get(&h, "X-Forwarded-Proto"))
-        hlist_add(&h, "X-Forwarded-Proto", c->ctx.tls ? "https" : "http");
-    if (!hlist_get(&h, "X-Forwarded-Host") && orig_host)
+    hlist_add(&h, "X-Forwarded-Proto", c->ctx.tls ? "https" : "http");
+    if (orig_host)
         hlist_add(&h, "X-Forwarded-Host", orig_host);
-    if (!hlist_get(&h, "X-Real-IP"))
-        hlist_add(&h, "X-Real-IP", c->peer_ip);
+    hlist_add(&h, "X-Real-IP", c->peer_ip);
     hlist_apply_ops(&h, p->hdr_up, p->n_hdr_up, c);
     hlist_write(&h, out);
     hlist_free(&h);
@@ -1265,6 +1279,8 @@ static void uconn_on_response_data(uconn_t *uc)
         }
         uc->head_done = 1;
         c->deadline = 0;
+        c->resp_head_mark = buf_readable(&c->wbuf);
+        c->pre_head_close = c->close_after_write;
         build_client_response_head(c, uc);
         if (uc->resp.status == 101) {
             conn_start_tunnel(c, uc);
@@ -1723,13 +1739,21 @@ static void listener_cb(ev_t *e, uint32_t events)
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                 return;
             if (errno == EMFILE || errno == ENFILE) {
-                LOGW("accept: %s", strerror(errno));
+                /* out of descriptors: stop accepting briefly instead of spinning */
+                LOGW("accept on %s: %s; pausing accepts", l->addr, strerror(errno));
+                l->paused_until = g_now + 0.2;
+                ev_mod(&l->ev, 0);
                 return;
             }
             if (errno == ECONNABORTED)
                 continue;
             LOGE("accept on %s: %s", l->addr, strerror(errno));
             return;
+        }
+        if (g_cfg->max_connections > 0 && g_stats.active_conns >= g_cfg->max_connections) {
+            LOGD("connection limit (%d) reached, refusing client", g_cfg->max_connections);
+            close(fd);
+            continue;
         }
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -2386,6 +2410,12 @@ static void tick(void)
             uconn_close(uc);
         uc = next;
     }
+
+    for (listener_t *l = g_listeners; l; l = l->next)
+        if (l->paused_until > 0 && g_now >= l->paused_until) {
+            l->paused_until = 0;
+            ev_mod(&l->ev, EPOLLIN);
+        }
 
     health_tick();
     reap_graveyard();

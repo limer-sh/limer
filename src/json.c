@@ -4,9 +4,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Nesting deeper than this is treated as malformed: the skipper is recursive
+ * and an attacker-controlled body must not be able to exhaust the stack. */
+#define JSON_MAX_DEPTH 256
+
 typedef struct {
     const char *p;
     const char *end;
+    int depth;
 } js_t;
 
 static void skip_ws(js_t *j)
@@ -40,10 +45,13 @@ static int skip_container(js_t *j, char open, char close)
 {
     if (j->p >= j->end || *j->p != open)
         return -1;
+    if (++j->depth > JSON_MAX_DEPTH)
+        return -1;
     j->p++;
     skip_ws(j);
     if (j->p < j->end && *j->p == close) {
         j->p++;
+        j->depth--;
         return 0;
     }
     for (;;) {
@@ -68,6 +76,7 @@ static int skip_container(js_t *j, char open, char close)
         }
         if (*j->p == close) {
             j->p++;
+            j->depth--;
             return 0;
         }
         return -1;
@@ -196,7 +205,7 @@ static int key_equals(js_t *j, const char *key, size_t keylen)
     js_t save = *j;
     int eq = 0;
     if (decode_string(j, &tmp) == 0)
-        eq = buf_readable(&tmp) == keylen && memcmp(buf_rptr(&tmp), key, keylen) == 0;
+        eq = buf_readable(&tmp) == keylen && (keylen == 0 || memcmp(buf_rptr(&tmp), key, keylen) == 0);
     else
         *j = save;
     buf_free(&tmp);
@@ -273,7 +282,7 @@ static int descend_array(js_t *j, long idx)
 
 int json_extract(const char *doc, size_t len, const char *path, buf_t *out)
 {
-    js_t j = { doc, doc + len };
+    js_t j = { doc, doc + len, 0 };
     const char *p = path;
 
     /* walk the path: segments separated by '.', with optional [n] indexes */

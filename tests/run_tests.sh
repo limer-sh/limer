@@ -497,6 +497,11 @@ expect_eq "multi-worker serves requests" "$names" "hello from a hello from b "
 kill -TERM $MW; for _ in $(seq 1 50); do kill -0 $MW 2>/dev/null || break; sleep 0.1; done
 if kill -0 $MW 2>/dev/null; then fail "master stops workers"; else ok "master stops workers"; fi
 
+if grep -q "Sanitizer\|runtime error" "$TMP/limer.log" "$TMP/mw.log" "$TMP/tls.log" 2>/dev/null; then
+    fail "no sanitizer reports in proxy logs" "$(grep -h "Sanitizer\|runtime error" "$TMP"/*.log | head -3)"
+else
+    ok "no sanitizer reports in proxy logs"
+fi
 if grep -qi "error\|warn" "$TMP/limer.log"; then
     echo "# notable log lines:"; grep -i "error\|warn" "$TMP/limer.log" | head -20
 fi
