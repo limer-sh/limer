@@ -38,7 +38,11 @@ static const char *tls_last_error(void)
 static int alpn_select(SSL *ssl, const unsigned char **out, unsigned char *outlen,
                        const unsigned char *in, unsigned int inlen, void *arg)
 {
+#ifdef LIMER_H2
+    static const unsigned char protos[] = "\x02h2\x08http/1.1";
+#else
     static const unsigned char protos[] = "\x08http/1.1";
+#endif
     (void)ssl; (void)arg;
     if (SSL_select_next_proto((unsigned char **)out, outlen, protos, sizeof protos - 1, in, inlen) == OPENSSL_NPN_NEGOTIATED)
         return SSL_TLSEXT_ERR_OK;

@@ -330,7 +330,9 @@ int main(int argc, char **argv)
         return 0;
     }
     if (strcmp(cmd, "version") == 0) {
-#ifdef LIMER_TLS
+#if defined(LIMER_TLS) && defined(LIMER_H2)
+        printf("limer %s (tls, http/2)\n", LIMER_VERSION);
+#elif defined(LIMER_TLS)
         printf("limer %s (tls)\n", LIMER_VERSION);
 #else
         printf("limer %s\n", LIMER_VERSION);

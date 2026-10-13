@@ -29,6 +29,7 @@ HASH=$(perl -e 'print crypt("secret", q{$2b$05$abcdefghijklmnopqrstuu})')
 printf 'hello from index\n' > "$TMP/site/index.html"
 printf 'sub page\n' > "$TMP/site/sub/page.txt"
 head -c 20000 /dev/zero | tr '\0' 'x' > "$TMP/site/big.txt"
+head -c 300000 /dev/urandom | base64 -w0 > "$TMP/big.txt"
 printf 'secret\n' > "$TMP/site/.hidden"
 printf 'respond "from import" 203\n' > "$TMP/conf.d/imported.conf"
 export LIMER_TEST_MSG="env says hi"
@@ -61,7 +62,7 @@ beta.test, www.beta.test {
     import security beta
     header X-Site beta
     route {
-        match path /echo
+        match path /echo /big /chunked /nolength /status/*
         reverse_proxy 127.0.0.1:9701
     }
     respond "beta site"
@@ -194,7 +195,7 @@ cn=$(curl -skv --resolve alpha.test:9781:127.0.0.1 https://alpha.test:9781/ 2>&1
 expect_eq "SNI selects alpha's certificate" "$cn" "CN=alpha.test"
 san=$(openssl s_client -connect 127.0.0.1:9781 -servername www.beta.test </dev/null 2>/dev/null | openssl x509 -noout -ext subjectAltName 2>/dev/null)
 expect_contains "internal cert carries SAN" "$san" "DNS:www.beta.test"
-hdrs=$(curl -sk -D - -o /dev/null --resolve beta.test:9781:127.0.0.1 https://beta.test:9781/)
+hdrs=$(curl -sk --http1.1 -D - -o /dev/null --resolve beta.test:9781:127.0.0.1 https://beta.test:9781/)
 expect_contains "snippet import with args (header)" "$hdrs" "X-Snippet: beta"
 expect_contains "header directive on site" "$hdrs" "X-Site: beta"
 expect_contains "header X-Frame-Options" "$hdrs" "X-Frame-Options: DENY"
@@ -366,6 +367,60 @@ $BIN run -c "$TMP/uptls-admin.conf" >/dev/null 2>&1 & UP2=$!; PIDS+=($UP2)
 wait_port 9787; sleep 1
 expect_contains "active health checks over tls report up" "$(curl -s http://127.0.0.1:9787/upstreams)" '"address":"127.0.0.1:9703","weight":1,"healthy":true'
 kill -TERM $UP $UP2; wait $UP $UP2 2>/dev/null
+
+echo "# http/2"
+if $BIN version | grep -q "http/2"; then
+    H2="curl -sk --http2 --resolve beta.test:9781:127.0.0.1 --resolve alpha.test:9781:127.0.0.1"
+    expect_eq "h2 negotiated via ALPN" "$($H2 -o /dev/null -w '%{http_version}' https://beta.test:9781/)" "2"
+    expect_eq "h2 local response" "$($H2 https://beta.test:9781/)" "beta site"
+    expect_eq "h2 virtual host by :authority" "$($H2 https://alpha.test:9781/)" "alpha site"
+    r=$($H2 -X POST -H 'Content-Type: application/json' -d '{"type":"order","customer":{"id":"h2"}}' https://beta.test:9781/echo)
+    expect_contains "h2 proxied POST body intact" "$r" '"body": "{\"type\":\"order\",\"customer\":{\"id\":\"h2\"}}"'
+    expect_contains "h2 request gets Content-Length upstream" "$r" '"Content-Length": "39"'
+    expect_contains "h2 forwarding headers" "$r" '"X-Forwarded-Proto": "https"'
+    expect_contains "h2 cookies joined" "$($H2 -H 'Cookie: a=1' -H 'Cookie: b=2' https://beta.test:9781/echo)" '"Cookie": "a=1; b=2"'
+    expect_eq "h2 large response intact" "$($H2 https://beta.test:9781/big 2>/dev/null | wc -c)" "3145728"
+    expect_eq "h2 large request body" "$($H2 -X POST --data-binary "@$TMP/big.txt" https://beta.test:9781/echo | python3 -c 'import sys,json;print(json.load(sys.stdin)["body_len"])')" "$(stat -c %s $TMP/big.txt)"
+    expect_eq "h2 chunked upstream response" "$($H2 https://beta.test:9781/chunked)" "alpha-beta-gamma"
+    expect_eq "h2 close-delimited upstream response" "$($H2 https://beta.test:9781/nolength)" "close-delimited body from a"
+    expect_eq "h2 HEAD" "$($H2 -I https://beta.test:9781/big | grep -ci '^content-length: 3145728')" "1"
+    expect_eq "h2 204" "$($H2 -o /dev/null -w '%{http_code}' https://beta.test:9781/status/204)" "204"
+    expect_eq "h2 upstream 500 passthrough" "$($H2 -o /dev/null -w '%{http_code}' https://beta.test:9781/status/500)" "500"
+    expect_eq "h2 multiplexed requests on one session" "$($H2 --parallel --parallel-max 10 -o /dev/null -o /dev/null -o /dev/null -o /dev/null -w '%{http_code} ' https://beta.test:9781/ https://beta.test:9781/big https://beta.test:9781/chunked https://beta.test:9781/echo)" "200 200 200 200 "
+    expect_eq "h2 session reused across requests" "$($H2 -o /dev/null -o /dev/null -o /dev/null -w '%{num_connects} ' https://beta.test:9781/ https://beta.test:9781/echo https://beta.test:9781/)" "1 0 0 "
+    expect_contains "h2 respond header ops" "$($H2 -D - -o /dev/null https://beta.test:9781/)" "x-site: beta"
+    expect_eq "h1 still works on the same listener" "$(curl -sk --http1.1 --resolve beta.test:9781:127.0.0.1 -o /dev/null -w '%{http_version}' https://beta.test:9781/)" "1.1"
+    # http/2 on the static/encode site: give it a tls listener
+    cat > "$TMP/h2files.conf" <<CFG
+{
+    log_level warn
+}
+https://localhost:9789 {
+    tls internal
+    log {
+        output file $TMP/h2.log
+        format json
+    }
+    root $TMP/site
+    encode gzip
+    file_server browse
+}
+CFG
+    $BIN run -c "$TMP/h2files.conf" >/dev/null 2>&1 & H2P=$!; PIDS+=($H2P)
+    wait_port 9789
+    expect_eq "h2 static file" "$(curl -sk --http2 https://localhost:9789/sub/page.txt)" "sub page"
+    expect_eq "h2 big static file gzip decodes" "$(curl -sk --http2 --compressed https://localhost:9789/big.txt | wc -c)" "20000"
+    expect_contains "h2 gzip header" "$(curl -sk --http2 -D - -o /dev/null -H 'Accept-Encoding: gzip' https://localhost:9789/big.txt)" "content-encoding: gzip"
+    expect_eq "h2 range request" "$(curl -sk --http2 -H 'Range: bytes=0-2' https://localhost:9789/sub/page.txt)" "sub"
+    expect_eq "h2 directory listing" "$(curl -sk --http2 https://localhost:9789/sub/ | grep -c page.txt)" "1"
+    expect_eq "h2 404" "$(curl -sk --http2 -o /dev/null -w '%{http_code}' https://localhost:9789/nope)" "404"
+    expect_eq "h2 parallel static" "$(curl -sk --http2 --parallel -o /dev/null -o /dev/null -o /dev/null -w '%{http_code} ' https://localhost:9789/big.txt https://localhost:9789/sub/page.txt https://localhost:9789/index.html)" "200 200 200 "
+    sleep 0.2
+    expect_contains "h2 json access log proto" "$(tail -1 $TMP/h2.log)" '"proto":"HTTP/2.0","tls":true'
+    kill -TERM $H2P; wait $H2P 2>/dev/null
+else
+    echo "  skip - built without HTTP/2"
+fi
 
 echo "# reload keeps virtual hosts"
 sed -i 's/respond "two"/respond "two-v2"/' "$TMP/Limerfile"

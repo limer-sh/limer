@@ -123,6 +123,7 @@ enum conn_state {
     CS_LOCAL,        /* locally generated response in wbuf     */
     CS_TUNNEL,       /* bidirectional copy after 101           */
     CS_CLOSING,      /* flushing wbuf, then close              */
+    CS_H2,           /* HTTP/2 session (streams are virtual conns) */
 };
 
 enum resp_mode {
@@ -211,6 +212,17 @@ typedef struct conn {
     int file_fd;                /* static file being streamed, or -1 */
     off_t file_off;
     off_t file_remaining;
+    /* HTTP/2: session (on the socket conn) and stream (virtual conn) state */
+    void *h2;
+    struct conn *h2_parent;
+    int32_t h2_stream_id;
+    int h2_submitted, h2_eof, h2_deferred, h2_chunked, h2_detached;
+    chunk_state_t h2_cs;
+    buf_t h2_body, h2_hdrs, h2_cookie, h2_reqbody;
+    size_t h2_reqlen;
+    char h2_method[24];
+    char h2_path[4096];
+    char h2_authority[264];
     char lb_why[128];
     int in_process;
     int dead;
@@ -264,6 +276,15 @@ static void reap_graveyard(void)
 
 static void conn_close(conn_t *c);
 static void conn_process(conn_t *c);
+#ifdef LIMER_H2
+#define H2_SEND_HIGH (1024 * 1024)
+static void h2_stream_flush(conn_t *st);
+static void h2_stream_close(conn_t *st);
+static void h2_session_close(conn_t *c);
+static void h2_session_recv(conn_t *c);
+static void h2_session_send(conn_t *c);
+static int  h2_session_start(conn_t *c);
+#endif
 static void conn_flush(conn_t *c);
 static void conn_try_upstream(conn_t *c);
 static void conn_send_error(conn_t *c, int status, const char *msg, int close);
@@ -718,6 +739,8 @@ static void conn_reset_request(conn_t *c)
 static void conn_update_mask(conn_t *c)
 {
     uint32_t m = 0;
+    if (c->h2_parent)
+        return; /* streams have no socket */
 #ifdef LIMER_TLS
     if (c->tls_handshaking) {
         /* mask set by the handshake code */
@@ -744,6 +767,10 @@ static void conn_update_mask(conn_t *c)
     case CS_LOCAL:
     case CS_CLOSING:
         break;
+    case CS_H2:
+        if (!c->rd_eof && buf_readable(&c->rbuf) < RBUF_PIPELINE_CAP)
+            m |= EPOLLIN;
+        break;
     }
     if (m == 0)
         m = EPOLLRDHUP; /* still get notified of errors */
@@ -768,8 +795,9 @@ static void conn_log_access(conn_t *c)
         log_json_escape(&b, c->req.method);
         buf_puts(&b, ",\"uri\":");
         log_json_escape(&b, c->req.uri);
-        buf_printf(&b, ",\"proto\":\"HTTP/1.%d\",\"tls\":%s,\"status\":%d,\"bytes\":%llu,\"duration_ms\":%.3f,\"route\":",
-                   c->req.minor, c->ctx.tls ? "true" : "false", c->resp_status, (unsigned long long)c->resp_bytes, ms);
+        buf_printf(&b, ",\"proto\":\"%s\",\"tls\":%s,\"status\":%d,\"bytes\":%llu,\"duration_ms\":%.3f,\"route\":",
+                   c->h2_parent ? "HTTP/2.0" : c->req.minor ? "HTTP/1.1" : "HTTP/1.0",
+                   c->ctx.tls ? "true" : "false", c->resp_status, (unsigned long long)c->resp_bytes, ms);
         log_json_escape(&b, c->route ? c->route->name : "");
         buf_puts(&b, ",\"upstream\":");
         log_json_escape(&b, c->up ? c->up->hostport : "");
@@ -784,8 +812,9 @@ static void conn_log_access(conn_t *c)
         }
         buf_puts(&b, "}");
     } else {
-        buf_printf(&b, "%s %s \"%s %s HTTP/1.%d\" %d %llu %.1fms route=%s upstream=%s%s%s",
-                   c->peer_str, host ? host : "-", c->req.method, c->req.uri, c->req.minor, c->resp_status,
+        buf_printf(&b, "%s %s \"%s %s %s\" %d %llu %.1fms route=%s upstream=%s%s%s",
+                   c->peer_str, host ? host : "-", c->req.method, c->req.uri,
+                   c->h2_parent ? "HTTP/2.0" : c->req.minor ? "HTTP/1.1" : "HTTP/1.0", c->resp_status,
                    (unsigned long long)c->resp_bytes, ms,
                    c->route ? c->route->name : "-",
                    c->up ? c->up->hostport : "-",
@@ -802,6 +831,10 @@ static void conn_destroy(ev_t *e)
         encoder_free(c->enc);
     buf_free(&c->enc_out);
     buf_free(&c->dechunk);
+    buf_free(&c->h2_body);
+    buf_free(&c->h2_hdrs);
+    buf_free(&c->h2_cookie);
+    buf_free(&c->h2_reqbody);
     if (c->file_fd >= 0)
         close(c->file_fd);
     buf_free(&c->rbuf);
@@ -816,6 +849,10 @@ static void conn_close(conn_t *c)
     if (c->dead)
         return;
     c->dead = 1;
+#ifdef LIMER_H2
+    if (c->h2)
+        h2_session_close(c);
+#endif
     if (c->uc) {
         uconn_t *uc = c->uc;
         c->uc = NULL;
@@ -837,7 +874,13 @@ static void conn_close(conn_t *c)
     }
 #endif
     conn_list_del(c);
-    g_stats.active_conns--;
+    if (c->h2_parent) {
+#ifdef LIMER_H2
+        h2_stream_close(c);
+#endif
+    } else {
+        g_stats.active_conns--;
+    }
     ev_retire(&c->ev);
 }
 
@@ -855,6 +898,12 @@ static void conn_finish(conn_t *c)
 
 static void conn_flush(conn_t *c)
 {
+#ifdef LIMER_H2
+    if (c->h2_parent) {
+        h2_stream_flush(c);
+        return;
+    }
+#endif
     while (buf_readable(&c->wbuf) > 0) {
         ssize_t r = conn_write_raw(c, buf_rptr(&c->wbuf), buf_readable(&c->wbuf));
         if (r > 0) {
@@ -1013,6 +1062,16 @@ static void conn_next_request(conn_t *c)
     c->requests++;
     if (c->resp_status >= 100 && c->resp_status < 600)
         g_stats.resp_class[c->resp_status / 100]++;
+#ifdef LIMER_H2
+    if (c->h2_parent) {
+        /* a stream serves exactly one request: hand the end of the body to HTTP/2 */
+        c->h2_eof = 1;
+        c->state = CS_LOCAL;
+        c->deadline = 0;
+        h2_stream_flush(c);
+        return;
+    }
+#endif
     if (c->close_after_write) {
         conn_finish(c);
         return;
@@ -1938,7 +1997,7 @@ static void conn_dispatch(conn_t *c)
     c->ctx.peerlen = c->peerlen;
     snprintf(c->ctx.peer_ip, sizeof c->ctx.peer_ip, "%s", c->peer_ip);
 #ifdef LIMER_TLS
-    c->ctx.tls = c->ssl != NULL;
+    c->ctx.tls = c->ssl != NULL || c->h2_parent != NULL;
 #else
     c->ctx.tls = 0;
 #endif
@@ -2117,7 +2176,7 @@ static void conn_process(conn_t *c)
                     return;
                 }
 #ifdef LIMER_TLS
-                if (c->ssl && srv->tls_mode == TLS_NONE)
+                if ((c->ssl || c->h2_parent) && srv->tls_mode == TLS_NONE)
                     srv = c->srv; /* never jump from a TLS site to a plain one */
 #endif
                 c->srv = srv;
@@ -2195,6 +2254,16 @@ static void conn_tls_handshake(conn_t *c)
     int r = SSL_do_handshake(c->ssl);
     if (r == 1) {
         c->tls_handshaking = 0;
+#ifdef LIMER_H2
+        const unsigned char *alpn = NULL;
+        unsigned int alen = 0;
+        SSL_get0_alpn_selected(c->ssl, &alpn, &alen);
+        if (alpn && alen == 2 && memcmp(alpn, "h2", 2) == 0) {
+            if (h2_session_start(c) < 0)
+                conn_close(c);
+            return;
+        }
+#endif
         conn_update_mask(c);
         return;
     }
@@ -2301,6 +2370,38 @@ static void conn_cb(ev_t *e, uint32_t events)
         conn_close(c);
         return;
     }
+#ifdef LIMER_H2
+    if (c->h2) {
+        if (events & EPOLLOUT) {
+            conn_flush(c);
+            if (c->dead)
+                return;
+            if (buf_readable(&c->wbuf) < H2_SEND_HIGH)
+                h2_session_send(c);
+            if (c->dead)
+                return;
+        }
+        if (events & (EPOLLIN | EPOLLHUP | EPOLLRDHUP)) {
+            for (int i = 0; i < 8; i++) {
+                if (buf_reserve(&c->rbuf, READ_CHUNK) < 0) {
+                    conn_close(c);
+                    return;
+                }
+                ssize_t r = conn_read_raw(c, buf_wptr(&c->rbuf), buf_wavail(&c->rbuf));
+                if (r > 0) {
+                    buf_commit(&c->rbuf, (size_t)r);
+                    continue;
+                }
+                if (r == -1)
+                    break;
+                conn_close(c); /* EOF or error */
+                return;
+            }
+            h2_session_recv(c);
+        }
+        return;
+    }
+#endif
     if (events & EPOLLOUT) {
         conn_flush(c);
         if (c->dead)
@@ -3072,6 +3173,10 @@ static void conn_serve_files(conn_t *c, route_t *r)
     file_pump(c);
 }
 
+#ifdef LIMER_H2
+#include "h2.inc"
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Admin API                                                           */
 /* ------------------------------------------------------------------ */
@@ -3328,6 +3433,15 @@ static void begin_shutdown(void)
         conn_t *next = c->next;
         if (c->state == CS_HEAD && !c->got_request_bytes)
             conn_close(c);
+#ifdef LIMER_H2
+        else if (c->h2) {
+            h2_session_t *hs = c->h2;
+            if (hs->nstreams == 0) {
+                nghttp2_session_terminate_session(hs->ng, NGHTTP2_NO_ERROR);
+                h2_session_send(c);
+            }
+        }
+#endif
         c = next;
     }
     uconn_t *uc = g_uconns;
