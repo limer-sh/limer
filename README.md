@@ -170,7 +170,7 @@ Path and host use glob matching with `*`. Regexes are POSIX extended.
 | `health_status <code>` | any 2xx/3xx | Expected status. |
 | `health_host <host>` | upstream address | `Host` header for checks. |
 | `connect_timeout` / `response_timeout` | `5s` / `60s` | Dial timeout and time to first response byte (`504` on expiry). |
-| `keepalive_idle <n>` | `32` | Idle upstream connections to pool per upstream (`0` disables pooling). |
+| `keepalive_idle <n>` | `256` | Idle upstream connections to pool per upstream (`0` disables pooling). |
 | `keepalive_timeout <dur>` | `60s` | How long pooled connections may idle. |
 | `header_up [+|-]Name [value]` | | Set, add (`+`), or delete (`-`) request headers sent upstream. |
 | `header_down [+|-]Name [value]` | | Same for response headers. |
@@ -288,6 +288,36 @@ verifies the proxy keeps serving after every attack.
 
 Reports of security issues are welcome as GitHub issues on this repository.
 
+## Performance
+
+`bench/run.sh` reproduces these numbers. It builds a minimal epoll backend
+(`bench/backend.c`), starts two of them, and drives Limer with
+[wrk](https://github.com/wg/wrk) over loopback. Measured on a 4-vCPU Linux
+VM with wrk using 2 threads, 8-second runs, keep-alive on:
+
+| Scenario | Requests/s | p50 | p99 |
+|---|---|---|---|
+| wrk to backend directly (no proxy) | 152,000 | 0.58 ms | 2.0 ms |
+| Limer, 1 worker, GET round robin, 100 connections | 33,000 | 2.8 ms | 6.3 ms |
+| Limer, 1 worker, POST with JSON match + payload hash | 34,000 | 2.7 ms | 5.6 ms |
+| Limer, 1 worker, GET, 1000 connections | 27,000 | 36 ms | 66 ms |
+| Limer, 4 workers, GET round robin, 100 connections | 102,000 | 0.80 ms | 4.3 ms |
+| Limer, 4 workers, POST with JSON match + payload hash | 98,000 | 0.83 ms | 5.4 ms |
+| Limer, 4 workers, GET, 1000 connections | 116,000 | 7.4 ms | 19 ms |
+
+Observations:
+
+- Inspecting the body (JSON field match plus rendezvous hashing on a JSON
+  path) costs about the same as plain round robin: matching and hashing are
+  a few microseconds per request.
+- A proxied request costs exactly four syscalls in Limer (read and write on
+  each side) plus a share of one `epoll_wait`; user-space CPU is roughly
+  2 µs per request. The single-worker ceiling is kernel loopback TCP cost,
+  which is why workers scale close to linearly (`workers auto`).
+- Keep `keepalive_idle` at or above your expected concurrency per upstream.
+  Reconnecting for every request roughly halves throughput and multiplies
+  tail latency; the default is 256 idle connections per upstream.
+
 ## Layout
 
 ```
@@ -301,6 +331,7 @@ src/match.c    matchers and key extraction
 src/balance.c  balancing policies, passive health accounting
 src/tls.c      OpenSSL glue
 tests/         unit tests, parser fuzzer, integration and security suites, test backend
+bench/         wrk-based benchmark (run.sh), minimal C backend, benchmark Limerfile
 .github/       CI workflow (normal and sanitized builds)
 examples/      annotated Limerfiles
 ```

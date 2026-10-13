@@ -670,7 +670,7 @@ static pool_t *pool_new(const char *name)
     p->health_timeout = 5;
     p->connect_timeout = 5;
     p->response_timeout = 60;
-    p->keepalive_idle = 32;
+    p->keepalive_idle = 256;
     p->keepalive_timeout = 60;
     p->preserve_host = 1;
     return p;

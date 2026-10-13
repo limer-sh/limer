@@ -1,7 +1,7 @@
 # Limer - HTTP load balancer with payload-based distribution
 CC      ?= cc
 CFLAGS  ?= -O2 -g
-CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
+override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
 LDFLAGS ?=
 LDLIBS  += -lm
 
@@ -12,14 +12,14 @@ BINDIR  ?= $(PREFIX)/bin
 # Force it with `make TLS=1` or disable it with `make TLS=0`.
 TLS ?= $(shell pkg-config --exists openssl 2>/dev/null && echo 1 || echo 0)
 ifeq ($(TLS),1)
-CFLAGS += -DLIMER_TLS $(shell pkg-config --cflags openssl 2>/dev/null)
+override CFLAGS += -DLIMER_TLS $(shell pkg-config --cflags openssl 2>/dev/null)
 LDLIBS += $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
 endif
 
 # `make SAN=1` builds everything with AddressSanitizer + UBSan.
 ifeq ($(SAN),1)
-CFLAGS  += -fsanitize=address,undefined -fno-omit-frame-pointer -O1
-LDFLAGS += -fsanitize=address,undefined
+override CFLAGS  += -fsanitize=address,undefined -fno-omit-frame-pointer -O1
+override LDFLAGS += -fsanitize=address,undefined
 endif
 
 SRC := $(wildcard src/*.c)
