@@ -4,11 +4,61 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Limer — payload-aware HTTP server &amp; load balancer</title>
-<meta name="description" content="Limer is a small, fast HTTP server and load balancer in C that routes and balances on what is inside the request — JSON fields, form fields, headers, cookies, the body. One binary, a readable Limerfile, automatic HTTPS.">
-<meta property="og:title" content="Limer">
-<meta property="og:description" content="A small, fast HTTP server and load balancer that routes on what is inside the request. One binary, automatic HTTPS, HTTP/2 and gRPC.">
+<meta name="description" content="Limer is a small, fast HTTP server and load balancer in C that routes and balances on what is inside the request — JSON fields, form fields, headers, cookies, the body. One binary, a readable Limerfile, automatic HTTPS, HTTP/2 and gRPC.">
+<meta name="keywords" content="reverse proxy, load balancer, HTTP server, payload routing, JSON routing, Caddy alternative, automatic HTTPS, HTTP/2, gRPC proxy, rate limiting, C">
+<meta name="author" content="limer">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+<meta name="theme-color" content="#0b0d09">
+<link rel="canonical" href="https://limer.sh/">
+
+<!-- Open Graph -->
+<meta property="og:site_name" content="Limer">
+<meta property="og:title" content="Limer — the reverse proxy that routes on what's inside the request">
+<meta property="og:description" content="A small, fast HTTP server and load balancer that distributes traffic by JSON fields, form fields, headers, cookies or the body. One binary, automatic HTTPS, HTTP/2 and gRPC.">
 <meta property="og:type" content="website">
-<meta property="og:url" content="https://limer.sh">
+<meta property="og:url" content="https://limer.sh/">
+<meta property="og:image" content="https://limer.sh/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Limer — payload-aware HTTP server and load balancer">
+<meta property="og:locale" content="en_US">
+
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Limer — routes on what's inside the request">
+<meta name="twitter:description" content="A small, fast, payload-aware HTTP server and load balancer in C. One binary, automatic HTTPS, HTTP/2 and gRPC.">
+<meta name="twitter:image" content="https://limer.sh/og.png">
+<meta name="twitter:image:alt" content="Limer — payload-aware HTTP server and load balancer">
+
+<!-- Structured data -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "name": "Limer",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Linux",
+      "description": "A small, fast HTTP server and load balancer written in C with payload-based request distribution: it routes and balances on JSON fields, form fields, body regexes, headers, cookies, the path or the client address. One binary, a readable Limerfile, automatic HTTPS, HTTP/2 and gRPC.",
+      "url": "https://limer.sh/",
+      "image": "https://limer.sh/og.png",
+      "softwareVersion": "0.1.0",
+      "programmingLanguage": "C",
+      "license": "https://opensource.org/licenses/MIT",
+      "codeRepository": "https://github.com/limer-sh/limer",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+    },
+    {
+      "@type": "WebSite",
+      "name": "Limer",
+      "url": "https://limer.sh/",
+      "publisher": { "@type": "Organization", "name": "Limer", "url": "https://limer.sh/" }
+    }
+  ]
+}
+</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230c0f0a'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='20' font-weight='700' fill='%23a3e635' text-anchor='middle'%3EL%3C/text%3E%3C/svg%3E">
 <style>
   :root{
@@ -395,9 +445,9 @@ curl -X POST localhost:8080/echo \
       </div>
       <div class="foot-links">
         <a href="https://github.com/limer-sh/limer">GitHub</a>
-        <a href="https://github.com/limer-sh/limer#the-limerfile">Docs</a>
+        <a href="https://github.com/limer-sh/limer/blob/main/USERGUIDE.md#the-limerfile">Docs</a>
         <a href="https://github.com/limer-sh/limer/blob/main/examples/payload-routing.Limerfile">Examples</a>
-        <a href="https://github.com/limer-sh/limer#performance">Benchmarks</a>
+        <a href="https://github.com/limer-sh/limer/blob/main/USERGUIDE.md#performance">Benchmarks</a>
       </div>
     </div>
   </div>
