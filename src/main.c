@@ -139,6 +139,7 @@ static int run_master(config_t *cfg, const char *cfg_path, int nworkers)
         pids[i] = spawn_worker(cfg_path, i + 1);
         spawned[i] = now_mono();
     }
+    acme_manager_start(cfg);
 
     int stopping = 0;
     int crashes = 0;
@@ -157,6 +158,7 @@ static int run_master(config_t *cfg, const char *cfg_path, int nworkers)
             if (!stopping) {
                 stopping = 1;
                 LOGI("master: stopping workers");
+                acme_manager_stop();
                 for (int i = 0; i < nworkers; i++)
                     if (pids[i] > 0)
                         kill(pids[i], SIGTERM);
@@ -170,11 +172,14 @@ static int run_master(config_t *cfg, const char *cfg_path, int nworkers)
                 if (!test) {
                     LOGE("reload: configuration invalid, not reloading workers: %s", err);
                 } else {
-                    config_unref(test);
                     LOGI("master: reloading workers");
                     for (int i = 0; i < nworkers; i++)
                         if (pids[i] > 0)
                             kill(pids[i], SIGHUP);
+                    acme_manager_stop();
+                    config_unref(cfg);
+                    cfg = test;
+                    acme_manager_start(cfg);
                 }
             }
         }
@@ -183,6 +188,14 @@ static int run_master(config_t *cfg, const char *cfg_path, int nworkers)
             int status;
             pid_t p;
             while ((p = waitpid(-1, &status, WNOHANG)) > 0) {
+                int is_worker = 0;
+                for (int i = 0; i < nworkers; i++)
+                    if (pids[i] == p)
+                        is_worker = 1;
+                if (!is_worker) {
+                    LOGW("master: certificate manager exited (%d); it restarts on the next reload", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+                    continue;
+                }
                 for (int i = 0; i < nworkers; i++) {
                     if (pids[i] != p)
                         continue;
@@ -221,6 +234,7 @@ static int run_master(config_t *cfg, const char *cfg_path, int nworkers)
         }
     }
     LOGI("master: all workers stopped");
+    config_unref(cfg);
     free(pids);
     free(spawned);
     return 0;
@@ -379,8 +393,7 @@ int main(int argc, char **argv)
     if (workers == 1) {
         rc = proxy_run(cfg, 0); /* takes ownership of cfg */
     } else {
-        rc = run_master(cfg, cfg_path, workers);
-        config_unref(cfg);
+        rc = run_master(cfg, cfg_path, workers); /* takes ownership of cfg */
     }
     if (pidfile) {
         unlink(pidfile);

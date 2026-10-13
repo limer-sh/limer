@@ -22,6 +22,14 @@ jobs:
         run: make integration
       - name: Feature tests
         run: make features
+      - name: Install Pebble (ACME test server)
+        run: |
+          curl -sSL -o /tmp/pebble.tar.gz https://github.com/letsencrypt/pebble/releases/latest/download/pebble-linux-amd64.tar.gz
+          tar xzf /tmp/pebble.tar.gz -C /tmp
+          sudo install -m 0755 "$(find /tmp/pebble-linux-amd64 -type f -name pebble)" /usr/local/bin/pebble
+          echo "127.0.0.1 limer.test www.limer.test" | sudo tee -a /etc/hosts
+      - name: Automatic HTTPS (ACME) tests
+        run: make acme
       - name: Security tests
         run: make security
       - name: Build without TLS
