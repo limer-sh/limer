@@ -1080,7 +1080,12 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
             else if (strcaseeq(lv, "error")) cfg->log_level = LOG_ERROR;
             else FAIL("line %d: unknown log level '%s'", c->line, lv);
         } else if (strcaseeq(k, "max_connections")) {
-            if (want_args(c, 1, 1, err, errlen) < 0 || arg_int(c, 1, &cfg->max_connections, 0, 10000000, err, errlen) < 0)
+            /* 0 / "auto" = derive from the descriptor limit at startup */
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            if (strcaseeq(c->args[1], "auto") || strcaseeq(c->args[1], "unlimited"))
+                cfg->max_connections = 0;
+            else if (arg_int(c, 1, &cfg->max_connections, 1, 10000000, err, errlen) < 0)
                 return -1;
         } else if (strcaseeq(k, "pidfile")) {
             if (want_args(c, 1, 1, err, errlen) < 0)

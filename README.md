@@ -105,6 +105,7 @@ curl localhost:2019/upstreams
     workers 4                 # or "auto"; default 1
     admin 127.0.0.1:2019      # admin API listener; "off" to disable
     log_level info            # debug | info | warn | error
+    max_connections auto      # per worker; auto = half the descriptor limit
     pidfile /run/limer.pid
     grace 10s                 # drain time on shutdown
 }
@@ -116,6 +117,17 @@ curl localhost:2019/upstreams
 
 Several addresses can share one block (`:8080, :8081 {`). Multiple server
 blocks are allowed.
+
+### Global options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `workers <n|auto>` | `1` | Worker processes sharing the listeners. |
+| `admin <addr|off>` | off | Admin API listener. |
+| `log_level <level>` | `info` | `debug`, `info`, `warn` or `error`. |
+| `max_connections <n|auto>` | `auto` | Client connection cap per worker; `auto` derives it from the descriptor limit. |
+| `pidfile <path>` | none | Written on start; used by `limer reload` and `limer stop`. |
+| `grace <dur>` | `10s` | Time allowed for in-flight requests on shutdown. |
 
 ### Server directives
 
@@ -317,6 +329,29 @@ Observations:
 - Keep `keepalive_idle` at or above your expected concurrency per upstream.
   Reconnecting for every request roughly halves throughput and multiplies
   tail latency; the default is 256 idle connections per upstream.
+
+### Connection capacity
+
+Each client connection costs one file descriptor and about 3 KB of memory
+while idle (5 KB once it has served a request, since small buffers are
+retained). Each request in flight additionally needs one upstream
+descriptor. At startup every worker raises its descriptor limit to the hard
+limit and, unless `max_connections` is set, caps client connections at half
+of it so an accepted connection can always reach an upstream; connections
+beyond the cap are closed immediately rather than queued. Measured on the
+same VM (hard limit 20,000 descriptors):
+
+| Test | Result |
+|---|---|
+| 18,000 keep-alive connections opened, one request each (in waves of 1,000) | all served; 55 MB idle, 90 MB after serving |
+| New requests while 18,000 connections sit idle | p50 0.14 ms, p99 0.75 ms |
+| 9,900 requests in flight simultaneously on one worker | all served in 1.1 s |
+| 12,000 connections against a cap of 9,968 | 9,968 served, 2,032 closed at accept |
+
+Timeouts are scanned every 250 ms in O(connections), which is negligible
+at these sizes. With a typical production limit of 1,048,576 descriptors,
+one worker can hold roughly 500,000 connections in about 2.5 GB; use
+`workers auto` to spread them over cores.
 
 ## Layout
 

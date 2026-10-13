@@ -639,6 +639,14 @@ TEST(test_config)
     cfg_bad("https://:1 {\n reverse_proxy 127.0.0.1:1\n}\n", "requires 'tls");
     cfg_bad(":1 {\n tls /no/cert.pem /no/key.pem\n reverse_proxy 127.0.0.1:1\n}\n", "tls");
     cfg_bad("{\n workers many\n}\n:1 {\n reverse_proxy 127.0.0.1:1\n}\n", "invalid number");
+    cfg_bad("{\n max_connections 0\n}\n:1 {\n reverse_proxy 127.0.0.1:1\n}\n", "invalid number");
+    {
+        config_t *mc = cfg_ok("{\n max_connections auto\n}\n:1 {\n reverse_proxy 127.0.0.1:1\n}\n");
+        if (mc) {
+            CHECK(mc->max_connections == 0); /* 0 = derive from the descriptor limit */
+            config_unref(mc);
+        }
+    }
     cfg_bad("{\n nope 1\n}\n:1 {\n reverse_proxy 127.0.0.1:1\n}\n", "unknown global option");
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1\n}\n{\n workers 2\n}\n", "must come first");
     cfg_bad("notanaddress {\n reverse_proxy 127.0.0.1:1\n}\n", "invalid listen address");
