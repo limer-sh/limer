@@ -2369,6 +2369,7 @@ static config_t *config_parse_in(const char *text, const char *path, const char 
     if (!cfg->acme_ca)
         cfg->acme_ca = xstrdup("https://acme-v02.api.letsencrypt.org/directory");
     config_add_redirect_servers(cfg);
+    overrides_apply(cfg);
     if (config_finish_tls(cfg, err, errlen) < 0) {
         config_unref(cfg);
         return NULL;
@@ -2401,4 +2402,158 @@ config_t *config_load(const char *path, char *err, size_t errlen)
     free(dup);
     free(text);
     return cfg;
+}
+
+/* ------------------------------------------------------------------ */
+/* Runtime overrides                                                   */
+/* ------------------------------------------------------------------ */
+
+typedef struct override {
+    char hostport[300];
+    int drained;   /* -1 unset */
+    int weight;    /* -1 unset */
+} override_t;
+
+static int overrides_read(const config_t *cfg, override_t **out)
+{
+    char path[2048];
+    snprintf(path, sizeof path, "%s/overrides.conf", cfg->storage);
+    FILE *f = fopen(path, "r");
+    *out = NULL;
+    if (!f)
+        return 0;
+    override_t *list = NULL;
+    int n = 0;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        override_t o;
+        o.drained = o.weight = -1;
+        char *save = NULL;
+        char *tok = strtok_r(line, " \t\r\n", &save);
+        if (!tok || *tok == '#')
+            continue;
+        snprintf(o.hostport, sizeof o.hostport, "%s", tok);
+        while ((tok = strtok_r(NULL, " \t\r\n", &save))) {
+            if (str_has_prefix(tok, "drained="))
+                o.drained = atoi(tok + 8) ? 1 : 0;
+            else if (str_has_prefix(tok, "weight="))
+                o.weight = atoi(tok + 7);
+        }
+        list = xrealloc(list, sizeof(override_t) * (size_t)(n + 1));
+        list[n++] = o;
+    }
+    fclose(f);
+    *out = list;
+    return n;
+}
+
+static int overrides_write(const config_t *cfg, override_t *list, int n)
+{
+    if (mkdir_p(cfg->storage) < 0)
+        return -1;
+    char path[2048], tmp[2060];
+    snprintf(path, sizeof path, "%s/overrides.conf", cfg->storage);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return -1;
+    fputs("# runtime upstream overrides written by the admin API\n", f);
+    for (int i = 0; i < n; i++) {
+        if (list[i].drained < 0 && list[i].weight < 0)
+            continue;
+        fprintf(f, "%s", list[i].hostport);
+        if (list[i].drained >= 0)
+            fprintf(f, " drained=%d", list[i].drained);
+        if (list[i].weight >= 0)
+            fprintf(f, " weight=%d", list[i].weight);
+        fputc('\n', f);
+    }
+    fclose(f);
+    return rename(tmp, path);
+}
+
+/* Apply stored overrides to every matching upstream of cfg. */
+int overrides_apply(config_t *cfg)
+{
+    override_t *list;
+    int n = overrides_read(cfg, &list);
+    for (int o = 0; o < n; o++) {
+        for (int i = 0; i < cfg->nservers; i++) {
+            server_t *s = cfg->servers[i];
+            for (int r = 0; r < s->nroutes; r++) {
+                pool_t *p = s->routes[r]->pool;
+                if (!p)
+                    continue;
+                int changed = 0;
+                for (int k = 0; k < p->nups; k++) {
+                    upstream_t *u = p->ups[k];
+                    if (strcmp(u->hostport, list[o].hostport) != 0)
+                        continue;
+                    if (list[o].drained >= 0)
+                        u->drained = list[o].drained;
+                    if (list[o].weight > 0) {
+                        u->weight = list[o].weight;
+                        changed = 1;
+                    }
+                }
+                if (changed) {
+                    p->total_weight = 0;
+                    for (int k = 0; k < p->nups; k++)
+                        p->total_weight += p->ups[k]->weight;
+                }
+            }
+        }
+    }
+    free(list);
+    return n;
+}
+
+int overrides_set(const config_t *cfg, const char *hostport, int drained, int weight, char *err, size_t errlen)
+{
+    override_t *list;
+    int n = overrides_read(cfg, &list);
+    int found = -1;
+    for (int i = 0; i < n; i++)
+        if (strcmp(list[i].hostport, hostport) == 0)
+            found = i;
+    if (found < 0) {
+        list = xrealloc(list, sizeof(override_t) * (size_t)(n + 1));
+        found = n++;
+        snprintf(list[found].hostport, sizeof list[found].hostport, "%s", hostport);
+        list[found].drained = list[found].weight = -1;
+    }
+    if (drained >= 0)
+        list[found].drained = drained;
+    if (weight >= 0)
+        list[found].weight = weight;
+    int rc = overrides_write(cfg, list, n);
+    if (rc < 0)
+        snprintf(err, errlen, "cannot write %s/overrides.conf: %s", cfg->storage, strerror(errno));
+    free(list);
+    return rc;
+}
+
+int overrides_clear(const config_t *cfg)
+{
+    char path[2048];
+    snprintf(path, sizeof path, "%s/overrides.conf", cfg->storage);
+    return unlink(path) == 0 || errno == ENOENT ? 0 : -1;
+}
+
+int overrides_list(const config_t *cfg, buf_t *json)
+{
+    override_t *list;
+    int n = overrides_read(cfg, &list);
+    buf_puts(json, "{\"overrides\":[");
+    for (int i = 0; i < n; i++) {
+        buf_printf(json, "%s{\"address\":\"%s\"", i ? "," : "", list[i].hostport);
+        if (list[i].drained >= 0)
+            buf_printf(json, ",\"drained\":%s", list[i].drained ? "true" : "false");
+        if (list[i].weight >= 0)
+            buf_printf(json, ",\"weight\":%d", list[i].weight);
+        buf_puts(json, "}");
+    }
+    buf_puts(json, "]}\n");
+    free(list);
+    return n;
 }

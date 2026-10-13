@@ -70,6 +70,7 @@ int is_ip_literal(const char *s);
 size_t base64_encode(const unsigned char *in, size_t n, char *out, int url);  /* out needs 4*(n/3+1)+1 */
 int    base64_decode(const char *in, size_t n, unsigned char *out, size_t outcap);  /* -1 on error */
 char  *path_clean(const char *path);   /* collapse //, ., ..; result starts with '/'; NULL if escaping */
+int    mkdir_p(const char *path);
 
 /* ------------------------------------------------------------------ */
 /* Growable buffer                                                     */
@@ -419,6 +420,11 @@ typedef struct config {
 } config_t;
 
 config_t *config_load(const char *path, char *err, size_t errlen);
+/* runtime overrides (<storage>/overrides.conf): "hostport drained=<0|1> weight=<n>" per line */
+int  overrides_apply(config_t *cfg);
+int  overrides_set(const config_t *cfg, const char *hostport, int drained, int weight, char *err, size_t errlen); /* -1 keeps a field */
+int  overrides_clear(const config_t *cfg);
+int  overrides_list(const config_t *cfg, buf_t *json);
 config_t *config_parse(const char *text, const char *path, char *err, size_t errlen);
 void      config_ref(config_t *c);
 void      config_unref(config_t *c);

@@ -3355,6 +3355,47 @@ static void admin_metrics(buf_t *b)
 
 static int g_master_pid;
 
+/* apply drain/weight to every live upstream with this address; returns matches */
+static int admin_apply_upstream(const char *hostport, int drained, int weight)
+{
+    int matches = 0;
+    for (int i = 0; i < g_cfg->nservers; i++) {
+        server_t *s = g_cfg->servers[i];
+        for (int r = 0; r < s->nroutes; r++) {
+            pool_t *p = s->routes[r]->pool;
+            if (!p)
+                continue;
+            int changed = 0;
+            for (int k = 0; k < p->nups; k++) {
+                upstream_t *u = p->ups[k];
+                if (strcmp(u->hostport, hostport) != 0)
+                    continue;
+                matches++;
+                if (drained >= 0)
+                    u->drained = drained;
+                if (weight > 0) {
+                    u->weight = weight;
+                    changed = 1;
+                }
+            }
+            if (changed) {
+                p->total_weight = 0;
+                for (int k = 0; k < p->nups; k++)
+                    p->total_weight += p->ups[k]->weight;
+            }
+        }
+    }
+    return matches;
+}
+
+static void admin_request_reload(void)
+{
+    if (g_master_pid > 0)
+        kill(g_master_pid, SIGHUP);
+    else
+        proxy_request_reload();
+}
+
 static void admin_handle(conn_t *c)
 {
     const char *path = c->req.path;
@@ -3377,15 +3418,66 @@ static void admin_handle(conn_t *c)
             status = 405;
             buf_puts(&b, "{\"error\":\"use POST\"}\n");
         } else {
-            if (g_master_pid > 0)
-                kill(g_master_pid, SIGHUP);
-            else
-                proxy_request_reload();
+            admin_request_reload();
             buf_puts(&b, "{\"status\":\"reload scheduled\"}\n");
+        }
+    } else if (strcmp(path, "/overrides") == 0) {
+        if (strcmp(c->req.method, "DELETE") == 0 || strcmp(c->req.method, "POST") == 0) {
+            overrides_clear(g_cfg);
+            admin_request_reload();
+            buf_puts(&b, "{\"status\":\"overrides cleared; reload scheduled\"}\n");
+        } else {
+            overrides_list(g_cfg, &b);
+        }
+    } else if (str_has_prefix(path, "/upstreams/")) {
+        /* POST /upstreams/<host:port>/drain | /undrain | /weight/<n> */
+        char hostport[300] = "";
+        const char *rest = path + 11;
+        const char *slash = strchr(rest, '/');
+        if (slash && (size_t)(slash - rest) < sizeof hostport) {
+            memcpy(hostport, rest, (size_t)(slash - rest));
+            hostport[slash - rest] = 0;
+        }
+        const char *action = slash ? slash + 1 : "";
+        int drained = -1, weight = -1;
+        char err[256] = "";
+        if (strcmp(c->req.method, "POST") != 0) {
+            status = 405;
+            buf_puts(&b, "{\"error\":\"use POST\"}\n");
+        } else if (!hostport[0]) {
+            status = 400;
+            buf_puts(&b, "{\"error\":\"expected /upstreams/<host:port>/<drain|undrain|weight/N>\"}\n");
+        } else if (strcmp(action, "drain") == 0) {
+            drained = 1;
+        } else if (strcmp(action, "undrain") == 0) {
+            drained = 0;
+        } else if (str_has_prefix(action, "weight/") && atoi(action + 7) >= 1 && atoi(action + 7) <= 1000) {
+            weight = atoi(action + 7);
+        } else {
+            status = 400;
+            buf_puts(&b, "{\"error\":\"unknown action; use drain, undrain or weight/<1-1000>\"}\n");
+        }
+        if (status == 200) {
+            int n = admin_apply_upstream(hostport, drained, weight);
+            if (n == 0) {
+                status = 404;
+                buf_printf(&b, "{\"error\":\"no upstream %s\"}\n", hostport);
+            } else if (overrides_set(g_cfg, hostport, drained, weight, err, sizeof err) < 0) {
+                status = 500;
+                buf_printf(&b, "{\"error\":\"%s\"}\n", err);
+            } else {
+                admin_request_reload(); /* propagate to every worker */
+                buf_printf(&b, "{\"status\":\"ok\",\"address\":\"%s\",\"pools\":%d", hostport, n);
+                if (drained >= 0)
+                    buf_printf(&b, ",\"drained\":%s", drained ? "true" : "false");
+                if (weight > 0)
+                    buf_printf(&b, ",\"weight\":%d", weight);
+                buf_puts(&b, "}\n");
+            }
         }
     } else {
         status = 404;
-        buf_puts(&b, "{\"error\":\"not found\",\"endpoints\":[\"/health\",\"/upstreams\",\"/metrics\",\"/config\",\"/reload (POST)\"]}\n");
+        buf_puts(&b, "{\"error\":\"not found\",\"endpoints\":[\"/health\",\"/upstreams\",\"/metrics\",\"/config\",\"/overrides\",\"/reload (POST)\",\"/upstreams/<host:port>/drain|undrain|weight/<n> (POST)\"]}\n");
     }
     c->route = NULL;
     conn_write_simple_response(c, status, ctype, b.data ? b.data : "", b.len, NULL, 0, NULL);
