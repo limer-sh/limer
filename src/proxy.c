@@ -539,7 +539,7 @@ static void expand_placeholders(const char *v, conn_t *c, buf_t *out)
         const char *name = p + 1;
 #define IS(x) (n == strlen(x) && memcmp(name, x, n) == 0)
         if (IS("remote_ip") || IS("remote")) {
-            buf_puts(out, c->peer_ip);
+            buf_puts(out, c->client_ip[0] ? c->client_ip : c->peer_ip);
         } else if (IS("remote_port")) {
             const char *colon = strrchr(c->peer_str, ':');
             buf_puts(out, colon ? colon + 1 : "");
@@ -3574,7 +3574,7 @@ static void listener_cb(ev_t *e, uint32_t events)
         char peer_ip[64];
         sockaddr_to_str((struct sockaddr *)&peer, peer_ip, sizeof peer_ip, 0);
         int ip_admitted = 0;
-        if (g_cfg->ipguard.enabled && g_ipguard) {
+        if (g_cfg->ipguard.enabled && g_ipguard && !l->default_srv->is_admin) {
             int v = ipguard_admit(g_ipguard, &g_cfg->ipguard, peer_ip, g_now);
             if (v != IPGUARD_OK) {
                 LOGD("ipguard: refusing %s (%s)", peer_ip,
