@@ -662,3 +662,11 @@ static void h2u_retire_config(config_t *old)
         s = next;
     }
 }
+
+/* An upstream that left its pool: drop its HTTP/2 session once no stream uses it. */
+static void h2u_close_idle_session(upstream_t *u)
+{
+    h2u_session_t *s = u->h2u;
+    if (s && !s->dead && s->nstreams == 0)
+        h2u_session_close(s);
+}

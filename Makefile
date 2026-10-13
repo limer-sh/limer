@@ -1,9 +1,10 @@
 # Limer - HTTP load balancer with payload-based distribution
 CC      ?= cc
 CFLAGS  ?= -O2 -g
-override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE
+override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -pthread
 LDFLAGS ?=
-LDLIBS  += -lm -lcrypt
+override LDFLAGS += -pthread
+LDLIBS  += -lm -lcrypt -lresolv
 
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin

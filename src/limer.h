@@ -255,6 +255,9 @@ typedef struct upstream {
     struct sockaddr_storage addr;
     socklen_t addrlen;
     int   resolved;
+    int   dynamic;            /* came from a DNS lookup (dynamic a / srv) */
+    double resolve_next;      /* runtime: next re-resolution of a named static upstream */
+    int   gone;               /* removed from the pool; freed once nothing references it */
 
     /* runtime state */
     int   drained;            /* runtime: take no new requests */
@@ -303,6 +306,16 @@ typedef struct pool {
     int   tls_insecure;       /* skip upstream certificate verification */
     char *tls_server_name;    /* SNI / verification name for upstream TLS */
     char *tls_ca;             /* PEM bundle to trust for upstream TLS */
+    int   tls_all;            /* `tls` in the pool block: every upstream speaks TLS */
+    /* dynamic upstreams */
+    int   dyn_kind;           /* 0 static, 1 A/AAAA lookup, 2 SRV lookup */
+    char *dyn_name;
+    int   dyn_port;           /* for A lookups */
+    double refresh;           /* re-resolution interval, 0 = never */
+    double dyn_next;          /* runtime: next lookup */
+    int   dyn_inflight;       /* runtime: a lookup is queued */
+    upstream_t **retired;     /* runtime: removed upstreams still referenced */
+    int   nretired;
 #ifdef LIMER_TLS
     SSL_CTX *client_ctx;      /* for https upstreams */
 #endif
@@ -426,12 +439,54 @@ typedef struct config {
     int      acme_challenge;    /* 0 http-01, 1 tls-alpn-01, 2 dns-01 */
     char    *acme_dns_script;   /* "script present|cleanup <domain> <txt>" for dns-01 */
     double   acme_dns_propagation; /* wait after "present" */
+    char   **resolvers;       /* DNS servers for upstream lookups (ip[:port]); empty = system */
+    int      nresolvers;
     int      refs;
 } config_t;
 
 config_t *config_load(const char *path, char *err, size_t errlen);
+extern int config_lenient_resolve;   /* reloads: an unresolvable named upstream keeps its old address */
 /* runtime overrides (<storage>/overrides.conf): "hostport drained=<0|1> weight=<n>" per line */
 int  overrides_apply(config_t *cfg);
+int  overrides_apply_upstream(const config_t *cfg, upstream_t *u);
+/* dynamic upstreams */
+upstream_t *upstream_new_resolved(pool_t *p, const char *host, const struct sockaddr *sa, socklen_t len, int port, int weight);
+void upstream_free(upstream_t *u);
+void pool_recompute(pool_t *p);
+int  pool_add_runtime(pool_t *p, upstream_t *u);        /* 0 ok, -1 full */
+void pool_retire_upstream(pool_t *p, int idx);          /* move ups[idx] to the retired list */
+void pool_reap_retired(pool_t *p);                      /* free retired upstreams nothing uses */
+
+/* resolver.c: DNS lookups on a helper thread */
+#define RESOLVE_MAX_RESULTS 64
+enum { RESOLVE_ADDR = 0, RESOLVE_SRV = 1 };
+typedef struct resolve_result {
+    struct sockaddr_storage addr;
+    socklen_t len;
+    int  port;
+    int  weight;
+    char target[256];
+} resolve_result_t;
+typedef struct resolve_job {
+    int  kind;
+    char name[256];
+    int  port;
+    char resolvers[4][64];
+    int  nresolvers;
+    resolve_result_t res[RESOLVE_MAX_RESULTS];
+    int  nres;
+    char err[512];
+    void *user;               /* caller context */
+    void *user2;
+    int  tag;                 /* caller's job classification */
+    struct resolve_job *next;
+} resolve_job_t;
+int  resolver_start(void);                 /* returns the fd that becomes readable when results are ready */
+void resolver_submit(resolve_job_t *job);
+resolve_job_t *resolver_take_done(void);   /* finished jobs, oldest first; NULL when none */
+void resolver_stop(void);
+void resolve_sync(resolve_job_t *job);     /* blocking lookup on the calling thread */
+void resolve_job_init(resolve_job_t *job, const config_t *cfg, int kind, const char *name, int port);
 int  overrides_set(const config_t *cfg, const char *hostport, int drained, int weight, char *err, size_t errlen); /* -1 keeps a field */
 int  overrides_clear(const config_t *cfg);
 int  overrides_list(const config_t *cfg, buf_t *json);

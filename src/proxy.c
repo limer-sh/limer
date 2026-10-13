@@ -259,6 +259,7 @@ typedef struct hc_conn {
 } hc_conn_t;
 
 static listener_t *g_listeners;
+static ev_t g_resolver_ev;
 static conn_t *g_conns;
 static uconn_t *g_uconns;
 static ev_t *g_graveyard;
@@ -302,6 +303,7 @@ static void h2u_detach(uconn_t *uc);
 static void h2u_consumed(uconn_t *uc, size_t n);
 static void h2u_resume(uconn_t *uc);
 static void h2u_body_resume(uconn_t *uc);
+static void h2u_close_idle_session(upstream_t *u);
 static void h2_stream_consumed(conn_t *st, size_t n);
 static void h2u_tick(void);
 static void h2u_retire_config(config_t *old);
@@ -3231,6 +3233,206 @@ static void hc_start(upstream_t *u, pool_t *p, config_t *cfg)
     ev_add(&h->ev, EPOLLOUT | EPOLLIN | EPOLLRDHUP);
 }
 
+/* ------------------------------------------------------------------ */
+/* Dynamic upstreams: DNS lookups applied to live pools                */
+/* ------------------------------------------------------------------ */
+
+static void upstream_drop_idle(upstream_t *u)
+{
+    while (u->idle)
+        uconn_close(u->idle);
+}
+
+static const char *dyn_kind_name(int k) { return k == 2 ? "srv" : "a"; }
+
+/* A lookup for a whole pool finished: add new upstreams, retire vanished ones. */
+static void pool_apply_lookup(pool_t *p, resolve_job_t *job)
+{
+    if (job->nres == 0) {
+        LOGW("pool %s: dynamic %s %s: %s (keeping %d upstream%s)", p->name, dyn_kind_name(p->dyn_kind), p->dyn_name,
+             job->err[0] ? job->err : "no results", p->nups, p->nups == 1 ? "" : "s");
+        return; /* a failed lookup never empties a pool */
+    }
+    /* build the new set as upstream objects so hostports compare one way */
+    upstream_t *fresh[RESOLVE_MAX_RESULTS];
+    int nfresh = 0;
+    for (int i = 0; i < job->nres; i++) {
+        resolve_result_t *r = &job->res[i];
+        upstream_t *u = upstream_new_resolved(p, r->target, (struct sockaddr *)&r->addr, r->len, r->port, r->weight);
+        int dup = 0;
+        for (int k = 0; k < nfresh && !dup; k++)
+            dup = strcmp(fresh[k]->hostport, u->hostport) == 0;
+        if (dup)
+            upstream_free(u);
+        else
+            fresh[nfresh++] = u;
+    }
+    int added = 0, removed = 0, changed = 0;
+    /* retire dynamic upstreams that are no longer listed */
+    for (int i = 0; i < p->nups;) {
+        upstream_t *u = p->ups[i];
+        int keep = !u->dynamic;
+        for (int k = 0; k < nfresh && !keep; k++)
+            if (strcmp(fresh[k]->hostport, u->hostport) == 0) {
+                keep = 1;
+                if (fresh[k]->weight != u->weight && !overrides_apply_upstream(g_cfg, fresh[k])) {
+                    u->weight = fresh[k]->weight;
+                    changed = 1;
+                }
+            }
+        if (keep) {
+            i++;
+            continue;
+        }
+        LOGI("pool %s: upstream %s went away", p->name, u->hostport);
+        upstream_drop_idle(u);
+        if (u->hc)
+            hc_close(u->hc);
+        pool_retire_upstream(p, i);
+        removed++;
+    }
+    /* add the ones we do not have yet */
+    for (int k = 0; k < nfresh; k++) {
+        upstream_t *u = fresh[k];
+        int have = 0;
+        for (int i = 0; i < p->nups && !have; i++)
+            have = strcmp(p->ups[i]->hostport, u->hostport) == 0;
+        if (have) {
+            upstream_free(u);
+            continue;
+        }
+        overrides_apply_upstream(g_cfg, u);
+        if (pool_add_runtime(p, u) < 0) {
+            LOGW("pool %s: too many upstreams, ignoring %s", p->name, u->hostport);
+            upstream_free(u);
+            continue;
+        }
+        LOGI("pool %s: upstream %s added (weight %d)", p->name, u->hostport, u->weight);
+        added++;
+    }
+    if (changed)
+        pool_recompute(p);
+    if (added || removed)
+        LOGI("pool %s: now %d upstream%s", p->name, p->nups, p->nups == 1 ? "" : "s");
+}
+
+/* A named static upstream was re-resolved: switch to a new address if it moved. */
+static void upstream_apply_lookup(pool_t *p, upstream_t *u, resolve_job_t *job)
+{
+    if (job->nres == 0) {
+        LOGD("upstream %s: re-resolution failed: %s", u->hostport, job->err);
+        return;
+    }
+    int pick = 0;
+    for (int i = 0; i < job->nres; i++)
+        if (job->res[i].addr.ss_family == AF_INET) {
+            pick = i;
+            break;
+        }
+    /* keep the current address when it is still among the answers */
+    for (int i = 0; i < job->nres; i++)
+        if (job->res[i].len == u->addrlen && memcmp(&job->res[i].addr, &u->addr, u->addrlen) == 0)
+            return;
+    memcpy(&u->addr, &job->res[pick].addr, job->res[pick].len);
+    u->addrlen = job->res[pick].len;
+    char ip[INET6_ADDRSTRLEN] = "?";
+    if (u->addr.ss_family == AF_INET)
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&u->addr)->sin_addr, ip, sizeof ip);
+    else if (u->addr.ss_family == AF_INET6)
+        inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&u->addr)->sin6_addr, ip, sizeof ip);
+    LOGI("pool %s: upstream %s now resolves to %s", p->name, u->hostport, ip);
+    upstream_drop_idle(u); /* new connections go to the new address */
+}
+
+static void resolver_cb(ev_t *e, uint32_t events)
+{
+    (void)e; (void)events;
+    resolve_job_t *job = resolver_take_done();
+    while (job) {
+        resolve_job_t *next = job->next;
+        config_t *cfg = job->user2;
+        pool_t *p = job->user;
+        if (cfg == g_cfg && p) {
+            if (job->tag == 0) {
+                p->dyn_inflight = 0;
+                pool_apply_lookup(p, job);
+            } else {
+                for (int i = 0; i < p->nups; i++) {
+                    upstream_t *u = p->ups[i];
+                    if (!u->dynamic && strcmp(u->host, job->name) == 0 && u->port == job->port)
+                        upstream_apply_lookup(p, u, job);
+                }
+            }
+        } else if (p && p->dyn_inflight) {
+            p->dyn_inflight = 0;
+        }
+        config_unref(cfg);
+        free(job);
+        job = next;
+    }
+}
+
+static void resolve_submit_pool(pool_t *p, config_t *cfg)
+{
+    resolve_job_t *job = xcalloc(1, sizeof *job);
+    resolve_job_init(job, cfg, p->dyn_kind == 2 ? RESOLVE_SRV : RESOLVE_ADDR, p->dyn_name, p->dyn_port);
+    job->user = p;
+    job->user2 = cfg;
+    job->tag = 0;
+    config_ref(cfg);
+    p->dyn_inflight = 1;
+    p->dyn_next = g_now + (p->refresh > 0 ? p->refresh : 30);
+    resolver_submit(job);
+}
+
+static void resolve_submit_upstream(pool_t *p, upstream_t *u, config_t *cfg)
+{
+    resolve_job_t *job = xcalloc(1, sizeof *job);
+    resolve_job_init(job, cfg, RESOLVE_ADDR, u->host, u->port);
+    job->user = p;
+    job->user2 = cfg;
+    job->tag = 1;
+    config_ref(cfg);
+    resolver_submit(job);
+}
+
+static void resolve_tick(void)
+{
+    if (!g_cfg || g_shutting_down)
+        return;
+    for (int i = 0; i < g_cfg->nservers; i++) {
+        server_t *s = g_cfg->servers[i];
+        for (int r = 0; r < s->nroutes; r++) {
+            pool_t *p = s->routes[r]->pool;
+            if (!p)
+                continue;
+            if (p->dyn_kind && !p->dyn_inflight && p->refresh > 0 && g_now >= p->dyn_next)
+                resolve_submit_pool(p, g_cfg);
+            if (p->refresh > 0) {
+                for (int k = 0; k < p->nups; k++) {
+                    upstream_t *u = p->ups[k];
+                    if (u->dynamic || is_ip_literal(u->host))
+                        continue;
+                    if (u->resolve_next == 0) {
+                        u->resolve_next = g_now + p->refresh; /* resolved at load: first refresh in one interval */
+                        continue;
+                    }
+                    if (g_now >= u->resolve_next) {
+                        u->resolve_next = g_now + p->refresh;
+                        resolve_submit_upstream(p, u, g_cfg);
+                    }
+                }
+            }
+#ifdef LIMER_H2
+            /* retired upstreams may still own an idle HTTP/2 session: close it so they can be freed */
+            for (int k = 0; k < p->nretired; k++)
+                h2u_close_idle_session(p->retired[k]);
+#endif
+            pool_reap_retired(p);
+        }
+    }
+}
+
 static void health_tick(void)
 {
     if (!g_cfg || g_shutting_down)
@@ -3586,6 +3788,13 @@ static void admin_upstreams_json(buf_t *b)
             buf_puts(b, ",\"listen\":");
             json_escape(b, s->addrs[0]);
             buf_printf(b, ",\"policy\":\"%s\"", lb_policy_name(p->policy));
+            if (p->dyn_kind) {
+                buf_printf(b, ",\"dynamic\":{\"type\":\"%s\",\"name\":", dyn_kind_name(p->dyn_kind));
+                json_escape(b, p->dyn_name);
+                if (p->dyn_kind == 1)
+                    buf_printf(b, ",\"port\":%d", p->dyn_port);
+                buf_printf(b, ",\"refresh\":%.0f}", p->refresh);
+            }
             if (p->policy == LB_HASH) {
                 buf_printf(b, ",\"hash_key\":{\"source\":\"%s\"", keysrc_name(p->key.src));
                 if (p->key.name) {
@@ -3844,6 +4053,33 @@ static void inherit_state(config_t *old, config_t *cfg)
             pool_t *p = s->routes[r]->pool;
             if (!p)
                 continue;
+            if (p->dyn_kind) {
+                /* same dynamic source as before: start from the old pool's members and schedule */
+                for (int oi = 0; oi < old->nservers; oi++) {
+                    server_t *os = old->servers[oi];
+                    for (int orr = 0; orr < os->nroutes; orr++) {
+                        pool_t *op = os->routes[orr]->pool;
+                        if (!op || !op->dyn_kind || op->dyn_kind != p->dyn_kind || strcmp(op->dyn_name, p->dyn_name) != 0 ||
+                            op->dyn_port != p->dyn_port || strcmp(op->name, p->name) != 0)
+                            continue;
+                        for (int ok = 0; ok < op->nups; ok++) {
+                            upstream_t *ou = op->ups[ok];
+                            if (!ou->dynamic)
+                                continue;
+                            int have = 0;
+                            for (int k = 0; k < p->nups && !have; k++)
+                                have = strcmp(p->ups[k]->hostport, ou->hostport) == 0;
+                            if (have)
+                                continue;
+                            upstream_t *u = upstream_new_resolved(p, ou->host, (struct sockaddr *)&ou->addr, ou->addrlen, ou->port, ou->weight);
+                            overrides_apply_upstream(cfg, u);
+                            if (pool_add_runtime(p, u) < 0)
+                                upstream_free(u);
+                        }
+                        p->dyn_next = op->dyn_next;
+                    }
+                }
+            }
             for (int k = 0; k < p->nups; k++) {
                 upstream_t *u = p->ups[k];
                 for (int oi = 0; oi < old->nservers; oi++) {
@@ -3860,7 +4096,14 @@ static void inherit_state(config_t *old, config_t *cfg)
                                 u->hc_next = ou->hc_next;
                                 u->fails = ou->fails;
                                 u->fail_until = ou->fail_until;
+                                u->resolve_next = ou->resolve_next;
                                 memcpy(u->hc_detail, ou->hc_detail, sizeof u->hc_detail);
+                                if (!u->dynamic && !is_ip_literal(u->host) && ou->addrlen) {
+                                    /* keep the address the old config had re-resolved to */
+                                    memcpy(&u->addr, &ou->addr, ou->addrlen);
+                                    u->addrlen = ou->addrlen;
+                                    u->resolved = 1;
+                                }
                             }
                         }
                     }
@@ -3874,7 +4117,9 @@ static void do_reload(void)
 {
     char err[512];
     LOGI("reloading configuration from %s", g_cfg->path);
+    config_lenient_resolve = 1;
     config_t *cfg = config_load(g_cfg->path, err, sizeof err);
+    config_lenient_resolve = 0;
     if (!cfg) {
         LOGE("reload failed, keeping current configuration: %s", err);
         return;
@@ -3886,6 +4131,16 @@ static void do_reload(void)
     }
     log_level = cfg->log_level;
     inherit_state(g_cfg, cfg);
+    for (int i = 0; i < cfg->nservers; i++)
+        for (int r = 0; r < cfg->servers[i]->nroutes; r++) {
+            pool_t *p = cfg->servers[i]->routes[r]->pool;
+            for (int k = 0; p && k < p->nups; k++)
+                if (!p->ups[k]->resolved) {
+                    LOGE("reload failed, keeping current configuration: upstream %s cannot be resolved and has no previous address", p->ups[k]->hostport);
+                    config_unref(cfg);
+                    return;
+                }
+        }
     config_t *old = g_cfg;
     g_cfg = cfg;
     retire_config(old);
@@ -4000,6 +4255,7 @@ static void tick(void)
         }
 
     health_tick();
+    resolve_tick();
 #ifdef LIMER_H2
     h2u_tick();
 #endif
@@ -4080,6 +4336,14 @@ int proxy_run(config_t *cfg, int worker_id)
     g_timer_ev.fd = tfd;
     g_timer_ev.cb = timer_cb;
     ev_add(&g_timer_ev, EPOLLIN);
+    int rfd = resolver_start();
+    if (rfd < 0) {
+        LOGE("cannot start the resolver thread: %s", strerror(errno));
+        return 1;
+    }
+    g_resolver_ev.fd = rfd;
+    g_resolver_ev.cb = resolver_cb;
+    ev_add(&g_resolver_ev, EPOLLIN);
 
     LOGI("limer %s worker %d ready (%d server block%s)", LIMER_VERSION, worker_id, cfg->nservers, cfg->nservers == 1 ? "" : "s");
 
@@ -4120,6 +4384,18 @@ int proxy_run(config_t *cfg, int worker_id)
     while (g_h2u_sessions)
         h2u_session_close(g_h2u_sessions);
 #endif
+    ev_del(&g_resolver_ev);
+    resolver_stop();
+    {
+        /* drop lookups that were still in flight */
+        resolve_job_t *job = resolver_take_done();
+        while (job) {
+            resolve_job_t *next = job->next;
+            config_unref(job->user2);
+            free(job);
+            job = next;
+        }
+    }
     reap_graveyard();
     while (g_listeners) {
         listener_t *l = g_listeners;

@@ -691,6 +691,45 @@ TEST(test_config)
         config_unref(c);
     }
     cfg_bad(":1 {\n request_body {\n  mode sometimes\n }\n reverse_proxy 127.0.0.1:1\n}\n", "mode accepts");
+    /* dynamic upstreams: the lookup runs at load (and may fail: the pool starts empty) */
+    c = cfg_ok("{\n resolvers 127.0.0.1:1 10.0.0.2\n}\n"
+               ":1 {\n reverse_proxy {\n  dynamic a backends.invalid 8080 {\n   refresh 5s\n  }\n  lb_policy least_conn\n }\n}\n"
+               ":2 {\n reverse_proxy {\n  dynamic srv _http._tcp.svc.invalid\n  refresh off\n }\n}\n"
+               ":3 {\n reverse_proxy 127.0.0.1:1 {\n  refresh 2m\n }\n}\n");
+    if (c) {
+        CHECK(c->nresolvers == 2);
+        CHECK_STR(c->resolvers[0], "127.0.0.1:1");
+        pool_t *pa = c->servers[0]->routes[0]->pool;
+        CHECK(pa->dyn_kind == 1 && pa->dyn_port == 8080 && pa->refresh == 5 && pa->nups == 0 && pa->policy == LB_LEAST_CONN);
+        CHECK_STR(pa->dyn_name, "backends.invalid");
+        pool_t *ps = c->servers[1]->routes[0]->pool;
+        CHECK(ps->dyn_kind == 2 && ps->refresh == 0 && ps->nups == 0);
+        CHECK(c->servers[2]->routes[0]->pool->refresh == 120 && c->servers[2]->routes[0]->pool->dyn_kind == 0);
+        /* runtime membership helpers */
+        struct sockaddr_in sin;
+        memset(&sin, 0, sizeof sin);
+        sin.sin_family = AF_INET;
+        inet_pton(AF_INET, "10.1.2.3", &sin.sin_addr);
+        upstream_t *u = upstream_new_resolved(pa, "backends.invalid", (struct sockaddr *)&sin, sizeof sin, 8080, 4);
+        CHECK_STR(u->hostport, "10.1.2.3:8080");
+        CHECK(u->dynamic && u->weight == 4 && u->port == 8080 && ((struct sockaddr_in *)&u->addr)->sin_port == htons(8080));
+        CHECK(pool_add_runtime(pa, u) == 0 && pa->nups == 1 && pa->total_weight == 4);
+        pool_retire_upstream(pa, 0);
+        CHECK(pa->nups == 0 && pa->nretired == 1 && u->gone);
+        u->active = 1;
+        pool_reap_retired(pa);
+        CHECK(pa->nretired == 1); /* still referenced */
+        u->active = 0;
+        pool_reap_retired(pa);
+        CHECK(pa->nretired == 0);
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n reverse_proxy {\n  dynamic a backends.invalid\n }\n}\n", "needs a name and a port");
+    cfg_bad(":1 {\n reverse_proxy {\n  dynamic srv\n }\n}\n", "dynamic needs");
+    cfg_bad(":1 {\n reverse_proxy {\n  dynamic mx mail.invalid\n }\n}\n", "accepts 'a' or 'srv'");
+    cfg_bad(":1 {\n reverse_proxy {\n  dynamic a x.invalid 80\n  dynamic srv _s._tcp.x.invalid\n }\n}\n", "only one 'dynamic'");
+    cfg_bad("{\n resolvers not-an-ip\n}\n:1 {\n reverse_proxy 127.0.0.1:1\n}\n", "resolvers takes IPv4");
+    cfg_bad(":1 {\n reverse_proxy {\n  dynamic a x.invalid 80 {\n   ttl 5s\n  }\n }\n}\n", "unknown dynamic option");
     CHECK(template_needs_body("{json.a}") && template_needs_body("x{form.b}y") && template_needs_body("{body}"));
     CHECK(!template_needs_body("{header.X}") && !template_needs_body("{query.q}{cookie.c}") && !template_needs_body(NULL));
 #endif
