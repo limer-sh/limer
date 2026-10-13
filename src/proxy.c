@@ -18,6 +18,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <sys/un.h>
@@ -501,6 +502,9 @@ static void conn_reset_request(conn_t *c)
 {
     http_req_free(&c->req);
     http_req_init(&c->req);
+    /* idle keep-alive connections should not pin read buffers */
+    if (buf_readable(&c->rbuf) == 0)
+        buf_free(&c->rbuf);
     c->route = NULL;
     c->pool = NULL;
     c->up = NULL;
@@ -643,6 +647,8 @@ static void conn_flush(conn_t *c)
         conn_close(c);
         return;
     }
+    if (buf_readable(&c->wbuf) == 0 && c->state == CS_HEAD && c->wbuf.cap > 4096)
+        buf_free(&c->wbuf);
     if (c->upstream_paused && c->uc && buf_readable(&c->wbuf) < WBUF_LOW_WATER) {
         c->upstream_paused = 0;
         ev_mod(&c->uc->ev, EPOLLIN | (buf_readable(&c->uc->wbuf) ? EPOLLOUT : 0));
@@ -2448,6 +2454,22 @@ int proxy_run(config_t *cfg, int worker_id)
     if (g_epfd < 0) {
         LOGE("epoll_create1: %s", strerror(errno));
         return 1;
+    }
+
+    /* Raise the descriptor limit as far as allowed; every proxied request
+     * needs two descriptors, so derive a default connection cap from it. */
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        if (rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            if (setrlimit(RLIMIT_NOFILE, &rl) < 0)
+                getrlimit(RLIMIT_NOFILE, &rl);
+        }
+        if (cfg->max_connections == 0 && rl.rlim_cur != RLIM_INFINITY) {
+            long cap = ((long)rl.rlim_cur - 64) / 2;
+            cfg->max_connections = cap < 64 ? 64 : (int)(cap > 1000000 ? 1000000 : cap);
+        }
+        LOGI("descriptor limit %lu, max_connections %d", (unsigned long)rl.rlim_cur, cfg->max_connections);
     }
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;

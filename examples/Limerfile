@@ -9,6 +9,7 @@
     workers 1                 # worker processes ("auto" = one per CPU)
     admin 127.0.0.1:2019      # admin API: /health /upstreams /metrics /config /reload
     log_level info            # debug | info | warn | error
+    max_connections auto      # per worker; auto = half the descriptor limit
     pidfile /tmp/limer.pid    # enables `limer reload` and `limer stop`
     grace 10s                 # how long to drain connections on shutdown
 }
