@@ -1,0 +1,110 @@
+# Limerfile - example configuration for Limer.
+#
+# The syntax follows Caddyfile conventions: one directive per line,
+# blocks open with "{" at the end of a line and close with "}" on its
+# own line, "#" starts a comment, and values with spaces are quoted.
+
+# Global options (optional, must be the first block)
+{
+    workers 1                 # worker processes ("auto" = one per CPU)
+    admin 127.0.0.1:2019      # admin API: /health /upstreams /metrics /config /reload
+    log_level info            # debug | info | warn | error
+    pidfile /tmp/limer.pid    # enables `limer reload` and `limer stop`
+    grace 10s                 # how long to drain connections on shutdown
+}
+
+# A server block: one or more listen addresses, then directives.
+:8080 {
+    max_body 8m               # request bodies are buffered (needed for payload routing)
+    read_timeout 30s
+    idle_timeout 2m
+    log                       # access log to stdout
+
+    # --- Static answers -------------------------------------------------
+
+    route health {
+        match path /lb-health
+        respond 200 "ok"
+    }
+
+    route legacy {
+        match path /v1/*
+        redir https://api.example.com{uri} 308
+    }
+
+    # --- Payload-based routing -----------------------------------------
+    # Routes are tried in order; the first whose matchers all pass wins.
+    # Matchers can look at the method, path, host, headers, query string,
+    # cookies, the client IP, and the request body (JSON fields, form
+    # fields, or a regex over the raw body).
+
+    route orders {
+        match method POST
+        match path /api/*
+        match json type == order refund          # value lists are OR'ed
+        to 10.0.1.10:8080 10.0.1.11:8080
+        lb_policy hash json customer.id          # same customer -> same upstream
+        header_up X-Route orders
+        health_uri /healthz
+        health_interval 10s
+    }
+
+    route big-spenders {
+        match json order.total >= 1000
+        to 10.0.2.10:8080
+    }
+
+    route forms {
+        match form action == checkout
+        to 10.0.3.10:8080 10.0.3.11:8080
+        lb_policy hash form cart_id
+    }
+
+    route urgent {
+        match body ~ "\"priority\": *\"(high|urgent)\""
+        to 10.0.4.10:8080
+    }
+
+    route tenant {
+        match header X-Tenant acme globex
+        to 10.0.5.10:8080 10.0.5.11:8080
+        lb_policy hash header X-Tenant
+    }
+
+    route internal {
+        match remote_ip 10.0.0.0/8 192.168.0.0/16
+        match path /admin/*
+        to 10.0.6.10:8080
+    }
+
+    # --- Default pool --------------------------------------------------
+    # reverse_proxy without matchers handles everything else.
+
+    reverse_proxy 10.0.0.10:8080 10.0.0.11:8080 10.0.0.12:8080 weight=2 {
+        lb_policy least_conn          # round_robin | least_conn | random | first | ip_hash | uri_hash | hash <source> [name]
+        lb_retries 2                  # try other upstreams when one fails
+        max_fails 3                   # passive health: failures before an upstream is ejected
+        fail_timeout 10s              #   ... and for how long
+        unhealthy_status 5xx          # count 5xx responses as failures
+        health_uri /healthz           # active health check
+        health_interval 10s
+        health_timeout 5s
+        health_status 200             # expected status (default: any 2xx/3xx)
+        connect_timeout 5s
+        response_timeout 60s
+        keepalive_idle 32             # idle upstream connections to keep per upstream
+        keepalive_timeout 60s
+        header_up X-Real-IP {remote_ip}
+        header_up -Cookie
+        header_down +Via "1.1 limer"
+        header_down -Server
+    }
+}
+
+# TLS termination: give the block an https:// address and a certificate
+# (uncomment once the files exist; `limer validate` checks that they load).
+#
+# https://:8443 {
+#     tls /etc/limer/cert.pem /etc/limer/key.pem
+#     reverse_proxy 10.0.0.10:8080 10.0.0.11:8080
+# }
