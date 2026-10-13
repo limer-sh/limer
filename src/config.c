@@ -570,6 +570,7 @@ static void matcher_free(matcher_t *m)
     free(m->vals);
     free(m->re);
     free(m->nums);
+    free(m->split_key.name);
 }
 
 static void hdr_ops_free(hdr_op_t *ops, int n)
@@ -629,6 +630,8 @@ static void pool_free(pool_t *p)
         upstream_free(p->retired[i]);
     free(p->retired);
     free(p->dyn_name);
+    if (p->mirror)
+        pool_free(p->mirror);
     free(p->name);
     free(p->key.name);
     free(p->health_uri);
@@ -998,6 +1001,7 @@ static pool_t *pool_new(const char *name)
     p->keepalive_timeout = 60;
     p->preserve_host = 1;
     p->refresh = 30;
+    p->mirror_sample = 100;
     return p;
 }
 
@@ -1081,6 +1085,34 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
     } else if (strcaseeq(k, "preserve_host")) {
         if (want_args(d, 1, 1, err, errlen) < 0 || arg_bool(d, 1, &p->preserve_host, err, errlen) < 0)
             return -1;
+    } else if (strcaseeq(k, "mirror")) {
+        /* mirror <upstreams...> [{ sample <pct>; ... }] : shadow a copy of the request */
+        if (p->mirror)
+            FAIL("line %d: only one mirror per reverse_proxy", d->line);
+        pool_t *mp = pool_new(p->name);
+        if (d->nargs > 1 && pool_add_upstream_list(mp, d, 1, err, errlen) < 0) {
+            pool_free(mp);
+            return -1;
+        }
+        for (int i = 0; i < d->nkids; i++) {
+            node_t *kk = d->kids[i];
+            int mh = 0;
+            if (strcaseeq(kk->args[0], "sample")) {
+                if (want_args(kk, 1, 1, err, errlen) < 0 || !is_numeric(kk->args[1], &p->mirror_sample) ||
+                    p->mirror_sample < 0 || p->mirror_sample > 100) {
+                    pool_free(mp);
+                    FAIL("line %d: mirror sample needs a percentage 0..100", kk->line);
+                }
+            } else if (parse_pool_directive(mp, kk, &mh, err, errlen) < 0 || !mh) {
+                pool_free(mp);
+                FAIL("line %d: unknown mirror option '%s'", kk->line, kk->args[0]);
+            }
+        }
+        p->mirror = mp;
+    } else if (strcaseeq(k, "mirror_sample")) {
+        if (want_args(d, 1, 1, err, errlen) < 0 || !is_numeric(d->args[1], &p->mirror_sample) ||
+            p->mirror_sample < 0 || p->mirror_sample > 100)
+            FAIL("line %d: mirror_sample needs a percentage 0..100", d->line);
     } else if (strcaseeq(k, "tls")) {
         /* `tls` inside a transport block: use TLS for every upstream of the pool */
         if (d->nargs > 1)
@@ -1218,6 +1250,12 @@ static int pool_finalize(pool_t *p, int line, char *err, size_t errlen)
         FAIL("line %d: '%s': all upstreams have weight 0", line, p->name);
     if (!p->dyn_kind && p->retries > p->nups - 1)
         p->retries = p->nups - 1;
+    if (p->mirror) {
+        if (p->mirror->nups == 0 && !p->mirror->dyn_kind)
+            FAIL("line %d: mirror has no upstreams", line);
+        if (pool_finalize(p->mirror, line, err, errlen) < 0)
+            return -1;
+    }
     return 0;
 }
 
@@ -1341,6 +1379,12 @@ static void config_resolve_dynamic(config_t *cfg)
 /* Matchers and route-level directives                                 */
 /* ------------------------------------------------------------------ */
 
+static void route_add_matcher(route_t *r, const matcher_t *m)
+{
+    r->m = xrealloc(r->m, sizeof(matcher_t) * (size_t)(r->nm + 1));
+    r->m[r->nm++] = *m;
+}
+
 static int parse_match(route_t *r, node_t *d, char *err, size_t errlen)
 {
     /* match [not] <source> [name] [op] [values...] */
@@ -1353,6 +1397,34 @@ static int parse_match(route_t *r, node_t *d, char *err, size_t errlen)
     }
     if (ai >= d->nargs)
         FAIL("line %d: 'match' needs a source (method, path, host, header, query, cookie, json, form, body, remote_ip)", d->line);
+    if (ai < d->nargs && strcaseeq(d->args[ai], "split")) {
+        /* match [not] split <percent> [<key-source> [name]] */
+        ai++;
+        if (ai >= d->nargs || !is_numeric(d->args[ai], &m.split_pct) || m.split_pct < 0 || m.split_pct > 100) {
+            free(m.key.name);
+            FAIL("line %d: 'match split' needs a percentage 0..100", d->line);
+        }
+        ai++;
+        m.is_split = 1;
+        m.split_key.src = KS_CLIENT_IP;
+        if (ai < d->nargs) {
+            int snamed;
+            if (parse_keysrc(d->args[ai], &m.split_key.src, &snamed) < 0)
+                FAIL("line %d: unknown split key source '%s'", d->line, d->args[ai]);
+            ai++;
+            if (snamed) {
+                if (ai >= d->nargs)
+                    FAIL("line %d: 'match split ... %s' needs a name", d->line, d->args[ai - 1]);
+                m.split_key.name = xstrdup(d->args[ai++]);
+            }
+        }
+        if (ai != d->nargs) {
+            free(m.split_key.name);
+            FAIL("line %d: 'match split' takes a percentage and an optional key source", d->line);
+        }
+        route_add_matcher(r, &m);
+        return 0;
+    }
     int named;
     if (parse_keysrc(d->args[ai], &m.key.src, &named) < 0)
         FAIL("line %d: unknown match source '%s'", d->line, d->args[ai]);
@@ -1976,6 +2048,7 @@ static int parse_reverse_proxy(server_t *s, node_t *d, char *err, size_t errlen)
     if (pool_finalize(p, d->line, err, errlen) < 0)
         goto fail;
     r->pool = p;
+    route_compute_needs_body(r);
     s->routes = xrealloc(s->routes, sizeof(route_t *) * (size_t)(s->nroutes + 1));
     s->routes[s->nroutes++] = r;
     return 0;

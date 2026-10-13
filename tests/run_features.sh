@@ -697,6 +697,66 @@ expect_eq "8 concurrent 20 MB uploads intact" "$okc" "11111111"
 expect_eq "no errors logged" "$(grep -c "error" $TMP/stream.log)" "0"
 kill -TERM $SP; wait $SP 2>/dev/null
 
+echo "# traffic splitting and request mirroring"
+python3 tests/backend.py 9708 stable & PIDS+=($!)
+python3 tests/backend.py 9709 canary & PIDS+=($!)
+: > "$TMP/mirror.rec"
+python3 tests/backend.py 9710 shadow --record "$TMP/mirror.rec" & SHADOWP=$!; PIDS+=($SHADOWP)
+wait_port 9708; wait_port 9709; wait_port 9710
+cat > "$TMP/split.conf" <<CFG
+{
+    admin off
+    log_level warn
+}
+:9820 {
+    route {
+        match split 20 header X-User
+        reverse_proxy 127.0.0.1:9709
+    }
+    reverse_proxy 127.0.0.1:9708 {
+        mirror 127.0.0.1:9710
+    }
+}
+:9821 {
+    route {
+        match split 100 header X-User
+        reverse_proxy 127.0.0.1:9709
+    }
+    reverse_proxy 127.0.0.1:9708
+}
+:9822 {
+    route {
+        match split 0 header X-User
+        reverse_proxy 127.0.0.1:9709
+    }
+    reverse_proxy 127.0.0.1:9708
+}
+CFG
+$BIN run -c "$TMP/split.conf" >/dev/null 2>"$TMP/split.log" & SPP=$!; PIDS+=($SPP)
+wait_port 9820
+# distribution: ~20% of distinct users to canary
+canary=$(for u in $(seq 1 400); do curl -s -H "X-User: u$u" http://127.0.0.1:9820/; echo; done | grep -c canary)
+[ "$canary" -ge 50 ] && [ "$canary" -le 110 ] && ok "split sends roughly 20% to canary ($canary/400)" || fail "split ~20%" "got $canary/400"
+# sticky: the same user always lands on the same side
+side1=$(curl -s -H "X-User: alice" http://127.0.0.1:9820/)
+sticky=yes; for i in $(seq 1 10); do [ "$(curl -s -H 'X-User: alice' http://127.0.0.1:9820/)" = "$side1" ] || sticky=no; done
+expect_eq "split assignment is sticky per key" "$sticky" "yes"
+expect_eq "split 100 sends everything to canary" "$(curl -s -H 'X-User: x' http://127.0.0.1:9821/)" "hello from canary"
+expect_eq "split 0 sends nothing to canary" "$(curl -s -H 'X-User: x' http://127.0.0.1:9822/)" "hello from stable"
+# mirroring: every request to stable is copied to the shadow, response ignored
+: > "$TMP/mirror.rec"
+for i in 1 2 3 4 5; do curl -s -X POST --data "body$i" http://127.0.0.1:9820/echo >/dev/null; done
+sleep 0.5
+expect_eq "all requests reach the mirror" "$(grep -c POST "$TMP/mirror.rec")" "5"
+expect_contains "mirror receives the request body" "$(cat "$TMP/mirror.rec")" "5 body3"
+expect_eq "the client still gets the real upstream response" "$(curl -s http://127.0.0.1:9820/)" "hello from stable"
+expect_contains "mirrored request carries the X-Mirrored-By marker" "$(cat "$TMP/mirror.rec")" "POST /echo"
+# a dead mirror does not affect the client
+kill "$SHADOWP" 2>/dev/null; wait "$SHADOWP" 2>/dev/null
+expect_eq "client unaffected when the mirror upstream is down" "$(curl -s http://127.0.0.1:9820/)" "hello from stable"
+expect_eq "mirror failure is not logged as an error" "$(grep -c ' error ' $TMP/split.log)" "0"
+kill -TERM $SPP 2>/dev/null; wait $SPP 2>/dev/null
+
 echo "# mutual tls: client certificates on sites and to upstreams"
 MT="$TMP/mtls"; mkdir -p "$MT"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$MT/ca.key" -out "$MT/ca.crt" -days 2 \

@@ -223,6 +223,18 @@ static int eval_values(const matcher_t *m, const char *v, size_t vlen)
 int matcher_eval(const matcher_t *m, const req_ctx_t *ctx)
 {
     int res;
+    if (m->is_split) {
+        /* deterministic bucketing: the same key always lands on the same side */
+        buf_t k;
+        buf_init(&k);
+        if (!key_extract(&m->split_key, ctx, &k))
+            buf_puts(&k, ctx->peer_ip);
+        uint64_t h = hash64(buf_rptr(&k), buf_readable(&k));
+        buf_free(&k);
+        double threshold = m->split_pct * (double)(UINT64_MAX / 100);
+        res = (double)h < threshold;
+        return m->negate ? !res : res;
+    }
     if (m->key.src == KS_CLIENT_IP) {
         /* remote_ip matcher uses CIDR semantics */
         res = 0;
@@ -272,6 +284,11 @@ int keysrc_needs_body(const keysrc_t *k)
     return k->src == KS_JSON || k->src == KS_FORM || k->src == KS_BODY;
 }
 
+static int matcher_needs_body(const matcher_t *m)
+{
+    return keysrc_needs_body(&m->key) || (m->is_split && keysrc_needs_body(&m->split_key));
+}
+
 int template_needs_body(const char *tmpl)
 {
     if (!tmpl)
@@ -291,8 +308,10 @@ int route_compute_needs_body(route_t *r)
 {
     int need = 0;
     for (int i = 0; i < r->nm; i++)
-        if (keysrc_needs_body(&r->m[i].key))
+        if (matcher_needs_body(&r->m[i]))
             need = 1;
+    if (r->pool && r->pool->mirror)
+        need = 1; /* the mirror needs the whole request buffered */
     if (r->pool) {
         if (r->pool->policy == LB_HASH && keysrc_needs_body(&r->pool->key))
             need = 1;
@@ -315,7 +334,7 @@ int route_prematch(const route_t *r, const req_ctx_t *ctx)
 {
     int undecided = 0;
     for (int i = 0; i < r->nm; i++) {
-        if (keysrc_needs_body(&r->m[i].key)) {
+        if (matcher_needs_body(&r->m[i])) {
             undecided = 1;
             continue;
         }

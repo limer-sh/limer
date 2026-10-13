@@ -665,6 +665,33 @@ TEST(test_config)
     cfg_bad("x.test {\n tls internal {\n  client_auth {\n   trusted_ca_cert_file /no/such/ca.pem\n  }\n }\n respond ok\n}\n", "cannot read");
     cfg_bad("x.test {\n tls internal {\n  frobnicate\n }\n respond ok\n}\n", "unknown tls option");
     cfg_bad(":1 {\n reverse_proxy https://127.0.0.1:1 {\n  tls_client_auth /no/such/c.pem /no/such/k.pem\n }\n}\n", "cannot read");
+    /* traffic split matcher and request mirroring */
+    c = cfg_ok(":1 {\n route {\n  match split 20 header X-User\n  reverse_proxy 127.0.0.1:1\n }\n"
+               " route {\n  match split 5\n  reverse_proxy 127.0.0.1:2\n }\n"
+               " reverse_proxy 127.0.0.1:3 {\n  mirror 127.0.0.1:4 127.0.0.1:5 {\n   sample 25\n  }\n }\n}\n");
+    if (c) {
+        route_t *r0 = c->servers[0]->routes[0];
+        CHECK(r0->nm == 1 && r0->m[0].is_split && r0->m[0].split_pct == 20);
+        CHECK(r0->m[0].split_key.src == KS_HEADER);
+        CHECK_STR(r0->m[0].split_key.name, "X-User");
+        CHECK(r0->needs_body == 0); /* a header-keyed split does not need the body */
+        route_t *r1 = c->servers[0]->routes[1];
+        CHECK(r1->m[0].is_split && r1->m[0].split_pct == 5 && r1->m[0].split_key.src == KS_CLIENT_IP);
+        route_t *rp = c->servers[0]->routes[2];
+        CHECK(rp->pool->mirror != NULL && rp->pool->mirror->nups == 2 && rp->pool->mirror_sample == 25);
+        CHECK(rp->needs_body == 1); /* the mirror forces buffering */
+        config_unref(c);
+    }
+    /* a split that keys on the body forces buffering */
+    c = cfg_ok(":1 {\n route {\n  match split 10 json user.id\n  reverse_proxy 127.0.0.1:1\n }\n respond ok\n}\n");
+    if (c) {
+        CHECK(c->servers[0]->routes[0]->needs_body == 1);
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n route {\n  match split 150\n  reverse_proxy 127.0.0.1:1\n }\n}\n", "percentage 0..100");
+    cfg_bad(":1 {\n route {\n  match split\n  reverse_proxy 127.0.0.1:1\n }\n}\n", "percentage 0..100");
+    cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 {\n  mirror 127.0.0.1:2 {\n   sample 500\n  }\n }\n}\n", "percentage 0..100");
+    cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 {\n  mirror 127.0.0.1:2\n  mirror 127.0.0.1:3\n }\n}\n", "only one mirror");
 #ifdef LIMER_H2
     /* http/2 upstreams: h2c:// (cleartext), h2:// (tls + alpn) and transport versions */
     c = cfg_ok(":1 {\n reverse_proxy h2c://127.0.0.1:1 h2://127.0.0.1:2 127.0.0.1:3\n"
@@ -1016,6 +1043,17 @@ TEST(test_prematch)
     CHECK(prematch_from("  match path /other/*\n  match json type == order", &t.ctx) == 0); /* path already fails */
     CHECK(prematch_from("  match header X-Tenant acme\n  match form a == b", &t.ctx) == 2);
     CHECK(prematch_from("  match method GET\n  match body ~ x", &t.ctx) == 0);
+    /* traffic split matcher: deterministic per key, honours the percentage boundaries */
+    matcher_t all, none, half;
+    memset(&all, 0, sizeof all); all.is_split = 1; all.split_pct = 100; all.split_key.src = KS_CLIENT_IP;
+    memset(&none, 0, sizeof none); none.is_split = 1; none.split_pct = 0; none.split_key.src = KS_CLIENT_IP;
+    CHECK(matcher_eval(&all, &t.ctx) == 1);
+    CHECK(matcher_eval(&none, &t.ctx) == 0);
+    memset(&half, 0, sizeof half);
+    half.is_split = 1; half.split_pct = 50; half.split_key.src = KS_HEADER; half.split_key.name = (char *)"X-Tenant";
+    int sa = matcher_eval(&half, &t.ctx);
+    for (int i = 0; i < 20; i++)
+        CHECK(matcher_eval(&half, &t.ctx) == sa); /* same key -> same side every time */
     http_req_free(&t.req);
 }
 

@@ -246,6 +246,9 @@ typedef struct matcher {
     regex_t *re;        /* compiled for OP_RE / OP_NRE, one per value */
     double  *nums;      /* parsed for numeric ops */
     int      negate;
+    int      is_split;  /* traffic split: match a deterministic fraction of requests */
+    double   split_pct; /* 0..100 */
+    keysrc_t split_key; /* key the split hashes (default client_ip) */
 } matcher_t;
 
 typedef struct hdr_op {
@@ -322,6 +325,8 @@ typedef struct pool {
     char *tls_client_cert;    /* client certificate (chain) presented to upstreams */
     char *tls_client_key;
     int   tls_all;            /* `tls` in the pool block: every upstream speaks TLS */
+    struct pool *mirror;      /* shadow pool: a copy of the request is sent here, response discarded */
+    double mirror_sample;     /* 0..100 percent of requests to mirror (default 100) */
     /* dynamic upstreams */
     int   dyn_kind;           /* 0 static, 1 A/AAAA lookup, 2 SRV lookup */
     char *dyn_name;
