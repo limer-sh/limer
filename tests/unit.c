@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int checks, failures;
 static const char *current;
@@ -635,8 +636,16 @@ TEST(test_config)
     cfg_bad(":1 {\n route {\n  match path !=\n  to 127.0.0.1:1\n }\n}\n", "at least one value");
     cfg_bad(":1 {\n max_body lots\n reverse_proxy 127.0.0.1:1\n}\n", "invalid size");
     cfg_bad(":1 {\n read_timeout soon\n reverse_proxy 127.0.0.1:1\n}\n", "invalid duration");
-    cfg_bad(":1 {\n tls only-one\n reverse_proxy 127.0.0.1:1\n}\n", "expects 2 arguments");
-    cfg_bad("https://:1 {\n reverse_proxy 127.0.0.1:1\n}\n", "requires 'tls");
+    cfg_bad(":1 {\n tls only-one\n reverse_proxy 127.0.0.1:1\n}\n", "tls accepts");
+    {
+        /* https without a hostname gets a self-signed certificate */
+        config_t *hc = cfg_ok("https://:1 {\n reverse_proxy 127.0.0.1:1\n}\n");
+        if (hc) {
+            CHECK(hc->servers[0]->tls_mode == TLS_INTERNAL && hc->servers[0]->ssl_ctx != NULL);
+            CHECK(hc->nservers == 1); /* no redirect site without hostnames */
+            config_unref(hc);
+        }
+    }
     cfg_bad(":1 {\n tls /no/cert.pem /no/key.pem\n reverse_proxy 127.0.0.1:1\n}\n", "tls");
     cfg_bad("{\n workers many\n}\n:1 {\n reverse_proxy 127.0.0.1:1\n}\n", "invalid number");
     cfg_bad("{\n max_connections 0\n}\n:1 {\n reverse_proxy 127.0.0.1:1\n}\n", "invalid number");
@@ -649,7 +658,9 @@ TEST(test_config)
     }
     cfg_bad("{\n nope 1\n}\n:1 {\n reverse_proxy 127.0.0.1:1\n}\n", "unknown global option");
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1\n}\n{\n workers 2\n}\n", "must come first");
-    cfg_bad("notanaddress {\n reverse_proxy 127.0.0.1:1\n}\n", "invalid listen address");
+    cfg_bad("bad!host {\n reverse_proxy 127.0.0.1:1\n}\n", "invalid hostname");
+    cfg_bad(":abc {\n reverse_proxy 127.0.0.1:1\n}\n", "invalid port");
+    cfg_bad("example.com, :8080 {\n reverse_proxy 127.0.0.1:1\n}\n", "cannot mix http and https");
     cfg_bad(":1 {\n respond 999\n}\n", "invalid number");
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 {\n  header_up -X-A value\n }\n}\n", "takes no value");
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 {\n  header_up X-A\n }\n}\n", "needs a value");
@@ -659,6 +670,143 @@ TEST(test_config)
     cfg_bad(":1 {\n route {\n  {\n   match path /x\n  }\n  to 127.0.0.1:1\n }\n}\n", "unexpected '{'");
     cfg_bad(":1 {\n {\n  to 127.0.0.1:1\n }\n}\n", "unexpected '{'");
     cfg_bad("{\n}\n{\n}\n", "must come first");
+
+    /* site addresses: hostnames, implied https, binds and redirect sites */
+    c = cfg_ok("{\n auto_https off\n}\n"
+               "example.com, www.example.com {\n respond \"a\"\n}\n"
+               "http://api.example.com:8080 {\n respond \"b\"\n}\n"
+               "localhost {\n respond \"c\"\n}\n"
+               "127.0.0.1:9000, [::1]:9000 {\n respond \"d\"\n}\n"
+               "*.wild.example {\n respond \"e\"\n}\n");
+    if (c) {
+        CHECK(c->nservers == 5);
+        server_t *a = c->servers[0];
+        CHECK(a->tls_mode == TLS_INTERNAL && a->nhosts == 2 && a->naddr == 1 && a->port == 443);
+        CHECK_STR(a->addrs[0], ":443");
+        CHECK_STR(a->hosts[1], "www.example.com");
+        server_t *b = c->servers[1];
+        CHECK(b->tls_mode == TLS_NONE && b->port == 8080 && b->nhosts == 1);
+        CHECK_STR(b->addrs[0], ":8080");
+        server_t *lc = c->servers[2];
+        CHECK(lc->tls_mode == TLS_INTERNAL && lc->ssl_ctx != NULL);
+        CHECK_STR(lc->hosts[0], "localhost");
+        server_t *d = c->servers[3];
+        CHECK(d->tls_mode == TLS_NONE && d->nhosts == 0 && d->naddr == 2);
+        CHECK_STR(d->addrs[0], "127.0.0.1:9000");
+        CHECK_STR(d->addrs[1], "[::1]:9000");
+        CHECK_STR(c->servers[4]->hosts[0], "*.wild.example");
+        config_unref(c);
+    }
+    /* with auto https on, an http redirect site is added for https sites */
+    c = cfg_ok("{\n http_port 8080\n https_port 8443\n}\n"
+               "example.com {\n tls internal\n respond \"a\"\n}\n"
+               "other.example {\n tls internal\n respond \"b\"\n}\n"
+               "http://other.example {\n respond \"plain\"\n}\n");
+    if (c) {
+        CHECK(c->http_port == 8080 && c->https_port == 8443);
+        CHECK(c->nservers == 4); /* example.com gets a redirect site; other.example already has http */
+        CHECK_STR(c->servers[0]->addrs[0], ":8443");
+        CHECK(c->servers[0]->port == 8443);
+        server_t *redir = c->servers[3];
+        CHECK(redir->redirect_https && redir->tls_mode == TLS_NONE && redir->port == 8443);
+        CHECK_STR(redir->addrs[0], ":8080");
+        CHECK_STR(redir->hosts[0], "example.com");
+        CHECK_STR(c->servers[2]->addrs[0], ":8080");
+        CHECK(c->servers[2]->tls_mode == TLS_NONE);
+        config_unref(c);
+    }
+    /* tls modes */
+    c = cfg_ok(":1 {\n tls internal\n respond ok\n}\n");
+    if (c) {
+        CHECK(c->servers[0]->tls_mode == TLS_INTERNAL && c->servers[0]->ssl_ctx);
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n tls /no/cert.pem /no/key.pem\n respond ok\n}\n", "cannot load certificate");
+
+    /* env substitution, snippets and imports */
+    setenv("LIMER_TEST_PORT", "7777", 1);
+    setenv("LIMER_TEST_BODY", "from env", 1);
+    c = cfg_ok("(common) {\n  header X-Snippet {args.0}\n}\n"
+               ":{$LIMER_TEST_PORT} {\n import common yes\n respond \"{$LIMER_TEST_BODY}\" {$NOPE_UNSET:201}\n}\n");
+    if (c) {
+        CHECK_STR(c->servers[0]->addrs[0], ":7777");
+        CHECK(c->servers[0]->n_hdr_down == 1);
+        CHECK_STR(c->servers[0]->hdr_down[0].name, "X-Snippet");
+        CHECK_STR(c->servers[0]->hdr_down[0].value, "yes");
+        CHECK_STR(c->servers[0]->routes[0]->resp_body, "from env");
+        CHECK(c->servers[0]->routes[0]->resp_status == 201);
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n import nope.conf\n respond ok\n}\n", "no such file or snippet");
+    {
+        FILE *f = fopen("/tmp/limer-unit-import.conf", "w");
+        if (f) {
+            fputs("respond \"imported\" 202\n", f);
+            fclose(f);
+            c = cfg_ok(":1 {\n import /tmp/limer-unit-import.conf\n}\n");
+            if (c) {
+                CHECK(c->servers[0]->nroutes == 1 && c->servers[0]->routes[0]->resp_status == 202);
+                CHECK_STR(c->servers[0]->routes[0]->resp_body, "imported");
+                config_unref(c);
+            }
+            unlink("/tmp/limer-unit-import.conf");
+        }
+    }
+
+    /* server-level header ops, request headers, basic_auth, log, encode */
+    c = cfg_ok(":1 {\n header X-A a\n header -Server\n header {\n  +X-B b\n  X-C \"c d\"\n }\n"
+               " request_header X-Up up\n basic_auth admin {\n  bob $2b$05$abcdefghijklmnopqrstuuabcdefghijklmnopqrstuvwxyz01234\n }\n"
+               " log {\n  output stderr\n  format json\n }\n encode gzip zstd {\n  minimum_length 100\n }\n respond ok\n}\n");
+    if (c) {
+        server_t *s = c->servers[0];
+        CHECK(s->n_hdr_down == 4 && s->hdr_down[1].kind == 2 && s->hdr_down[2].kind == 1);
+        CHECK_STR(s->hdr_down[3].value, "c d");
+        CHECK(s->n_hdr_up == 1);
+        CHECK(s->auth && s->auth->nusers == 1);
+        CHECK_STR(s->auth->realm, "admin");
+        CHECK(s->access_log && s->log_fd == 2 && s->log_json);
+        CHECK_STR(s->encode, "gzip zstd");
+        CHECK(s->encode_min == 100);
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n basic_auth {\n  bob plaintext\n }\n respond ok\n}\n", "bcrypt hash");
+    cfg_bad(":1 {\n encode lzma\n respond ok\n}\n", "encode supports");
+    cfg_bad(":1 {\n log {\n  format xml\n }\n respond ok\n}\n", "json or common");
+
+    /* route handlers: rewrite, uri, handle_path, error, abort, respond forms, redir forms */
+    c = cfg_ok(":1 {\n"
+               " handle_path /api/* {\n  to 127.0.0.1:1\n }\n"
+               " handle /old/* {\n  uri strip_prefix /old\n  uri replace .php .html\n  rewrite /new{uri}\n  respond ok\n }\n"
+               " route {\n  match path /gone\n  error \"it is gone\" 410\n }\n"
+               " route {\n  match path /drop\n  abort\n }\n"
+               " route {\n  match path /r\n  redir /elsewhere permanent\n }\n"
+               " route {\n  match path /s\n  respond \"body first\" 418\n }\n"
+               " error 503\n}\n");
+    if (c) {
+        server_t *s = c->servers[0];
+        CHECK(s->nroutes == 7);
+        route_t *hp = s->routes[0];
+        CHECK(hp->kind == ROUTE_PROXY && hp->nm == 1 && hp->nrw == 1 && hp->rw[0].kind == RW_STRIP_PREFIX);
+        CHECK_STR(hp->rw[0].a, "/api");
+        CHECK_STR(hp->m[0].vals[0], "/api/*");
+        route_t *h = s->routes[1];
+        CHECK(h->nrw == 3 && h->rw[0].kind == RW_STRIP_PREFIX && h->rw[1].kind == RW_REPLACE && h->rw[2].kind == RW_URI);
+        CHECK_STR(h->rw[1].b, ".html");
+        CHECK(s->routes[2]->kind == ROUTE_ERROR && s->routes[2]->resp_status == 410);
+        CHECK_STR(s->routes[2]->resp_body, "it is gone");
+        CHECK(s->routes[3]->kind == ROUTE_ABORT);
+        CHECK(s->routes[4]->kind == ROUTE_REDIRECT && s->routes[4]->resp_status == 301);
+        CHECK(s->routes[5]->kind == ROUTE_RESPOND && s->routes[5]->resp_status == 418);
+        CHECK_STR(s->routes[5]->resp_body, "body first");
+        CHECK(s->routes[6]->kind == ROUTE_ERROR && s->routes[6]->resp_status == 503 && s->routes[6]->nm == 0);
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n handle_path api/* {\n  respond ok\n }\n}\n", "path pattern like");
+    cfg_bad(":1 {\n route {\n  uri strip_prefix\n  respond ok\n }\n}\n", "expects 2 to 3");
+    cfg_bad(":1 {\n route {\n  uri frobnicate /x\n  respond ok\n }\n}\n", "uri accepts");
+    cfg_bad(":1 {\n route {\n  error oops\n }\n}\n", "needs a status code");
+    cfg_bad(":1 {\n route {\n  to 127.0.0.1:1\n  abort\n }\n}\n", "more than one handler");
+    cfg_bad(":1 {\n route {\n  file_server\n }\n}\n", "needs a 'root'");
 }
 
 /* ------------------------------------------------------------------ */

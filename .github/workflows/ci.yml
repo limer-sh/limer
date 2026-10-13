@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev pkg-config python3 curl valgrind
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev zlib1g-dev libzstd-dev libbrotli-dev pkg-config python3 curl valgrind
       - name: Build
         run: make
       - name: Unit tests
@@ -20,6 +20,8 @@ jobs:
         run: make fuzz FUZZ_ITERS=200000
       - name: Integration tests
         run: make integration
+      - name: Feature tests
+        run: make features
       - name: Security tests
         run: make security
       - name: Build without TLS
@@ -31,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev pkg-config python3 curl
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev zlib1g-dev libzstd-dev libbrotli-dev pkg-config python3 curl
       - name: Sanitized build and suites
         run: make check-asan
         env:

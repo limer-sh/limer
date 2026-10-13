@@ -3,17 +3,21 @@
  *
  * The syntax follows the Caddyfile conventions: whitespace-separated tokens,
  * one directive per line, blocks delimited by '{' at the end of a line and
- * '}' on its own line, '#' comments, and quoted strings.
+ * '}' on its own line, '#' comments, quoted strings, {$ENV} substitution,
+ * snippets "(name) { ... }" and "import <file|snippet>".
  */
 #include "limer.h"
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <glob.h>
+#include <libgen.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 
 /* ------------------------------------------------------------------ */
 /* Tokenizer                                                           */
@@ -49,6 +53,42 @@ static void toks_free(toks_t *t)
     for (int i = 0; i < t->n; i++)
         free(t->v[i].s);
     free(t->v);
+}
+
+/* Replace {$VAR} and {$VAR:default} with environment values. */
+static char *expand_env(const char *in)
+{
+    buf_t b;
+    buf_init(&b);
+    const char *p = in;
+    while (*p) {
+        if (p[0] == '{' && p[1] == '$') {
+            const char *end = strchr(p, '}');
+            if (end) {
+                size_t n = (size_t)(end - p - 2);
+                char name[256];
+                if (n < sizeof name) {
+                    memcpy(name, p + 2, n);
+                    name[n] = 0;
+                    char *def = strchr(name, ':');
+                    if (def)
+                        *def++ = 0;
+                    const char *v = getenv(name);
+                    if (!v)
+                        v = def ? def : "";
+                    buf_puts(&b, v);
+                    p = end + 1;
+                    continue;
+                }
+            }
+        }
+        buf_append(&b, p, 1);
+        p++;
+    }
+    buf_append(&b, "", 1);
+    char *out = xstrdup(b.data);
+    buf_free(&b);
+    return out;
 }
 
 static int tokenize(const char *text, toks_t *t, char *err, size_t errlen)
@@ -151,6 +191,25 @@ static void node_free(node_t *n)
     free(n);
 }
 
+static node_t *node_clone(const node_t *n)
+{
+    node_t *c = xcalloc(1, sizeof *c);
+    c->line = n->line;
+    c->args = xcalloc((size_t)n->nargs + 1, sizeof(char *));
+    for (int i = 0; i < n->nargs; i++)
+        c->args[c->nargs++] = xstrdup(n->args[i]);
+    c->kids = xcalloc((size_t)n->nkids + 1, sizeof(node_t *));
+    for (int i = 0; i < n->nkids; i++)
+        c->kids[c->nkids++] = node_clone(n->kids[i]);
+    return c;
+}
+
+static void node_add_kid(node_t *parent, node_t *kid)
+{
+    parent->kids = xrealloc(parent->kids, sizeof(node_t *) * (size_t)(parent->nkids + 1));
+    parent->kids[parent->nkids++] = kid;
+}
+
 static int is_open(const tok_t *t)  { return !t->quoted && strcmp(t->s, "{") == 0; }
 static int is_close(const tok_t *t) { return !t->quoted && strcmp(t->s, "}") == 0; }
 
@@ -206,12 +265,202 @@ static int parse_block(toks_t *t, int *i, node_t *parent, int nested, char *err,
             node_free(d);
             return -1;
         }
-        parent->kids = xrealloc(parent->kids, sizeof(node_t *) * (size_t)(parent->nkids + 1));
-        parent->kids[parent->nkids++] = d;
+        node_add_kid(parent, d);
     }
     if (nested) {
         snprintf(err, errlen, "unexpected end of file: missing '}'");
         return -1;
+    }
+    return 0;
+}
+
+static node_t *parse_text_to_tree(const char *text, char *err, size_t errlen)
+{
+    toks_t t = { NULL, 0, 0 };
+    if (tokenize(text, &t, err, errlen) < 0) {
+        toks_free(&t);
+        return NULL;
+    }
+    node_t *root = xcalloc(1, sizeof *root);
+    int i = 0;
+    if (parse_block(&t, &i, root, 0, err, errlen) < 0) {
+        node_free(root);
+        toks_free(&t);
+        return NULL;
+    }
+    toks_free(&t);
+    return root;
+}
+
+/* ------------------------------------------------------------------ */
+/* Imports and snippets                                                */
+/* ------------------------------------------------------------------ */
+
+typedef struct snippets {
+    char **names;
+    node_t **bodies;
+    int n;
+} snippets_t;
+
+static char *read_file(const char *path, char *err, size_t errlen)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        snprintf(err, errlen, "cannot open %s: %s", path, strerror(errno));
+        return NULL;
+    }
+    buf_t b;
+    buf_init(&b);
+    char tmp[4096];
+    size_t n;
+    while ((n = fread(tmp, 1, sizeof tmp, f)) > 0)
+        buf_append(&b, tmp, n);
+    fclose(f);
+    buf_append(&b, "", 1);
+    char *text = xstrdup(b.data);
+    buf_free(&b);
+    return text;
+}
+
+/* substitute {args.N} in a cloned snippet */
+static void subst_args(node_t *n, char **args, int nargs)
+{
+    for (int i = 0; i < n->nargs; i++) {
+        const char *a = n->args[i];
+        const char *m = strstr(a, "{args.");
+        if (!m)
+            continue;
+        buf_t b;
+        buf_init(&b);
+        const char *p = a;
+        while (*p) {
+            if (str_has_prefix(p, "{args.")) {
+                char *end;
+                long idx = strtol(p + 6, &end, 10);
+                if (*end == '}' && idx >= 0) {
+                    if (idx < nargs)
+                        buf_puts(&b, args[idx]);
+                    p = end + 1;
+                    continue;
+                }
+            }
+            buf_append(&b, p++, 1);
+        }
+        buf_append(&b, "", 1);
+        free(n->args[i]);
+        n->args[i] = xstrdup(b.data);
+        buf_free(&b);
+    }
+    for (int i = 0; i < n->nkids; i++)
+        subst_args(n->kids[i], args, nargs);
+}
+
+static int expand_imports(node_t *parent, const char *base_dir, snippets_t *sn, int depth, char *err, size_t errlen);
+
+static int import_file(node_t *parent, int *pos, const char *path, const char *base_dir, snippets_t *sn, int depth, char *err, size_t errlen)
+{
+    char *text = read_file(path, err, errlen);
+    if (!text)
+        return -1;
+    char *expanded = expand_env(text);
+    free(text);
+    char ierr[512];
+    node_t *tree = parse_text_to_tree(expanded, ierr, sizeof ierr);
+    free(expanded);
+    if (!tree) {
+        snprintf(err, errlen, "%s: %s", path, ierr);
+        return -1;
+    }
+    char *dup = xstrdup(path);
+    const char *dir = dirname(dup);
+    int rc = expand_imports(tree, dir, sn, depth + 1, err, errlen);
+    free(dup);
+    if (rc < 0) {
+        node_free(tree);
+        return -1;
+    }
+    /* splice tree->kids into parent at *pos */
+    int k = tree->nkids;
+    parent->kids = xrealloc(parent->kids, sizeof(node_t *) * (size_t)(parent->nkids + k));
+    memmove(parent->kids + *pos + k, parent->kids + *pos, sizeof(node_t *) * (size_t)(parent->nkids - *pos));
+    for (int i = 0; i < k; i++)
+        parent->kids[*pos + i] = tree->kids[i];
+    parent->nkids += k;
+    *pos += k;
+    tree->nkids = 0;
+    node_free(tree);
+    return 0;
+}
+
+static int expand_imports(node_t *parent, const char *base_dir, snippets_t *sn, int depth, char *err, size_t errlen)
+{
+    if (depth > 10) {
+        snprintf(err, errlen, "import nesting too deep");
+        return -1;
+    }
+    for (int i = 0; i < parent->nkids;) {
+        node_t *d = parent->kids[i];
+        if (d->nargs == 0 || strcmp(d->args[0], "import") != 0) {
+            if (expand_imports(d, base_dir, sn, depth, err, errlen) < 0)
+                return -1;
+            i++;
+            continue;
+        }
+        if (d->nargs < 2) {
+            snprintf(err, errlen, "line %d: import needs a file or snippet name", d->line);
+            return -1;
+        }
+        const char *what = d->args[1];
+        /* remove the import node */
+        memmove(parent->kids + i, parent->kids + i + 1, sizeof(node_t *) * (size_t)(parent->nkids - i - 1));
+        parent->nkids--;
+        int snip = -1;
+        for (int k = 0; k < sn->n; k++)
+            if (strcmp(sn->names[k], what) == 0)
+                snip = k;
+        if (snip >= 0) {
+            node_t *body = node_clone(sn->bodies[snip]);
+            subst_args(body, d->args + 2, d->nargs - 2);
+            int k = body->nkids;
+            parent->kids = xrealloc(parent->kids, sizeof(node_t *) * (size_t)(parent->nkids + k));
+            memmove(parent->kids + i + k, parent->kids + i, sizeof(node_t *) * (size_t)(parent->nkids - i));
+            for (int j = 0; j < k; j++)
+                parent->kids[i + j] = body->kids[j];
+            parent->nkids += k;
+            body->nkids = 0;
+            node_free(body);
+            /* expanded snippet may itself contain imports */
+            node_free(d);
+            continue;
+        }
+        char pattern[4096];
+        if (what[0] == '/')
+            snprintf(pattern, sizeof pattern, "%s", what);
+        else
+            snprintf(pattern, sizeof pattern, "%s/%s", base_dir, what);
+        glob_t g;
+        memset(&g, 0, sizeof g);
+        int rc = glob(pattern, 0, NULL, &g);
+        if (rc != 0 || g.gl_pathc == 0) {
+            globfree(&g);
+            if (strpbrk(what, "*?[")) {
+                node_free(d);
+                continue; /* a glob matching nothing imports nothing */
+            }
+            snprintf(err, errlen, "line %d: import: no such file or snippet '%s'", d->line, what);
+            node_free(d);
+            return -1;
+        }
+        int pos = i;
+        for (size_t f = 0; f < g.gl_pathc; f++) {
+            if (import_file(parent, &pos, g.gl_pathv[f], base_dir, sn, depth, err, errlen) < 0) {
+                globfree(&g);
+                node_free(d);
+                return -1;
+            }
+        }
+        globfree(&g);
+        node_free(d);
     }
     return 0;
 }
@@ -331,6 +580,33 @@ static void hdr_ops_free(hdr_op_t *ops, int n)
     free(ops);
 }
 
+static void auth_free(basic_auth_t *a)
+{
+    if (!a)
+        return;
+    for (int i = 0; i < a->nusers; i++) {
+        free(a->users[i].name);
+        free(a->users[i].hash);
+    }
+    free(a->users);
+    free(a->realm);
+    free(a);
+}
+
+static void files_free(file_server_t *f)
+{
+    if (!f)
+        return;
+    free(f->root);
+    for (int i = 0; i < f->nindex; i++)
+        free(f->index[i]);
+    free(f->index);
+    for (int i = 0; i < f->ntry; i++)
+        free(f->try_files[i]);
+    free(f->try_files);
+    free(f);
+}
+
 static void pool_free(pool_t *p)
 {
     if (!p)
@@ -361,6 +637,13 @@ static void route_free(route_t *r)
     pool_free(r->pool);
     free(r->resp_body);
     hdr_ops_free(r->hdr_down, r->n_hdr_down);
+    for (int i = 0; i < r->nrw; i++) {
+        free(r->rw[i].a);
+        free(r->rw[i].b);
+    }
+    free(r->rw);
+    auth_free(r->auth);
+    files_free(r->files);
     free(r);
 }
 
@@ -371,11 +654,20 @@ static void server_free(server_t *s)
     for (int i = 0; i < s->naddr; i++)
         free(s->addrs[i]);
     free(s->addrs);
+    for (int i = 0; i < s->nhosts; i++)
+        free(s->hosts[i]);
+    free(s->hosts);
     for (int i = 0; i < s->nroutes; i++)
         route_free(s->routes[i]);
     free(s->routes);
     free(s->tls_cert);
     free(s->tls_key);
+    hdr_ops_free(s->hdr_down, s->n_hdr_down);
+    hdr_ops_free(s->hdr_up, s->n_hdr_up);
+    auth_free(s->auth);
+    free(s->encode);
+    if (s->log_fd > 2)
+        close(s->log_fd);
     tls_free_server(s);
     free(s);
 }
@@ -391,6 +683,10 @@ static void config_free(config_t *c)
     free(c->text);
     free(c->admin_addr);
     free(c->pidfile);
+    free(c->storage);
+    free(c->acme_ca);
+    free(c->acme_ca_root);
+    free(c->acme_email);
     free(c);
 }
 
@@ -408,7 +704,7 @@ void config_unref(config_t *c)
 }
 
 /* ------------------------------------------------------------------ */
-/* Interpretation                                                      */
+/* Upstreams and pools                                                 */
 /* ------------------------------------------------------------------ */
 
 static int resolve_upstream(upstream_t *u, int line, char *err, size_t errlen)
@@ -426,7 +722,6 @@ static int resolve_upstream(upstream_t *u, int line, char *err, size_t errlen)
             freeaddrinfo(res);
         FAIL("line %d: cannot resolve upstream '%s': %s", line, u->hostport, rc ? gai_strerror(rc) : "no address");
     }
-    /* prefer IPv4 for predictability when both exist */
     struct addrinfo *pick = res;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next)
         if (ai->ai_family == AF_INET) {
@@ -493,32 +788,60 @@ static int pool_add_upstream_list(pool_t *p, node_t *d, int from, char *err, siz
     return 0;
 }
 
-static int add_hdr_op(hdr_op_t **ops, int *n, node_t *d, char *err, size_t errlen)
+/* header_up / header / request_header: [+|-]Name [value], or a block of them */
+static int add_hdr_op_args(hdr_op_t **ops, int *n, node_t *d, int from, char *err, size_t errlen)
 {
-    /* header_up [+|-]Name [value] */
-    if (want_args(d, 1, 2, err, errlen) < 0)
-        return -1;
-    const char *name = d->args[1];
+    if (d->nargs <= from)
+        FAIL("line %d: '%s' needs a header name", d->line, d->args[0]);
+    const char *name = d->args[from];
     hdr_op_t op = { 0, NULL, NULL };
     if (name[0] == '-') {
         op.kind = 2;
         name++;
-        if (d->nargs > 2)
+        if (d->nargs > from + 1)
             FAIL("line %d: '%s -%s' takes no value", d->line, d->args[0], name);
     } else {
         if (name[0] == '+') {
             op.kind = 1;
             name++;
         }
-        if (d->nargs < 3)
-            FAIL("line %d: '%s %s' needs a value", d->line, d->args[0], d->args[1]);
-        op.value = xstrdup(d->args[2]);
+        if (d->nargs < from + 2)
+            FAIL("line %d: '%s %s' needs a value", d->line, d->args[0], d->args[from]);
+        if (d->nargs > from + 2)
+            FAIL("line %d: '%s': too many arguments (quote values with spaces)", d->line, d->args[0]);
+        op.value = xstrdup(d->args[from + 1]);
     }
     if (!*name)
         FAIL("line %d: '%s': empty header name", d->line, d->args[0]);
     op.name = xstrdup(name);
     *ops = xrealloc(*ops, sizeof(hdr_op_t) * (size_t)(*n + 1));
     (*ops)[(*n)++] = op;
+    return 0;
+}
+
+static int add_hdr_ops(hdr_op_t **ops, int *n, node_t *d, char *err, size_t errlen)
+{
+    if (d->nargs > 1) {
+        if (add_hdr_op_args(ops, n, d, 1, err, errlen) < 0)
+            return -1;
+    }
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *k = d->kids[i];
+        /* inside a block each line is "[+|-]Name [value]" */
+        node_t tmp = *k;
+        char *args[4];
+        args[0] = d->args[0];
+        int na = 1;
+        for (int a = 0; a < k->nargs && na < 4; a++)
+            args[na++] = k->args[a];
+        tmp.args = args;
+        tmp.nargs = na;
+        tmp.nkids = 0;
+        if (add_hdr_op_args(ops, n, &tmp, 1, err, errlen) < 0)
+            return -1;
+    }
+    if (d->nargs == 1 && d->nkids == 0)
+        FAIL("line %d: '%s' needs a header name or a block", d->line, d->args[0]);
     return 0;
 }
 
@@ -566,95 +889,6 @@ static int parse_lb_policy(pool_t *p, node_t *d, char *err, size_t errlen)
     }
     if (p->policy != LB_HASH && d->nargs > 2)
         FAIL("line %d: 'lb_policy %s' takes no arguments", d->line, pol);
-    return 0;
-}
-
-static int parse_match(route_t *r, node_t *d, char *err, size_t errlen)
-{
-    /* match [not] <source> [name] [op] [values...] */
-    int ai = 1;
-    matcher_t m;
-    memset(&m, 0, sizeof m);
-    if (ai < d->nargs && strcaseeq(d->args[ai], "not")) {
-        m.negate = 1;
-        ai++;
-    }
-    if (ai >= d->nargs)
-        FAIL("line %d: 'match' needs a source (method, path, host, header, query, cookie, json, form, body, remote_ip)", d->line);
-    int named;
-    if (parse_keysrc(d->args[ai], &m.key.src, &named) < 0)
-        FAIL("line %d: unknown match source '%s'", d->line, d->args[ai]);
-    ai++;
-    if (named) {
-        if (ai >= d->nargs)
-            FAIL("line %d: 'match %s' needs a name", d->line, d->args[ai - 1]);
-        m.key.name = xstrdup(d->args[ai++]);
-    }
-    m.op = OP_EQ;
-    if (ai < d->nargs && parse_op(d->args[ai], &m.op) == 0)
-        ai++;
-    int nvals = d->nargs - ai;
-    if (m.op == OP_EXISTS || m.op == OP_MISSING) {
-        if (nvals)
-            FAIL("line %d: 'match ... %s' takes no values", d->line, d->args[ai - 1]);
-    } else if (nvals == 0) {
-        if (m.op == OP_EQ) {
-            m.op = OP_EXISTS;
-        } else {
-            free(m.key.name);
-            FAIL("line %d: 'match' needs at least one value", d->line);
-        }
-    }
-    m.vals = xcalloc((size_t)nvals + 1, sizeof(char *));
-    for (int i = 0; i < nvals; i++)
-        m.vals[m.nvals++] = xstrdup(d->args[ai + i]);
-    if (m.op == OP_RE || m.op == OP_NRE) {
-        m.re = xcalloc((size_t)nvals + 1, sizeof(regex_t));
-        for (int i = 0; i < nvals; i++) {
-            int rc = regcomp(&m.re[i], m.vals[i], REG_EXTENDED | REG_NOSUB);
-            if (rc) {
-                char rb[128];
-                regerror(rc, &m.re[i], rb, sizeof rb);
-                snprintf(err, errlen, "line %d: bad regex '%s': %s", d->line, m.vals[i], rb);
-                /* free compiled ones so far */
-                for (int k = 0; k < i; k++)
-                    regfree(&m.re[k]);
-                free(m.re);
-                m.re = NULL;
-                for (int k = 0; k < m.nvals; k++)
-                    free(m.vals[k]);
-                free(m.vals);
-                free(m.key.name);
-                return -1;
-            }
-        }
-    }
-    if (m.op == OP_GT || m.op == OP_LT || m.op == OP_GE || m.op == OP_LE) {
-        m.nums = xcalloc((size_t)nvals + 1, sizeof(double));
-        for (int i = 0; i < nvals; i++)
-            if (!is_numeric(m.vals[i], &m.nums[i])) {
-                snprintf(err, errlen, "line %d: '%s' is not a number", d->line, m.vals[i]);
-                matcher_free(&m);
-                return -1;
-            }
-    }
-    if (m.key.src == KS_CLIENT_IP && (m.op == OP_EQ || m.op == OP_NE)) {
-        for (int i = 0; i < nvals; i++) {
-            char tmp[80];
-            snprintf(tmp, sizeof tmp, "%s", m.vals[i]);
-            char *sl = strchr(tmp, '/');
-            if (sl)
-                *sl = 0;
-            unsigned char b[16];
-            if (inet_pton(strchr(tmp, ':') ? AF_INET6 : AF_INET, tmp, b) != 1) {
-                snprintf(err, errlen, "line %d: invalid IP or CIDR '%s'", d->line, m.vals[i]);
-                matcher_free(&m);
-                return -1;
-            }
-        }
-    }
-    r->m = xrealloc(r->m, sizeof(matcher_t) * (size_t)(r->nm + 1));
-    r->m[r->nm++] = m;
     return 0;
 }
 
@@ -745,18 +979,32 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
     } else if (strcaseeq(k, "keepalive_timeout") || strcaseeq(k, "keepalive")) {
         if (want_args(d, 1, 1, err, errlen) < 0)
             return -1;
-        if (strcaseeq(d->args[1], "off")) {
+        if (strcaseeq(d->args[1], "off"))
             p->keepalive_idle = 0;
-        } else if (arg_duration(d, 1, &p->keepalive_timeout, err, errlen) < 0) {
+        else if (arg_duration(d, 1, &p->keepalive_timeout, err, errlen) < 0)
             return -1;
-        }
-    } else if (strcaseeq(k, "header_up")) {
-        return add_hdr_op(&p->hdr_up, &p->n_hdr_up, d, err, errlen);
+    } else if (strcaseeq(k, "header_up") || strcaseeq(k, "request_header")) {
+        return add_hdr_ops(&p->hdr_up, &p->n_hdr_up, d, err, errlen);
     } else if (strcaseeq(k, "header_down")) {
-        return add_hdr_op(&p->hdr_down, &p->n_hdr_down, d, err, errlen);
+        return add_hdr_ops(&p->hdr_down, &p->n_hdr_down, d, err, errlen);
     } else if (strcaseeq(k, "preserve_host")) {
         if (want_args(d, 1, 1, err, errlen) < 0 || arg_bool(d, 1, &p->preserve_host, err, errlen) < 0)
             return -1;
+    } else if (strcaseeq(k, "transport")) {
+        /* Caddy compatibility: transport http { keepalive_idle_conns N ... } */
+        for (int i = 0; i < d->nkids; i++) {
+            int h = 0;
+            node_t *c = d->kids[i];
+            if (strcaseeq(c->args[0], "keepalive_idle_conns_per_host") || strcaseeq(c->args[0], "keepalive_idle_conns")) {
+                if (want_args(c, 1, 1, err, errlen) < 0 || arg_int(c, 1, &p->keepalive_idle, 0, 100000, err, errlen) < 0)
+                    return -1;
+                continue;
+            }
+            if (parse_pool_directive(p, c, &h, err, errlen) < 0)
+                return -1;
+            if (!h)
+                FAIL("line %d: unknown transport option '%s'", c->line, c->args[0]);
+        }
     } else {
         *handled = 0;
     }
@@ -777,135 +1025,522 @@ static int pool_finalize(pool_t *p, int line, char *err, size_t errlen)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Matchers and route-level directives                                 */
+/* ------------------------------------------------------------------ */
+
+static int parse_match(route_t *r, node_t *d, char *err, size_t errlen)
+{
+    /* match [not] <source> [name] [op] [values...] */
+    int ai = 1;
+    matcher_t m;
+    memset(&m, 0, sizeof m);
+    if (ai < d->nargs && strcaseeq(d->args[ai], "not")) {
+        m.negate = 1;
+        ai++;
+    }
+    if (ai >= d->nargs)
+        FAIL("line %d: 'match' needs a source (method, path, host, header, query, cookie, json, form, body, remote_ip)", d->line);
+    int named;
+    if (parse_keysrc(d->args[ai], &m.key.src, &named) < 0)
+        FAIL("line %d: unknown match source '%s'", d->line, d->args[ai]);
+    ai++;
+    if (named) {
+        if (ai >= d->nargs)
+            FAIL("line %d: 'match %s' needs a name", d->line, d->args[ai - 1]);
+        m.key.name = xstrdup(d->args[ai++]);
+    }
+    m.op = OP_EQ;
+    if (ai < d->nargs && parse_op(d->args[ai], &m.op) == 0)
+        ai++;
+    int nvals = d->nargs - ai;
+    if (m.op == OP_EXISTS || m.op == OP_MISSING) {
+        if (nvals) {
+            free(m.key.name);
+            FAIL("line %d: 'match ... %s' takes no values", d->line, d->args[ai - 1]);
+        }
+    } else if (nvals == 0) {
+        if (m.op == OP_EQ) {
+            m.op = OP_EXISTS;
+        } else {
+            free(m.key.name);
+            FAIL("line %d: 'match' needs at least one value", d->line);
+        }
+    }
+    m.vals = xcalloc((size_t)nvals + 1, sizeof(char *));
+    for (int i = 0; i < nvals; i++)
+        m.vals[m.nvals++] = xstrdup(d->args[ai + i]);
+    if (m.op == OP_RE || m.op == OP_NRE) {
+        m.re = xcalloc((size_t)nvals + 1, sizeof(regex_t));
+        for (int i = 0; i < nvals; i++) {
+            int rc = regcomp(&m.re[i], m.vals[i], REG_EXTENDED | REG_NOSUB);
+            if (rc) {
+                char rb[128];
+                regerror(rc, &m.re[i], rb, sizeof rb);
+                snprintf(err, errlen, "line %d: bad regex '%s': %s", d->line, m.vals[i], rb);
+                for (int k = 0; k < i; k++)
+                    regfree(&m.re[k]);
+                free(m.re);
+                m.re = NULL;
+                for (int k = 0; k < m.nvals; k++)
+                    free(m.vals[k]);
+                free(m.vals);
+                free(m.key.name);
+                return -1;
+            }
+        }
+    }
+    if (m.op == OP_GT || m.op == OP_LT || m.op == OP_GE || m.op == OP_LE) {
+        m.nums = xcalloc((size_t)nvals + 1, sizeof(double));
+        for (int i = 0; i < nvals; i++)
+            if (!is_numeric(m.vals[i], &m.nums[i])) {
+                snprintf(err, errlen, "line %d: '%s' is not a number", d->line, m.vals[i]);
+                matcher_free(&m);
+                return -1;
+            }
+    }
+    if (m.key.src == KS_CLIENT_IP && (m.op == OP_EQ || m.op == OP_NE)) {
+        for (int i = 0; i < nvals; i++) {
+            char tmp[80];
+            snprintf(tmp, sizeof tmp, "%s", m.vals[i]);
+            char *sl = strchr(tmp, '/');
+            if (sl)
+                *sl = 0;
+            unsigned char b[16];
+            if (inet_pton(strchr(tmp, ':') ? AF_INET6 : AF_INET, tmp, b) != 1) {
+                snprintf(err, errlen, "line %d: invalid IP or CIDR '%s'", d->line, m.vals[i]);
+                matcher_free(&m);
+                return -1;
+            }
+        }
+    }
+    r->m = xrealloc(r->m, sizeof(matcher_t) * (size_t)(r->nm + 1));
+    r->m[r->nm++] = m;
+    return 0;
+}
+
+static void route_add_path_match(route_t *r, const char *pattern)
+{
+    matcher_t m;
+    memset(&m, 0, sizeof m);
+    m.key.src = KS_PATH;
+    m.op = OP_EQ;
+    m.vals = xcalloc(2, sizeof(char *));
+    m.vals[0] = xstrdup(pattern);
+    m.nvals = 1;
+    r->m = xrealloc(r->m, sizeof(matcher_t) * (size_t)(r->nm + 1));
+    r->m[r->nm++] = m;
+}
+
+static void route_add_rewrite(route_t *r, int kind, const char *a, const char *b)
+{
+    r->rw = xrealloc(r->rw, sizeof(rewrite_t) * (size_t)(r->nrw + 1));
+    r->rw[r->nrw].kind = kind;
+    r->rw[r->nrw].a = xstrdup(a);
+    r->rw[r->nrw].b = b ? xstrdup(b) : NULL;
+    r->nrw++;
+}
+
+static int parse_basic_auth(basic_auth_t **out, node_t *d, char *err, size_t errlen)
+{
+    /* basic_auth [bcrypt] [realm] { user hash ... } */
+    basic_auth_t *a = xcalloc(1, sizeof *a);
+    int ai = 1;
+    if (ai < d->nargs && strcaseeq(d->args[ai], "bcrypt"))
+        ai++;
+    if (ai < d->nargs)
+        a->realm = xstrdup(d->args[ai++]);
+    if (ai < d->nargs) {
+        auth_free(a);
+        FAIL("line %d: basic_auth accepts [bcrypt] [realm] followed by a block of 'user hash' lines", d->line);
+    }
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *k = d->kids[i];
+        if (k->nargs != 2) {
+            auth_free(a);
+            FAIL("line %d: basic_auth entries are '<user> <hash>'", k->line);
+        }
+        if (!str_has_prefix(k->args[1], "$2") && !str_has_prefix(k->args[1], "$6$") && !str_has_prefix(k->args[1], "$5$")) {
+            auth_free(a);
+            FAIL("line %d: basic_auth: password for '%s' must be a bcrypt hash (e.g. from `htpasswd -nbB user pass`)", k->line, k->args[0]);
+        }
+        a->users = xrealloc(a->users, sizeof(auth_user_t) * (size_t)(a->nusers + 1));
+        a->users[a->nusers].name = xstrdup(k->args[0]);
+        a->users[a->nusers].hash = xstrdup(k->args[1]);
+        a->nusers++;
+    }
+    if (a->nusers == 0) {
+        auth_free(a);
+        FAIL("line %d: basic_auth has no users", d->line);
+    }
+    if (!a->realm)
+        a->realm = xstrdup("restricted");
+    auth_free(*out);
+    *out = a;
+    return 0;
+}
+
 static int parse_respond(route_t *r, node_t *d, char *err, size_t errlen)
 {
-    /* respond [status] [body] */
+    /* respond [status] | [body] | [body status] | [status body] */
     r->kind = ROUTE_RESPOND;
     r->resp_status = 200;
     int ai = 1;
+    int have_status = 0;
     if (ai < d->nargs && is_numeric(d->args[ai], NULL)) {
         if (arg_int(d, ai, &r->resp_status, 100, 599, err, errlen) < 0)
             return -1;
+        have_status = 1;
         ai++;
     }
     if (ai < d->nargs) {
         free(r->resp_body);
         r->resp_body = xstrdup(d->args[ai++]);
     }
+    if (ai < d->nargs && !have_status && is_numeric(d->args[ai], NULL)) {
+        if (arg_int(d, ai, &r->resp_status, 100, 599, err, errlen) < 0)
+            return -1;
+        ai++;
+    }
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *k = d->kids[i];
+        if (strcaseeq(k->args[0], "body") && k->nargs == 2) {
+            free(r->resp_body);
+            r->resp_body = xstrdup(k->args[1]);
+        } else if (strcaseeq(k->args[0], "close")) {
+            ; /* accepted for compatibility */
+        } else {
+            FAIL("line %d: unknown respond option '%s'", k->line, k->args[0]);
+        }
+    }
     if (ai < d->nargs)
-        FAIL("line %d: 'respond' accepts [status] [body]", d->line);
+        FAIL("line %d: 'respond' accepts [status] [body] or [body] [status]", d->line);
     return 0;
 }
 
 static int parse_redirect(route_t *r, node_t *d, char *err, size_t errlen)
 {
-    /* redir <location> [code] */
+    /* redir <location> [code|permanent|temporary] */
     if (want_args(d, 1, 2, err, errlen) < 0)
         return -1;
     r->kind = ROUTE_REDIRECT;
     r->resp_status = 302;
     free(r->resp_body);
     r->resp_body = xstrdup(d->args[1]);
-    if (d->nargs > 2 && arg_int(d, 2, &r->resp_status, 300, 399, err, errlen) < 0)
-        return -1;
+    if (d->nargs > 2) {
+        if (strcaseeq(d->args[2], "permanent"))
+            r->resp_status = 301;
+        else if (strcaseeq(d->args[2], "temporary"))
+            r->resp_status = 302;
+        else if (arg_int(d, 2, &r->resp_status, 300, 399, err, errlen) < 0)
+            return -1;
+    }
     return 0;
 }
 
-static int parse_route(server_t *s, node_t *d, char *err, size_t errlen)
+static int parse_error(route_t *r, node_t *d, char *err, size_t errlen)
 {
-    route_t *r = xcalloc(1, sizeof *r);
-    char name[64];
-    if (d->nargs > 2) {
-        free(r);
-        FAIL("line %d: 'route [name] {' takes at most one argument", d->line);
+    /* error [message] <status> | error <status> [message] */
+    r->kind = ROUTE_ERROR;
+    r->resp_status = 500;
+    int ai = 1;
+    int have = 0;
+    if (ai < d->nargs && is_numeric(d->args[ai], NULL)) {
+        if (arg_int(d, ai, &r->resp_status, 400, 599, err, errlen) < 0)
+            return -1;
+        have = 1;
+        ai++;
     }
-    if (d->nargs == 2)
-        snprintf(name, sizeof name, "%s", d->args[1]);
-    else
-        snprintf(name, sizeof name, "route%d", s->nroutes + 1);
-    r->name = xstrdup(name);
-    r->kind = -1;
-    pool_t *p = pool_new(name);
+    if (ai < d->nargs && (!is_numeric(d->args[ai], NULL) || have)) {
+        free(r->resp_body);
+        r->resp_body = xstrdup(d->args[ai++]);
+    }
+    if (ai < d->nargs && !have && is_numeric(d->args[ai], NULL)) {
+        if (arg_int(d, ai, &r->resp_status, 400, 599, err, errlen) < 0)
+            return -1;
+        have = 1;
+        ai++;
+    }
+    if (!have)
+        FAIL("line %d: 'error' needs a status code (400-599)", d->line);
+    if (ai < d->nargs)
+        FAIL("line %d: 'error' accepts [message] <status>", d->line);
+    return 0;
+}
+
+static file_server_t *files_new(void)
+{
+    file_server_t *f = xcalloc(1, sizeof *f);
+    f->index = xcalloc(2, sizeof(char *));
+    f->index[0] = xstrdup("index.html");
+    f->nindex = 1;
+    f->hide_dotfiles = 1;
+    return f;
+}
+
+static int parse_file_server(file_server_t *f, node_t *d, char *err, size_t errlen)
+{
+    /* file_server [browse] { root DIR; index a b; browse; hide .git; } */
+    for (int i = 1; i < d->nargs; i++) {
+        if (strcaseeq(d->args[i], "browse"))
+            f->browse = 1;
+        else
+            FAIL("line %d: file_server accepts only 'browse' inline", d->line);
+    }
     for (int i = 0; i < d->nkids; i++) {
-        node_t *c = d->kids[i];
-        const char *k = c->args[0];
-        int handled = 0;
-        if (strcaseeq(k, "match")) {
-            if (parse_match(r, c, err, errlen) < 0)
-                goto fail;
-        } else if (strcaseeq(k, "respond")) {
-            if (r->kind >= 0 && r->kind != ROUTE_RESPOND) {
-                snprintf(err, errlen, "line %d: route has more than one handler", c->line);
-                goto fail;
-            }
-            if (parse_respond(r, c, err, errlen) < 0)
-                goto fail;
-        } else if (strcaseeq(k, "redir") || strcaseeq(k, "redirect")) {
-            if (r->kind >= 0) {
-                snprintf(err, errlen, "line %d: route has more than one handler", c->line);
-                goto fail;
-            }
-            if (parse_redirect(r, c, err, errlen) < 0)
-                goto fail;
-        } else if (strcaseeq(k, "reverse_proxy")) {
-            /* inline upstream list and nested options */
-            if (pool_add_upstream_list(p, c, 1, err, errlen) < 0)
-                goto fail;
-            for (int j = 0; j < c->nkids; j++) {
-                int h2 = 0;
-                if (parse_pool_directive(p, c->kids[j], &h2, err, errlen) < 0)
-                    goto fail;
-                if (!h2) {
-                    snprintf(err, errlen, "line %d: unknown reverse_proxy option '%s'", c->kids[j]->line, c->kids[j]->args[0]);
-                    goto fail;
-                }
-            }
-            r->kind = ROUTE_PROXY;
+        node_t *k = d->kids[i];
+        const char *n = k->args[0];
+        if (strcaseeq(n, "root")) {
+            if (want_args(k, 1, 1, err, errlen) < 0)
+                return -1;
+            free(f->root);
+            f->root = xstrdup(k->args[1]);
+        } else if (strcaseeq(n, "index")) {
+            if (want_args(k, 1, -1, err, errlen) < 0)
+                return -1;
+            for (int j = 0; j < f->nindex; j++)
+                free(f->index[j]);
+            free(f->index);
+            f->index = xcalloc((size_t)k->nargs, sizeof(char *));
+            f->nindex = 0;
+            for (int j = 1; j < k->nargs; j++)
+                f->index[f->nindex++] = xstrdup(k->args[j]);
+        } else if (strcaseeq(n, "browse")) {
+            f->browse = 1;
+        } else if (strcaseeq(n, "hide")) {
+            ; /* dotfiles are always hidden */
         } else {
-            if (parse_pool_directive(p, c, &handled, err, errlen) < 0)
-                goto fail;
-            if (!handled) {
-                snprintf(err, errlen, "line %d: unknown directive '%s' in route", c->line, k);
-                goto fail;
-            }
-            if (strcaseeq(k, "to") || strcaseeq(k, "upstream") || strcaseeq(k, "upstreams")) {
-                if (r->kind >= 0 && r->kind != ROUTE_PROXY) {
-                    snprintf(err, errlen, "line %d: route has more than one handler", c->line);
-                    goto fail;
-                }
-                r->kind = ROUTE_PROXY;
-            }
+            FAIL("line %d: unknown file_server option '%s'", k->line, n);
         }
     }
+    return 0;
+}
+
+/* Route-level directives shared by route/handle blocks. Returns 1 handled, 0 not, -1 error. */
+static int parse_route_directive(route_t *r, pool_t *p, node_t *c, char **root_hint, char *err, size_t errlen)
+{
+    const char *k = c->args[0];
+    if (strcaseeq(k, "match")) {
+        return parse_match(r, c, err, errlen) < 0 ? -1 : 1;
+    }
+    if (strcaseeq(k, "respond")) {
+        if (r->kind >= 0 && r->kind != ROUTE_RESPOND)
+            FAIL("line %d: route has more than one handler", c->line);
+        return parse_respond(r, c, err, errlen) < 0 ? -1 : 1;
+    }
+    if (strcaseeq(k, "redir") || strcaseeq(k, "redirect")) {
+        if (r->kind >= 0)
+            FAIL("line %d: route has more than one handler", c->line);
+        return parse_redirect(r, c, err, errlen) < 0 ? -1 : 1;
+    }
+    if (strcaseeq(k, "error")) {
+        if (r->kind >= 0)
+            FAIL("line %d: route has more than one handler", c->line);
+        return parse_error(r, c, err, errlen) < 0 ? -1 : 1;
+    }
+    if (strcaseeq(k, "abort")) {
+        if (r->kind >= 0)
+            FAIL("line %d: route has more than one handler", c->line);
+        r->kind = ROUTE_ABORT;
+        return 1;
+    }
+    if (strcaseeq(k, "file_server")) {
+        if (r->kind >= 0)
+            FAIL("line %d: route has more than one handler", c->line);
+        r->kind = ROUTE_FILES;
+        if (!r->files)
+            r->files = files_new();
+        return parse_file_server(r->files, c, err, errlen) < 0 ? -1 : 1;
+    }
+    if (strcaseeq(k, "root")) {
+        if (want_args(c, 1, 1, err, errlen) < 0)
+            return -1;
+        free(*root_hint);
+        *root_hint = xstrdup(c->args[1]);
+        return 1;
+    }
+    if (strcaseeq(k, "try_files")) {
+        if (want_args(c, 1, -1, err, errlen) < 0)
+            return -1;
+        if (!r->files)
+            r->files = files_new();
+        for (int i = 1; i < c->nargs; i++) {
+            r->files->try_files = xrealloc(r->files->try_files, sizeof(char *) * (size_t)(r->files->ntry + 1));
+            r->files->try_files[r->files->ntry++] = xstrdup(c->args[i]);
+        }
+        return 1;
+    }
+    if (strcaseeq(k, "reverse_proxy")) {
+        if (pool_add_upstream_list(p, c, 1, err, errlen) < 0)
+            return -1;
+        for (int j = 0; j < c->nkids; j++) {
+            int h2 = 0;
+            if (parse_pool_directive(p, c->kids[j], &h2, err, errlen) < 0)
+                return -1;
+            if (!h2)
+                FAIL("line %d: unknown reverse_proxy option '%s'", c->kids[j]->line, c->kids[j]->args[0]);
+        }
+        if (r->kind >= 0 && r->kind != ROUTE_PROXY)
+            FAIL("line %d: route has more than one handler", c->line);
+        r->kind = ROUTE_PROXY;
+        return 1;
+    }
+    if (strcaseeq(k, "rewrite")) {
+        if (want_args(c, 1, 1, err, errlen) < 0)
+            return -1;
+        route_add_rewrite(r, RW_URI, c->args[1], NULL);
+        return 1;
+    }
+    if (strcaseeq(k, "uri")) {
+        if (want_args(c, 2, 3, err, errlen) < 0)
+            return -1;
+        const char *what = c->args[1];
+        if (strcaseeq(what, "strip_prefix") && c->nargs == 3)
+            route_add_rewrite(r, RW_STRIP_PREFIX, c->args[2], NULL);
+        else if (strcaseeq(what, "strip_suffix") && c->nargs == 3)
+            route_add_rewrite(r, RW_STRIP_SUFFIX, c->args[2], NULL);
+        else if (strcaseeq(what, "replace") && c->nargs == 4)
+            route_add_rewrite(r, RW_REPLACE, c->args[2], c->args[3]);
+        else
+            FAIL("line %d: uri accepts 'strip_prefix <p>', 'strip_suffix <s>' or 'replace <find> <replacement>'", c->line);
+        return 1;
+    }
+    if (strcaseeq(k, "basic_auth") || strcaseeq(k, "basicauth")) {
+        return parse_basic_auth(&r->auth, c, err, errlen) < 0 ? -1 : 1;
+    }
+    if (strcaseeq(k, "header") || strcaseeq(k, "header_down")) {
+        return add_hdr_ops(&p->hdr_down, &p->n_hdr_down, c, err, errlen) < 0 ? -1 : 1;
+    }
+    int handled = 0;
+    if (parse_pool_directive(p, c, &handled, err, errlen) < 0)
+        return -1;
+    if (handled) {
+        if (strcaseeq(k, "to") || strcaseeq(k, "upstream") || strcaseeq(k, "upstreams")) {
+            if (r->kind >= 0 && r->kind != ROUTE_PROXY)
+                FAIL("line %d: route has more than one handler", c->line);
+            r->kind = ROUTE_PROXY;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* Finish a route after its directives were parsed. Takes ownership of p and root_hint. */
+static int route_finish(server_t *s, route_t *r, pool_t *p, char *root_hint, const char *server_root, int line, char *err, size_t errlen)
+{
     if (r->kind < 0) {
-        snprintf(err, errlen, "line %d: route '%s' has no handler (to, respond, redir)", d->line, name);
+        if (r->files && r->files->ntry) {
+            snprintf(err, errlen, "line %d: route '%s' uses try_files without file_server", line, r->name);
+            goto fail;
+        }
+        snprintf(err, errlen, "line %d: route '%s' has no handler (reverse_proxy/to, respond, redir, error, abort, file_server)", line, r->name);
         goto fail;
     }
     if (r->kind == ROUTE_PROXY) {
-        if (pool_finalize(p, d->line, err, errlen) < 0)
+        if (pool_finalize(p, line, err, errlen) < 0)
             goto fail;
         r->pool = p;
+        p = NULL;
     } else {
-        /* header_down on respond routes */
         r->hdr_down = p->hdr_down;
         r->n_hdr_down = p->n_hdr_down;
         p->hdr_down = NULL;
         p->n_hdr_down = 0;
+        if (p->nups) {
+            snprintf(err, errlen, "line %d: route '%s' has upstreams but a non-proxy handler", line, r->name);
+            goto fail;
+        }
         pool_free(p);
+        p = NULL;
     }
+    if (r->kind == ROUTE_FILES) {
+        if (!r->files->root) {
+            const char *root = root_hint ? root_hint : server_root;
+            if (!root) {
+                snprintf(err, errlen, "line %d: file_server needs a 'root' directory", line);
+                goto fail;
+            }
+            r->files->root = xstrdup(root);
+        }
+        if (access(r->files->root, R_OK) != 0) {
+            snprintf(err, errlen, "line %d: file_server root '%s': %s", line, r->files->root, strerror(errno));
+            goto fail;
+        }
+    }
+    free(root_hint);
     s->routes = xrealloc(s->routes, sizeof(route_t *) * (size_t)(s->nroutes + 1));
     s->routes[s->nroutes++] = r;
     return 0;
 fail:
     pool_free(p);
-    r->pool = NULL;
+    free(root_hint);
     route_free(r);
     return -1;
 }
 
+static int parse_route(server_t *s, node_t *d, const char *server_root, char *err, size_t errlen)
+{
+    /* route [name|/path-pattern] { ... }  |  handle [/path-pattern] { ... }  |  handle_path /prefix/ * { ... } */
+    route_t *r = xcalloc(1, sizeof *r);
+    char name[64];
+    const char *kw = d->args[0];
+    int is_handle_path = strcaseeq(kw, "handle_path");
+    if (d->nargs > 2) {
+        free(r);
+        FAIL("line %d: '%s' takes at most one argument", d->line, kw);
+    }
+    snprintf(name, sizeof name, "%s%d", is_handle_path ? "handle_path" : strcaseeq(kw, "handle") ? "handle" : "route", s->nroutes + 1);
+    if (d->nargs == 2) {
+        const char *a = d->args[1];
+        if (a[0] == '/' || a[0] == '*') {
+            route_add_path_match(r, a);
+            if (is_handle_path) {
+                /* strip the literal prefix (pattern without its trailing wildcard) */
+                char prefix[1024];
+                snprintf(prefix, sizeof prefix, "%s", a);
+                size_t n = strlen(prefix);
+                if (n && prefix[n - 1] == '*')
+                    prefix[--n] = 0;
+                if (n > 1 && prefix[n - 1] == '/')
+                    prefix[--n] = 0;
+                if (n)
+                    route_add_rewrite(r, RW_STRIP_PREFIX, prefix, NULL);
+            }
+        } else if (is_handle_path) {
+            free(r);
+            FAIL("line %d: handle_path needs a path pattern like /api/*", d->line);
+        } else {
+            snprintf(name, sizeof name, "%s", a);
+        }
+    } else if (is_handle_path) {
+        free(r);
+        FAIL("line %d: handle_path needs a path pattern like /api/*", d->line);
+    }
+    r->name = xstrdup(name);
+    r->kind = -1;
+    pool_t *p = pool_new(name);
+    char *root_hint = NULL;
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *c = d->kids[i];
+        int rc = parse_route_directive(r, p, c, &root_hint, err, errlen);
+        if (rc < 0)
+            goto fail;
+        if (rc == 0) {
+            snprintf(err, errlen, "line %d: unknown directive '%s' in %s", c->line, c->args[0], kw);
+            goto fail;
+        }
+    }
+    return route_finish(s, r, p, root_hint, server_root, d->line, err, errlen);
+fail:
+    pool_free(p);
+    free(root_hint);
+    route_free(r);
+    return -1;
+}
+
+/* top-level `reverse_proxy [upstreams...] [{ options }]` = catch-all proxy route */
 static int parse_reverse_proxy(server_t *s, node_t *d, char *err, size_t errlen)
 {
-    /* reverse_proxy [upstreams...] [{ options }] - a catch-all route */
     char name[64];
     snprintf(name, sizeof name, "reverse_proxy%d", s->nroutes + 1);
     route_t *r = xcalloc(1, sizeof *r);
@@ -941,18 +1576,205 @@ fail:
     return -1;
 }
 
+/* a standalone handler directive at server level becomes a catch-all route */
+static int parse_simple_route(server_t *s, node_t *d, const char *server_root, char *err, size_t errlen)
+{
+    route_t *r = xcalloc(1, sizeof *r);
+    char name[64];
+    snprintf(name, sizeof name, "%s%d", d->args[0], s->nroutes + 1);
+    r->name = xstrdup(name);
+    r->kind = -1;
+    pool_t *p = pool_new(name);
+    char *root_hint = NULL;
+    int rc = parse_route_directive(r, p, d, &root_hint, err, errlen);
+    if (rc <= 0) {
+        if (rc == 0)
+            snprintf(err, errlen, "line %d: unknown directive '%s'", d->line, d->args[0]);
+        pool_free(p);
+        free(root_hint);
+        route_free(r);
+        return -1;
+    }
+    return route_finish(s, r, p, root_hint, server_root, d->line, err, errlen);
+}
+
+/* ------------------------------------------------------------------ */
+/* Site addresses                                                      */
+/* ------------------------------------------------------------------ */
+
+typedef struct site_addr {
+    int scheme;     /* 0 none, 1 http, 2 https */
+    char host[256]; /* "" = any */
+    int port;       /* 0 = unspecified */
+} site_addr_t;
+
+static int parse_site_address(const char *text, site_addr_t *out, char *err, size_t errlen, int line)
+{
+    memset(out, 0, sizeof *out);
+    const char *s = text;
+    if (str_has_prefix(s, "https://")) {
+        out->scheme = 2;
+        s += 8;
+    } else if (str_has_prefix(s, "http://")) {
+        out->scheme = 1;
+        s += 7;
+    }
+    size_t n = strlen(s);
+    while (n && s[n - 1] == '/')
+        n--;
+    char tmp[256];
+    if (n >= sizeof tmp || n == 0)
+        FAIL("line %d: invalid site address '%s'", line, text);
+    memcpy(tmp, s, n);
+    tmp[n] = 0;
+    char *host = tmp;
+    char *portstr = NULL;
+    if (tmp[0] == '[') {
+        char *rb = strchr(tmp, ']');
+        if (!rb)
+            FAIL("line %d: invalid site address '%s'", line, text);
+        *rb = 0;
+        host = tmp + 1;
+        if (rb[1] == ':')
+            portstr = rb + 2;
+        else if (rb[1])
+            FAIL("line %d: invalid site address '%s'", line, text);
+    } else {
+        char *c = strrchr(tmp, ':');
+        if (c && strchr(tmp, ':') == c) {
+            *c = 0;
+            portstr = c + 1;
+        } else if (c) {
+            FAIL("line %d: invalid site address '%s' (wrap IPv6 addresses in [])", line, text);
+        }
+    }
+    if (portstr) {
+        char *end;
+        long v = strtol(portstr, &end, 10);
+        if (end == portstr || *end || v < 1 || v > 65535)
+            FAIL("line %d: invalid port in site address '%s'", line, text);
+        out->port = (int)v;
+    }
+    if (strlen(host) >= sizeof out->host)
+        FAIL("line %d: site address too long", line);
+    for (const char *p = host; *p; p++)
+        if (!(isalnum((unsigned char)*p) || strchr("-.*_:", *p)))
+            FAIL("line %d: invalid hostname in site address '%s'", line, text);
+    snprintf(out->host, sizeof out->host, "%s", host);
+    if (!out->host[0] && !out->port)
+        FAIL("line %d: site address '%s' needs a host or a port", line, text);
+    return 0;
+}
+
+static void server_add_bind(server_t *s, const char *bind)
+{
+    for (int i = 0; i < s->naddr; i++)
+        if (strcmp(s->addrs[i], bind) == 0)
+            return;
+    s->addrs = xrealloc(s->addrs, sizeof(char *) * (size_t)(s->naddr + 1));
+    s->addrs[s->naddr++] = xstrdup(bind);
+}
+
+static void server_add_host(server_t *s, const char *host)
+{
+    for (int i = 0; i < s->nhosts; i++)
+        if (strcasecmp(s->hosts[i], host) == 0)
+            return;
+    s->hosts = xrealloc(s->hosts, sizeof(char *) * (size_t)(s->nhosts + 1));
+    s->hosts[s->nhosts++] = xstrdup(host);
+}
+
 static server_t *server_new(void)
 {
     server_t *s = xcalloc(1, sizeof *s);
     s->max_body = 8 * 1024 * 1024;
     s->read_timeout = 30;
     s->idle_timeout = 120;
+    s->log_fd = -1;
+    s->encode_min = 512;
     return s;
+}
+
+static int parse_log(server_t *s, node_t *d, char *err, size_t errlen)
+{
+    /* log [off] { output stdout|stderr|<file>; format json|common } */
+    s->access_log = 1;
+    if (s->log_fd < 0)
+        s->log_fd = STDOUT_FILENO;
+    if (d->nargs > 1) {
+        if (strcaseeq(d->args[1], "off")) {
+            s->access_log = 0;
+            return 0;
+        }
+        if (arg_bool(d, 1, &s->access_log, err, errlen) < 0)
+            return -1;
+    }
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *k = d->kids[i];
+        if (strcaseeq(k->args[0], "output")) {
+            if (want_args(k, 1, 2, err, errlen) < 0)
+                return -1;
+            const char *spec = k->args[1];
+            char fspec[1024];
+            if (strcaseeq(spec, "file")) {
+                if (k->nargs < 3)
+                    FAIL("line %d: 'output file' needs a path", k->line);
+                snprintf(fspec, sizeof fspec, "%s", k->args[2]);
+                spec = fspec;
+            }
+            if (s->log_fd > 2)
+                close(s->log_fd);
+            s->log_fd = log_open_target(spec, err, errlen);
+            if (s->log_fd < 0 && !(strcaseeq(spec, "off") || strcaseeq(spec, "discard") || strcaseeq(spec, "none")))
+                return -1;
+        } else if (strcaseeq(k->args[0], "format")) {
+            if (want_args(k, 1, 1, err, errlen) < 0)
+                return -1;
+            if (strcaseeq(k->args[1], "json"))
+                s->log_json = 1;
+            else if (strcaseeq(k->args[1], "common") || strcaseeq(k->args[1], "console") || strcaseeq(k->args[1], "text"))
+                s->log_json = 0;
+            else
+                FAIL("line %d: log format must be json or common", k->line);
+        } else {
+            FAIL("line %d: unknown log option '%s'", k->line, k->args[0]);
+        }
+    }
+    return 0;
+}
+
+static int parse_tls(server_t *s, node_t *d, char *err, size_t errlen)
+{
+    /* tls internal | tls <cert> <key> | tls <email> */
+    if (d->nargs == 2 && strcaseeq(d->args[1], "internal")) {
+        s->tls_mode = TLS_INTERNAL;
+        return 0;
+    }
+    if (d->nargs == 3) {
+        free(s->tls_cert);
+        free(s->tls_key);
+        s->tls_cert = xstrdup(d->args[1]);
+        s->tls_key = xstrdup(d->args[2]);
+        s->tls_mode = TLS_FILES;
+        return 0;
+    }
+    if (d->nargs == 2 && strchr(d->args[1], '@')) {
+        s->tls_mode = TLS_AUTO;
+        free(s->tls_cert);
+        s->tls_cert = xstrdup(d->args[1]); /* account email for ACME */
+        return 0;
+    }
+    if (d->nargs == 1 && d->nkids) {
+        s->tls_mode = TLS_AUTO;
+        return 0;
+    }
+    FAIL("line %d: tls accepts 'internal', '<cert.pem> <key.pem>' or an email for automatic certificates", d->line);
 }
 
 static int parse_server(config_t *cfg, node_t *d, char *err, size_t errlen)
 {
     server_t *s = server_new();
+    int tls_implied = 0, plain_implied = 0;
     for (int i = 0; i < d->nargs; i++) {
         char *a = xstrdup(d->args[i]);
         size_t l = strlen(a);
@@ -962,51 +1784,87 @@ static int parse_server(config_t *cfg, node_t *d, char *err, size_t errlen)
             free(a);
             continue;
         }
-        const char *addr = a;
-        if (str_has_prefix(addr, "https://")) {
-            s->tls_cert = s->tls_cert ? s->tls_cert : xstrdup("");
-            addr += 8;
-        } else if (str_has_prefix(addr, "http://")) {
-            addr += 7;
-        }
-        char *h;
-        int port;
-        if (parse_hostport(addr, &h, &port, 0) < 0) {
+        site_addr_t sa;
+        if (parse_site_address(a, &sa, err, errlen, d->line) < 0) {
             free(a);
             server_free(s);
-            FAIL("line %d: invalid listen address '%s' (use host:port or :port)", d->line, d->args[i]);
+            return -1;
         }
-        free(h);
-        s->addrs = xrealloc(s->addrs, sizeof(char *) * (size_t)(s->naddr + 1));
-        s->addrs[s->naddr++] = xstrdup(addr);
         free(a);
+        int is_ip = sa.host[0] && is_ip_literal(sa.host);
+        int tls;
+        if (sa.scheme == 2)
+            tls = 1;
+        else if (sa.scheme == 1)
+            tls = 0;
+        else if (sa.host[0] && !is_ip)
+            tls = sa.port != cfg->http_port;
+        else
+            tls = 0;
+        int port = sa.port ? sa.port : (tls ? cfg->https_port : cfg->http_port);
+        if (!sa.port && !sa.host[0]) {
+            server_free(s);
+            FAIL("line %d: site address needs a port", d->line);
+        }
+        if (tls)
+            tls_implied = 1;
+        else
+            plain_implied = 1;
+        char bind[320];
+        if (is_ip)
+            snprintf(bind, sizeof bind, strchr(sa.host, ':') ? "[%s]:%d" : "%s:%d", sa.host, port);
+        else
+            snprintf(bind, sizeof bind, ":%d", port);
+        server_add_bind(s, bind);
+        if (sa.host[0] && !is_ip)
+            server_add_host(s, sa.host);
+        if (!s->port)
+            s->port = port;
     }
     if (s->naddr == 0) {
         server_free(s);
         FAIL("line %d: server block has no listen address", d->line);
     }
+    if (tls_implied && plain_implied) {
+        server_free(s);
+        FAIL("line %d: a site block cannot mix http and https addresses", d->line);
+    }
+    if (tls_implied)
+        s->tls_mode = TLS_AUTO;
+
+    char *server_root = NULL;
     for (int i = 0; i < d->nkids; i++) {
         node_t *c = d->kids[i];
         const char *k = c->args[0];
         int rc = 0;
-        if (strcaseeq(k, "route")) {
-            rc = parse_route(s, c, err, errlen);
+        if (strcaseeq(k, "route") || strcaseeq(k, "handle") || strcaseeq(k, "handle_path")) {
+            rc = parse_route(s, c, server_root, err, errlen);
         } else if (strcaseeq(k, "reverse_proxy")) {
             rc = parse_reverse_proxy(s, c, err, errlen);
-        } else if (strcaseeq(k, "respond")) {
-            route_t *r = xcalloc(1, sizeof *r);
-            char name[64];
-            snprintf(name, sizeof name, "respond%d", s->nroutes + 1);
-            r->name = xstrdup(name);
-            rc = parse_respond(r, c, err, errlen);
-            if (rc < 0) {
-                route_free(r);
-            } else {
-                s->routes = xrealloc(s->routes, sizeof(route_t *) * (size_t)(s->nroutes + 1));
-                s->routes[s->nroutes++] = r;
+        } else if (strcaseeq(k, "respond") || strcaseeq(k, "redir") || strcaseeq(k, "redirect") ||
+                   strcaseeq(k, "error") || strcaseeq(k, "abort") || strcaseeq(k, "file_server")) {
+            rc = parse_simple_route(s, c, server_root, err, errlen);
+        } else if (strcaseeq(k, "root")) {
+            if ((rc = want_args(c, 1, 1, err, errlen)) == 0) {
+                free(server_root);
+                server_root = xstrdup(c->args[1]);
             }
         } else if (strcaseeq(k, "max_body") || strcaseeq(k, "max_body_size") || strcaseeq(k, "request_body")) {
-            if ((rc = want_args(c, 1, 1, err, errlen)) == 0 && parse_size(c->args[1], &s->max_body) < 0) {
+            if (c->nkids && c->nargs == 1) {
+                /* request_body { max_size 10MB } */
+                for (int j = 0; j < c->nkids && rc == 0; j++) {
+                    node_t *kk = c->kids[j];
+                    if (strcaseeq(kk->args[0], "max_size") && kk->nargs == 2) {
+                        if (parse_size(kk->args[1], &s->max_body) < 0) {
+                            snprintf(err, errlen, "line %d: invalid size '%s'", kk->line, kk->args[1]);
+                            rc = -1;
+                        }
+                    } else {
+                        snprintf(err, errlen, "line %d: unknown request_body option '%s'", kk->line, kk->args[0]);
+                        rc = -1;
+                    }
+                }
+            } else if ((rc = want_args(c, 1, 1, err, errlen)) == 0 && parse_size(c->args[1], &s->max_body) < 0) {
                 snprintf(err, errlen, "line %d: invalid size '%s'", c->line, c->args[1]);
                 rc = -1;
             }
@@ -1017,36 +1875,65 @@ static int parse_server(config_t *cfg, node_t *d, char *err, size_t errlen)
             if ((rc = want_args(c, 1, 1, err, errlen)) == 0)
                 rc = arg_duration(c, 1, &s->idle_timeout, err, errlen);
         } else if (strcaseeq(k, "log") || strcaseeq(k, "access_log")) {
-            s->access_log = 1;
-            if (c->nargs > 1)
-                rc = arg_bool(c, 1, &s->access_log, err, errlen);
+            rc = parse_log(s, c, err, errlen);
         } else if (strcaseeq(k, "tls")) {
-            if ((rc = want_args(c, 2, 2, err, errlen)) == 0) {
-                free(s->tls_cert);
-                free(s->tls_key);
-                s->tls_cert = xstrdup(c->args[1]);
-                s->tls_key = xstrdup(c->args[2]);
+            rc = parse_tls(s, c, err, errlen);
+        } else if (strcaseeq(k, "header")) {
+            rc = add_hdr_ops(&s->hdr_down, &s->n_hdr_down, c, err, errlen);
+        } else if (strcaseeq(k, "request_header") || strcaseeq(k, "header_up")) {
+            rc = add_hdr_ops(&s->hdr_up, &s->n_hdr_up, c, err, errlen);
+        } else if (strcaseeq(k, "basic_auth") || strcaseeq(k, "basicauth")) {
+            rc = parse_basic_auth(&s->auth, c, err, errlen);
+        } else if (strcaseeq(k, "encode")) {
+            if ((rc = want_args(c, 0, -1, err, errlen)) == 0) {
+                buf_t b;
+                buf_init(&b);
+                for (int j = 1; j < c->nargs; j++) {
+                    if (!(strcaseeq(c->args[j], "gzip") || strcaseeq(c->args[j], "zstd") || strcaseeq(c->args[j], "br"))) {
+                        snprintf(err, errlen, "line %d: encode supports gzip, zstd and br", c->line);
+                        rc = -1;
+                        break;
+                    }
+                    if (j > 1)
+                        buf_puts(&b, " ");
+                    buf_puts(&b, c->args[j]);
+                }
+                if (rc == 0 && c->nargs == 1)
+                    buf_puts(&b, "zstd br gzip");
+                buf_append(&b, "", 1);
+                free(s->encode);
+                s->encode = xstrdup(b.data);
+                buf_free(&b);
+                for (int j = 0; j < c->nkids && rc == 0; j++) {
+                    node_t *kk = c->kids[j];
+                    if (strcaseeq(kk->args[0], "minimum_length") && kk->nargs == 2)
+                        rc = arg_int(kk, 1, &s->encode_min, 0, 1 << 30, err, errlen);
+                    else if (strcaseeq(kk->args[0], "gzip") || strcaseeq(kk->args[0], "zstd") || strcaseeq(kk->args[0], "br"))
+                        ; /* level options are accepted and ignored */
+                    else {
+                        snprintf(err, errlen, "line %d: unknown encode option '%s'", kk->line, kk->args[0]);
+                        rc = -1;
+                    }
+                }
             }
         } else {
             snprintf(err, errlen, "line %d: unknown directive '%s'", c->line, k);
             rc = -1;
         }
         if (rc < 0) {
+            free(server_root);
             server_free(s);
             return -1;
         }
     }
-    if (s->tls_cert && !*s->tls_cert) {
+    free(server_root);
+    if (s->tls_mode == TLS_NONE && (s->tls_cert || s->tls_key)) {
         server_free(s);
-        FAIL("line %d: https:// listener requires 'tls <cert> <key>'", d->line);
-    }
-    if (s->tls_cert && tls_init_server(s, err, errlen) < 0) {
-        server_free(s);
-        return -1;
+        FAIL("line %d: incomplete tls configuration", d->line);
     }
     if (s->nroutes == 0) {
         server_free(s);
-        FAIL("line %d: server block has no handlers (reverse_proxy, route, respond)", d->line);
+        FAIL("line %d: site block has no handlers (reverse_proxy, route, respond, file_server, ...)", d->line);
     }
     cfg->servers = xrealloc(cfg->servers, sizeof(server_t *) * (size_t)(cfg->nservers + 1));
     cfg->servers[cfg->nservers++] = s;
@@ -1070,17 +1957,14 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
                 return -1;
             free(cfg->admin_addr);
             cfg->admin_addr = strcaseeq(c->args[1], "off") ? NULL : xstrdup(c->args[1]);
-        } else if (strcaseeq(k, "log_level") || strcaseeq(k, "log")) {
-            if (want_args(c, 1, 1, err, errlen) < 0)
-                return -1;
-            const char *lv = c->args[1];
+        } else if (strcaseeq(k, "log_level") || strcaseeq(k, "log") || strcaseeq(k, "debug")) {
+            const char *lv = c->nargs > 1 ? c->args[1] : "debug";
             if (strcaseeq(lv, "debug")) cfg->log_level = LOG_DEBUG;
             else if (strcaseeq(lv, "info")) cfg->log_level = LOG_INFO;
             else if (strcaseeq(lv, "warn") || strcaseeq(lv, "warning")) cfg->log_level = LOG_WARN;
             else if (strcaseeq(lv, "error")) cfg->log_level = LOG_ERROR;
             else FAIL("line %d: unknown log level '%s'", c->line, lv);
         } else if (strcaseeq(k, "max_connections")) {
-            /* 0 / "auto" = derive from the descriptor limit at startup */
             if (want_args(c, 1, 1, err, errlen) < 0)
                 return -1;
             if (strcaseeq(c->args[1], "auto") || strcaseeq(c->args[1], "unlimited"))
@@ -1095,6 +1979,43 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
         } else if (strcaseeq(k, "grace") || strcaseeq(k, "grace_period")) {
             if (want_args(c, 1, 1, err, errlen) < 0 || arg_duration(c, 1, &cfg->grace, err, errlen) < 0)
                 return -1;
+        } else if (strcaseeq(k, "http_port")) {
+            if (want_args(c, 1, 1, err, errlen) < 0 || arg_int(c, 1, &cfg->http_port, 1, 65535, err, errlen) < 0)
+                return -1;
+        } else if (strcaseeq(k, "https_port")) {
+            if (want_args(c, 1, 1, err, errlen) < 0 || arg_int(c, 1, &cfg->https_port, 1, 65535, err, errlen) < 0)
+                return -1;
+        } else if (strcaseeq(k, "storage")) {
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            free(cfg->storage);
+            cfg->storage = xstrdup(c->args[1]);
+        } else if (strcaseeq(k, "email")) {
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            free(cfg->acme_email);
+            cfg->acme_email = xstrdup(c->args[1]);
+        } else if (strcaseeq(k, "acme_ca")) {
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            free(cfg->acme_ca);
+            cfg->acme_ca = xstrdup(c->args[1]);
+        } else if (strcaseeq(k, "acme_ca_root")) {
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            free(cfg->acme_ca_root);
+            cfg->acme_ca_root = xstrdup(c->args[1]);
+        } else if (strcaseeq(k, "auto_https")) {
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            if (strcaseeq(c->args[1], "off"))
+                cfg->acme_disabled = 1;
+            else if (strcaseeq(c->args[1], "disable_redirects"))
+                cfg->acme_disabled = 2;
+            else if (strcaseeq(c->args[1], "on"))
+                cfg->acme_disabled = 0;
+            else
+                FAIL("line %d: auto_https accepts off, on or disable_redirects", c->line);
         } else {
             FAIL("line %d: unknown global option '%s'", c->line, k);
         }
@@ -1102,45 +2023,177 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
     return 0;
 }
 
-config_t *config_parse(const char *text, const char *path, char *err, size_t errlen)
+/* ------------------------------------------------------------------ */
+/* Certificates and implicit servers                                   */
+/* ------------------------------------------------------------------ */
+
+static int host_is_local(const char *h)
 {
-    toks_t t = { NULL, 0, 0 };
+    size_t n = strlen(h);
+    return strcasecmp(h, "localhost") == 0 || (n > 10 && strcasecmp(h + n - 10, ".localhost") == 0);
+}
+
+static int config_finish_tls(config_t *cfg, char *err, size_t errlen)
+{
+    for (int i = 0; i < cfg->nservers; i++) {
+        server_t *s = cfg->servers[i];
+        if (s->tls_mode == TLS_NONE)
+            continue;
+        if (s->tls_mode == TLS_FILES) {
+            if (tls_init_server(s, err, errlen) < 0)
+                return -1;
+            continue;
+        }
+        if (s->tls_mode == TLS_INTERNAL) {
+            if (tls_init_internal(s, err, errlen) < 0)
+                return -1;
+            continue;
+        }
+        /* TLS_AUTO: local names get internal certificates; public names use ACME
+         * (managed by the certificate manager, which installs them into storage). */
+        int all_local = s->nhosts > 0;
+        for (int h = 0; h < s->nhosts; h++)
+            if (!host_is_local(s->hosts[h]))
+                all_local = 0;
+        if (all_local || cfg->acme_disabled == 1 || s->nhosts == 0) {
+            if (tls_init_internal(s, err, errlen) < 0)
+                return -1;
+            if (!all_local && s->nhosts)
+                LOGW("site %s: automatic HTTPS is off; serving a self-signed certificate", s->hosts[0]);
+            s->tls_mode = TLS_INTERNAL;
+            continue;
+        }
+        /* ACME-managed: load the certificate from storage when present, else a
+         * temporary self-signed one until the manager obtains it. */
+        if (tls_init_internal(s, err, errlen) < 0)
+            return -1;
+        extern int acme_load_stored(config_t *cfg, server_t *s, char *err, size_t errlen);
+        if (acme_load_stored(cfg, s, err, errlen) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* For every https site with hostnames, add an http listener that redirects
+ * to https and answers ACME http-01 challenges (unless disabled or a site
+ * already serves plain http on that port). */
+static void config_add_redirect_servers(config_t *cfg)
+{
+    if (cfg->acme_disabled == 1)
+        return;
+    char bind[32];
+    snprintf(bind, sizeof bind, ":%d", cfg->http_port);
+    for (int i = 0, n = cfg->nservers; i < n; i++) {
+        server_t *s = cfg->servers[i];
+        if (s->tls_mode == TLS_NONE || s->nhosts == 0 || s->is_admin)
+            continue;
+        /* does a plain-http site already own this bind with any of these hosts (or catch-all)? */
+        int covered = 0;
+        for (int j = 0; j < cfg->nservers && !covered; j++) {
+            server_t *o = cfg->servers[j];
+            if (o->tls_mode != TLS_NONE || o->is_admin)
+                continue;
+            for (int a = 0; a < o->naddr && !covered; a++) {
+                if (strcmp(o->addrs[a], bind) != 0)
+                    continue;
+                if (o->nhosts == 0 && !o->redirect_https) {
+                    covered = 1;
+                    break;
+                }
+                for (int h = 0; h < o->nhosts && !covered; h++)
+                    for (int sh = 0; sh < s->nhosts; sh++)
+                        if (strcasecmp(o->hosts[h], s->hosts[sh]) == 0)
+                            covered = 1;
+            }
+        }
+        if (covered)
+            continue;
+        server_t *r = server_new();
+        r->redirect_https = 1;
+        r->port = s->port;
+        server_add_bind(r, bind);
+        for (int h = 0; h < s->nhosts; h++)
+            server_add_host(r, s->hosts[h]);
+        /* the redirect handler is built in; give it a placeholder route */
+        route_t *rt = xcalloc(1, sizeof *rt);
+        rt->name = xstrdup("https_redirect");
+        rt->kind = ROUTE_REDIRECT;
+        rt->resp_status = cfg->acme_disabled == 2 ? 404 : 308;
+        rt->resp_body = xstrdup("https://{host}{uri}");
+        r->routes = xmalloc(sizeof(route_t *));
+        r->routes[0] = rt;
+        r->nroutes = 1;
+        cfg->servers = xrealloc(cfg->servers, sizeof(server_t *) * (size_t)(cfg->nservers + 1));
+        cfg->servers[cfg->nservers++] = r;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Entry points                                                        */
+/* ------------------------------------------------------------------ */
+
+static config_t *config_parse_in(const char *text, const char *path, const char *base_dir, char *err, size_t errlen)
+{
     err[0] = 0;
-    if (tokenize(text, &t, err, errlen) < 0) {
-        toks_free(&t);
+    char *expanded = expand_env(text);
+    node_t *root = parse_text_to_tree(expanded, err, errlen);
+    free(expanded);
+    if (!root)
         return NULL;
+
+    /* collect snippets "(name) { ... }" */
+    snippets_t sn = { NULL, NULL, 0 };
+    for (int k = 0; k < root->nkids;) {
+        node_t *d = root->kids[k];
+        if (d->nargs == 1 && d->args[0][0] == '(' && d->args[0][strlen(d->args[0]) - 1] == ')') {
+            size_t n = strlen(d->args[0]);
+            sn.names = xrealloc(sn.names, sizeof(char *) * (size_t)(sn.n + 1));
+            sn.bodies = xrealloc(sn.bodies, sizeof(node_t *) * (size_t)(sn.n + 1));
+            sn.names[sn.n] = xstrndup(d->args[0] + 1, n - 2);
+            sn.bodies[sn.n] = d;
+            sn.n++;
+            memmove(root->kids + k, root->kids + k + 1, sizeof(node_t *) * (size_t)(root->nkids - k - 1));
+            root->nkids--;
+            continue;
+        }
+        k++;
     }
-    node_t *root = xcalloc(1, sizeof *root);
-    int i = 0;
-    if (parse_block(&t, &i, root, 0, err, errlen) < 0) {
+    int rc = expand_imports(root, base_dir, &sn, 0, err, errlen);
+    for (int i = 0; i < sn.n; i++) {
+        free(sn.names[i]);
+        node_free(sn.bodies[i]);
+    }
+    free(sn.names);
+    free(sn.bodies);
+    if (rc < 0) {
         node_free(root);
-        toks_free(&t);
         return NULL;
     }
-    toks_free(&t);
 
     config_t *cfg = xcalloc(1, sizeof *cfg);
     cfg->refs = 1;
     cfg->workers = 1;
     cfg->log_level = LOG_INFO;
     cfg->grace = 10;
+    cfg->http_port = 80;
+    cfg->https_port = 443;
     cfg->path = xstrdup(path ? path : "<inline>");
     cfg->text = xstrdup(text);
 
     for (int k = 0; k < root->nkids; k++) {
         node_t *d = root->kids[k];
-        int rc;
+        int r;
         if (d->nargs == 0) {
             if (k != 0) {
                 snprintf(err, errlen, "line %d: global options block must come first", d->line);
-                rc = -1;
+                r = -1;
             } else {
-                rc = parse_global(cfg, d, err, errlen);
+                r = parse_global(cfg, d, err, errlen);
             }
         } else {
-            rc = parse_server(cfg, d, err, errlen);
+            r = parse_server(cfg, d, err, errlen);
         }
-        if (rc < 0) {
+        if (r < 0) {
             node_free(root);
             config_unref(cfg);
             return NULL;
@@ -1152,8 +2205,25 @@ config_t *config_parse(const char *text, const char *path, char *err, size_t err
         config_unref(cfg);
         return NULL;
     }
+    if (!cfg->storage) {
+        const char *home = getenv("XDG_DATA_HOME");
+        char buf[1024];
+        if (home && *home)
+            snprintf(buf, sizeof buf, "%s/limer", home);
+        else if ((home = getenv("HOME")) && *home)
+            snprintf(buf, sizeof buf, "%s/.local/share/limer", home);
+        else
+            snprintf(buf, sizeof buf, "/var/lib/limer");
+        cfg->storage = xstrdup(buf);
+    }
+    if (!cfg->acme_ca)
+        cfg->acme_ca = xstrdup("https://acme-v02.api.letsencrypt.org/directory");
+    config_add_redirect_servers(cfg);
+    if (config_finish_tls(cfg, err, errlen) < 0) {
+        config_unref(cfg);
+        return NULL;
+    }
     if (cfg->admin_addr) {
-        /* the admin API is a built-in server with its own handler */
         server_t *s = server_new();
         s->is_admin = 1;
         s->addrs = xmalloc(sizeof(char *));
@@ -1165,22 +2235,20 @@ config_t *config_parse(const char *text, const char *path, char *err, size_t err
     return cfg;
 }
 
+config_t *config_parse(const char *text, const char *path, char *err, size_t errlen)
+{
+    return config_parse_in(text, path, ".", err, errlen);
+}
+
 config_t *config_load(const char *path, char *err, size_t errlen)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        snprintf(err, errlen, "cannot open %s: %s", path, strerror(errno));
+    char *text = read_file(path, err, errlen);
+    if (!text)
         return NULL;
-    }
-    buf_t b;
-    buf_init(&b);
-    char tmp[4096];
-    size_t n;
-    while ((n = fread(tmp, 1, sizeof tmp, f)) > 0)
-        buf_append(&b, tmp, n);
-    fclose(f);
-    buf_append(&b, "", 1);
-    config_t *cfg = config_parse(b.data, path, err, errlen);
-    buf_free(&b);
+    char *dup = xstrdup(path);
+    const char *dir = dirname(dup);
+    config_t *cfg = config_parse_in(text, path, dir, err, errlen);
+    free(dup);
+    free(text);
     return cfg;
 }

@@ -2,6 +2,9 @@
 #include "limer.h"
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -64,4 +67,48 @@ void log_access(const char *fmt, ...)
         len = sizeof line - 2;
     line[len++] = '\n';
     (void)!write(STDOUT_FILENO, line, len);
+}
+
+void log_access_to(int fd, const char *line, size_t len)
+{
+    if (fd < 0)
+        return;
+    char ts[40];
+    timestamp(ts, sizeof ts);
+    char head[48];
+    int n = snprintf(head, sizeof head, "%s ", ts);
+    struct iovec iov[3] = { { head, (size_t)n }, { (void *)line, len }, { (void *)"\n", 1 } };
+    (void)!writev(fd, iov, 3);
+}
+
+int log_open_target(const char *spec, char *err, size_t errlen)
+{
+    if (!spec || strcaseeq(spec, "stdout"))
+        return STDOUT_FILENO;
+    if (strcaseeq(spec, "stderr"))
+        return STDERR_FILENO;
+    if (strcaseeq(spec, "off") || strcaseeq(spec, "discard") || strcaseeq(spec, "none"))
+        return -1;
+    const char *path = spec;
+    if (str_has_prefix(path, "file "))
+        path += 5;
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0)
+        snprintf(err, errlen, "cannot open log file '%s': %s", path, strerror(errno));
+    return fd;
+}
+
+void log_json_escape(buf_t *b, const char *s)
+{
+    buf_append(b, "\"", 1);
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\')
+            buf_printf(b, "\\%c", c);
+        else if (c < 0x20)
+            buf_printf(b, "\\u%04x", c);
+        else
+            buf_append(b, s, 1);
+    }
+    buf_append(b, "\"", 1);
 }

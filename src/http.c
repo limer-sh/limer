@@ -16,6 +16,8 @@ void http_req_init(http_req_t *r)
 void http_req_free(http_req_t *r)
 {
     free(r->raw);
+    free(r->uri_owned);
+    free(r->orig_path);
     free(r->path);
     free(r->query);
     buf_free(&r->body);
