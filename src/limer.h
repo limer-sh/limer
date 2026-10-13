@@ -213,7 +213,20 @@ enum key_src {
     KS_BODY,
     KS_METHOD,
     KS_HOST,
+    KS_TLS_CLIENT,      /* client certificate: subject, issuer, serial, fingerprint, verified */
 };
+
+/* What the TLS client presented (filled after the handshake). */
+typedef struct tls_client_info {
+    int  present;             /* a certificate was presented */
+    int  verified;            /* ... and it chains to a trusted CA */
+    char subject[512];
+    char issuer[512];
+    char serial[96];
+    char fingerprint[72];     /* sha256, lowercase hex */
+} tls_client_info_t;
+
+enum client_auth_mode { CA_NONE = 0, CA_REQUEST, CA_REQUIRE, CA_VERIFY_IF_GIVEN, CA_REQUIRE_AND_VERIFY };
 
 typedef struct keysrc {
     int   src;      /* enum key_src */
@@ -306,6 +319,8 @@ typedef struct pool {
     int   tls_insecure;       /* skip upstream certificate verification */
     char *tls_server_name;    /* SNI / verification name for upstream TLS */
     char *tls_ca;             /* PEM bundle to trust for upstream TLS */
+    char *tls_client_cert;    /* client certificate (chain) presented to upstreams */
+    char *tls_client_key;
     int   tls_all;            /* `tls` in the pool block: every upstream speaks TLS */
     /* dynamic upstreams */
     int   dyn_kind;           /* 0 static, 1 A/AAAA lookup, 2 SRV lookup */
@@ -406,6 +421,9 @@ typedef struct server {
     int     tls_mode;    /* enum tls_mode */
     char   *tls_cert;
     char   *tls_key;
+    int     client_auth_mode; /* enum client_auth_mode */
+    char  **client_ca;        /* PEM files with CAs that may sign client certificates */
+    int     nclient_ca;
     hdr_op_t *hdr_down; int n_hdr_down;   /* `header` directive: all responses */
     hdr_op_t *hdr_up;   int n_hdr_up;     /* `request_header`: all proxied requests */
     basic_auth_t *auth;                   /* server-wide basic_auth */
@@ -506,6 +524,7 @@ typedef struct req_ctx {
     socklen_t peerlen;
     char peer_ip[64];
     int tls;
+    const tls_client_info_t *client_cert;   /* NULL on plain connections */
 } req_ctx_t;
 
 /* Extract a key from the request. Returns 1 and fills `out` when present. */
@@ -566,6 +585,7 @@ int  tls_init_server(server_t *s, char *err, size_t errlen);   /* from files */
 int  tls_init_internal(server_t *s, char *err, size_t errlen); /* self-signed for its hosts */
 int  tls_load_pem(server_t *s, const char *cert, const char *key, char *err, size_t errlen);
 void tls_free_server(server_t *s);
+void tls_client_info(SSL *ssl, tls_client_info_t *out);   /* after the handshake */
 int  tls_init_pool_client(pool_t *p, char *err, size_t errlen);  /* client context for https upstreams */
 void tls_free_pool_client(pool_t *p);
 #ifdef LIMER_TLS

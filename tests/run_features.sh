@@ -697,6 +697,115 @@ expect_eq "8 concurrent 20 MB uploads intact" "$okc" "11111111"
 expect_eq "no errors logged" "$(grep -c "error" $TMP/stream.log)" "0"
 kill -TERM $SP; wait $SP 2>/dev/null
 
+echo "# mutual tls: client certificates on sites and to upstreams"
+MT="$TMP/mtls"; mkdir -p "$MT"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$MT/ca.key" -out "$MT/ca.crt" -days 2 \
+    -subj "/O=Limer Test/CN=Limer Test CA" -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$MT/other-ca.key" -out "$MT/other-ca.crt" -days 2 \
+    -subj "/CN=Other CA" -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
+mkcert() { # mkcert NAME CA-PREFIX SUBJECT
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$MT/$1.key" -out "$MT/$1.csr" -subj "$3" >/dev/null 2>&1
+    openssl x509 -req -in "$MT/$1.csr" -CA "$MT/$2.crt" -CAkey "$MT/$2.key" -CAcreateserial -out "$MT/$1.crt" -days 2 >/dev/null 2>&1
+}
+mkcert client ca "/O=Limer Test/OU=ops/CN=alice"
+mkcert rogue other-ca "/CN=mallory"
+cat > "$MT/Limerfile" <<CFG
+{
+    https_port 9815
+    admin off
+    log_level warn
+}
+mtls.test {
+    tls internal {
+        client_auth {
+            mode require_and_verify
+            trusted_ca_cert_file $MT/ca.crt
+        }
+    }
+    header X-Client-Serial {tls_client_serial}
+    respond "{tls_client_subject}|{tls_client_verified}|{tls_client_issuer}"
+}
+optional.test {
+    tls internal {
+        client_auth {
+            mode request
+            trusted_ca_cert_file $MT/ca.crt
+        }
+    }
+    route {
+        match tls_client verified == true
+        respond "verified {tls_client_subject} fp={tls_client_fingerprint}"
+    }
+    route {
+        match tls_client present == true
+        respond "unverified {tls_client_subject}"
+    }
+    respond "anonymous"
+}
+strict.test {
+    tls internal {
+        client_auth {
+            mode verify_if_given
+            trusted_ca_cert_file $MT/ca.crt
+        }
+    }
+    respond "strict {tls_client_present}"
+}
+open.test {
+    tls internal
+    respond "open site"
+}
+CFG
+$BIN run -c "$MT/Limerfile" >/dev/null 2>"$MT/limer.log" & MTP=$!; PIDS+=($MTP)
+wait_port 9815
+R="--resolve mtls.test:9815:127.0.0.1 --resolve optional.test:9815:127.0.0.1 --resolve strict.test:9815:127.0.0.1 --resolve open.test:9815:127.0.0.1"
+r=$(curl -sk $R --cert "$MT/client.crt" --key "$MT/client.key" https://mtls.test:9815/)
+expect_eq "require_and_verify accepts a trusted client certificate" "$r" "CN=alice,OU=ops,O=Limer Test|true|CN=Limer Test CA,O=Limer Test"
+expect_contains "serial placeholder in a header" "$(curl -sk $R --http1.1 -D - -o /dev/null --cert "$MT/client.crt" --key "$MT/client.key" https://mtls.test:9815/)" "X-Client-Serial: "
+r=$(curl -sk $R -o /dev/null -w '%{http_code}' https://mtls.test:9815/ 2>&1)
+expect_eq "require_and_verify rejects a client without a certificate" "$r" "000"
+r=$(curl -sk $R -o /dev/null -w '%{http_code}' --cert "$MT/rogue.crt" --key "$MT/rogue.key" https://mtls.test:9815/ 2>&1)
+expect_eq "require_and_verify rejects a certificate from another CA" "$r" "000"
+expect_eq "sites without client_auth on the same listener stay open" "$(curl -sk $R https://open.test:9815/)" "open site"
+expect_eq "request mode: anonymous clients pass" "$(curl -sk $R https://optional.test:9815/)" "anonymous"
+expect_contains "request mode: verified clients match tls_client verified" "$(curl -sk $R --cert "$MT/client.crt" --key "$MT/client.key" https://optional.test:9815/)" "verified CN=alice,OU=ops,O=Limer Test fp="
+expect_eq "request mode: untrusted certificates are seen but unverified" "$(curl -sk $R --cert "$MT/rogue.crt" --key "$MT/rogue.key" https://optional.test:9815/)" "unverified CN=mallory"
+fp=$(openssl x509 -in "$MT/client.crt" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f')
+expect_contains "fingerprint placeholder matches openssl" "$(curl -sk $R --cert "$MT/client.crt" --key "$MT/client.key" https://optional.test:9815/)" "fp=$fp"
+expect_eq "verify_if_given: no certificate is fine" "$(curl -sk $R https://strict.test:9815/)" "strict false"
+expect_eq "verify_if_given: a trusted certificate is fine" "$(curl -sk $R --cert "$MT/client.crt" --key "$MT/client.key" https://strict.test:9815/)" "strict true"
+r=$(curl -sk $R -o /dev/null -w '%{http_code}' --cert "$MT/rogue.crt" --key "$MT/rogue.key" https://strict.test:9815/ 2>&1)
+expect_eq "verify_if_given rejects an untrusted certificate" "$r" "000"
+expect_contains "http/2 streams see the client certificate" "$(curl -sk $R --http2 --cert "$MT/client.crt" --key "$MT/client.key" https://mtls.test:9815/)" "CN=alice"
+kill -TERM $MTP; wait $MTP 2>/dev/null
+# client certificates towards upstreams
+mkcert upstream ca "/CN=127.0.0.1"
+python3 tests/backend.py 9713 mtls-up --tls "$TMP/up.crt" "$TMP/up.key" --client-ca "$MT/ca.crt" & PIDS+=($!)
+wait_port 9713
+cat > "$MT/up.conf" <<CFG
+{
+    admin off
+    log_level warn
+}
+:9816 {
+    reverse_proxy https://127.0.0.1:9713 {
+        tls_trusted_ca_certs $TMP/up.crt
+        tls_client_auth $MT/client.crt $MT/client.key
+    }
+}
+:9817 {
+    reverse_proxy https://127.0.0.1:9713 {
+        tls_trusted_ca_certs $TMP/up.crt
+        lb_retries 0
+    }
+}
+CFG
+$BIN run -c "$MT/up.conf" >/dev/null 2>"$MT/up.log" & MUP=$!; PIDS+=($MUP)
+wait_port 9816
+expect_eq "client certificate presented to the upstream" "$(curl -s http://127.0.0.1:9816/)" "hello from mtls-up"
+expect_eq "upstream requiring a certificate rejects a pool without one" "$(H http://127.0.0.1:9817/)" "502"
+kill -TERM $MUP; wait $MUP 2>/dev/null
+
 echo "# dynamic upstreams (dns a / srv, re-resolution)"
 cat > "$TMP/zone.json" <<ZONE
 {"backends.test": {"A": ["127.0.0.1", "127.0.0.2"]},

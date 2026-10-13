@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Small test upstream: identifies itself and echoes request details as JSON.
 
-Usage: backend.py PORT NAME [--bind IP] [--slow SECONDS] [--fail-health] [--tls CERT KEY]
+Usage: backend.py PORT NAME [--bind IP] [--slow SECONDS] [--fail-health] [--tls CERT KEY] [--client-ca CA]
 Endpoints:
   /healthz      -> 200 "ok" (or 503 with --fail-health)
   /echo         -> JSON with name, method, path, headers, body
@@ -24,12 +24,15 @@ NAME = sys.argv[2]
 SLOW = 0.0
 FAIL_HEALTH = False
 TLS = None
+CLIENT_CA = None
 BIND = "127.0.0.1"
 args = sys.argv[3:]
 while args:
     a = args.pop(0)
     if a == "--bind":
         BIND = args.pop(0)
+    elif a == "--client-ca":
+        CLIENT_CA = args.pop(0)   # require client certificates signed by this CA
     elif a == "--slow":
         SLOW = float(args.pop(0))
     elif a == "--fail-health":
@@ -175,5 +178,8 @@ if __name__ == "__main__":
         import ssl
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(TLS[0], TLS[1])
+        if CLIENT_CA:
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.load_verify_locations(CLIENT_CA)
         srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     srv.serve_forever()

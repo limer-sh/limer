@@ -217,10 +217,113 @@ static int servername_cb(SSL *ssl, int *al, void *arg)
     const char *name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
     if (name && sni_resolver) {
         SSL_CTX *ctx = sni_resolver(ssl, name);
-        if (ctx && ctx != SSL_get_SSL_CTX(ssl))
+        if (ctx && ctx != SSL_get_SSL_CTX(ssl)) {
             SSL_set_SSL_CTX(ssl, ctx);
+            /* client authentication is per site: carry the verify settings over */
+            SSL_set_verify(ssl, SSL_CTX_get_verify_mode(ctx), SSL_CTX_get_verify_callback(ctx));
+            STACK_OF(X509_NAME) *cas = SSL_CTX_get_client_CA_list(ctx);
+            SSL_set_client_CA_list(ssl, cas ? SSL_dup_CA_list(cas) : NULL);
+        }
     }
     return SSL_TLSEXT_ERR_OK;
+}
+
+/* verify callback for modes that only ask for (or require) a certificate without validating it */
+static int accept_any_client_cert(int preverify_ok, X509_STORE_CTX *x509_ctx)
+{
+    (void)preverify_ok; (void)x509_ctx;
+    return 1;
+}
+
+static int apply_client_auth(server_t *s, SSL_CTX *ctx, char *err, size_t errlen)
+{
+    if (s->client_auth_mode == CA_NONE)
+        return 0;
+    for (int i = 0; i < s->nclient_ca; i++) {
+        if (SSL_CTX_load_verify_locations(ctx, s->client_ca[i], NULL) != 1) {
+            snprintf(err, errlen, "tls: client_auth: cannot load trusted CA '%s': %s", s->client_ca[i], tls_last_error());
+            return -1;
+        }
+        STACK_OF(X509_NAME) *names = SSL_load_client_CA_file(s->client_ca[i]);
+        if (!names) {
+            snprintf(err, errlen, "tls: client_auth: no certificates in '%s'", s->client_ca[i]);
+            return -1;
+        }
+        STACK_OF(X509_NAME) *cur = SSL_CTX_get_client_CA_list(ctx);
+        if (!cur) {
+            SSL_CTX_set_client_CA_list(ctx, names); /* takes ownership */
+        } else {
+            while (sk_X509_NAME_num(names) > 0)
+                sk_X509_NAME_push(cur, sk_X509_NAME_shift(names));
+            sk_X509_NAME_free(names);
+        }
+    }
+    int mode = SSL_VERIFY_PEER;
+    int (*cb)(int, X509_STORE_CTX *) = NULL;
+    switch (s->client_auth_mode) {
+    case CA_REQUEST:
+        cb = accept_any_client_cert;
+        break;
+    case CA_REQUIRE:
+        mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+        cb = accept_any_client_cert;
+        break;
+    case CA_VERIFY_IF_GIVEN:
+        break;
+    case CA_REQUIRE_AND_VERIFY:
+        mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+        break;
+    }
+    SSL_CTX_set_verify(ctx, mode, cb);
+    SSL_CTX_set_verify_depth(ctx, 5);
+    return 0;
+}
+
+static void x509_name_rfc2253(X509_NAME *n, char *out, size_t outlen)
+{
+    out[0] = 0;
+    if (!n)
+        return;
+    BIO *b = BIO_new(BIO_s_mem());
+    if (!b)
+        return;
+    X509_NAME_print_ex(b, n, 0, XN_FLAG_RFC2253 & ~ASN1_STRFLGS_ESC_MSB);
+    char *data = NULL;
+    long len = BIO_get_mem_data(b, &data);
+    if (len > 0)
+        snprintf(out, outlen, "%.*s", (int)(len < (long)outlen - 1 ? len : (long)outlen - 1), data);
+    BIO_free(b);
+}
+
+void tls_client_info(SSL *ssl, tls_client_info_t *out)
+{
+    memset(out, 0, sizeof *out);
+    X509 *x = SSL_get1_peer_certificate(ssl);
+    if (!x)
+        return;
+    out->present = 1;
+    out->verified = SSL_get_verify_result(ssl) == X509_V_OK;
+    x509_name_rfc2253(X509_get_subject_name(x), out->subject, sizeof out->subject);
+    x509_name_rfc2253(X509_get_issuer_name(x), out->issuer, sizeof out->issuer);
+    const ASN1_INTEGER *serial = X509_get0_serialNumber(x);
+    BIGNUM *bn = serial ? ASN1_INTEGER_to_BN(serial, NULL) : NULL;
+    if (bn) {
+        char *hex = BN_bn2hex(bn);
+        if (hex) {
+            snprintf(out->serial, sizeof out->serial, "%s", hex);
+            for (char *q = out->serial; *q; q++)
+                *q = (char)tolower((unsigned char)*q);
+            OPENSSL_free(hex);
+        }
+        BN_free(bn);
+    }
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int mdlen = 0;
+    if (X509_digest(x, EVP_sha256(), md, &mdlen) == 1) {
+        for (unsigned int i = 0; i < mdlen && i * 2 + 2 < sizeof out->fingerprint; i++)
+            snprintf(out->fingerprint + i * 2, 3, "%02x", md[i]);
+    }
+    X509_free(x);
 }
 
 static SSL_CTX *new_ctx(char *err, size_t errlen)
@@ -259,6 +362,10 @@ int tls_load_pem(server_t *s, const char *cert, const char *key, char *err, size
     }
     if (SSL_CTX_check_private_key(ctx) != 1) {
         snprintf(err, errlen, "tls: certificate and key do not match");
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+    if (apply_client_auth(s, ctx, err, errlen) < 0) {
         SSL_CTX_free(ctx);
         return -1;
     }
@@ -329,6 +436,8 @@ int tls_init_internal(server_t *s, char *err, size_t errlen)
         snprintf(err, errlen, "tls internal: cannot install certificate: %s", tls_last_error());
         goto out;
     }
+    if (apply_client_auth(s, ctx, err, errlen) < 0)
+        goto out;
     ok = 1;
 out:
     if (x)
@@ -377,6 +486,15 @@ int tls_init_pool_client(pool_t *p, char *err, size_t errlen)
             SSL_CTX_set_default_verify_paths(ctx);
         }
     }
+    if (p->tls_client_cert) {
+        if (SSL_CTX_use_certificate_chain_file(ctx, p->tls_client_cert) != 1 ||
+            SSL_CTX_use_PrivateKey_file(ctx, p->tls_client_key, SSL_FILETYPE_PEM) != 1 ||
+            SSL_CTX_check_private_key(ctx) != 1) {
+            snprintf(err, errlen, "tls: cannot load tls_client_auth '%s' / '%s': %s", p->tls_client_cert, p->tls_client_key, tls_last_error());
+            SSL_CTX_free(ctx);
+            return -1;
+        }
+    }
     if (p->client_ctx)
         SSL_CTX_free(p->client_ctx);
     p->client_ctx = ctx;
@@ -421,6 +539,12 @@ int tls_init_pool_client(pool_t *p, char *err, size_t errlen)
     (void)p;
     snprintf(err, errlen, "tls: this build has no TLS support (https upstreams unavailable)");
     return -1;
+}
+
+void tls_client_info(SSL *ssl, tls_client_info_t *out)
+{
+    (void)ssl;
+    memset(out, 0, sizeof *out);
 }
 
 void tls_free_pool_client(pool_t *p)

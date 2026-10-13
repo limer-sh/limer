@@ -122,6 +122,33 @@ int key_extract(const keysrc_t *k, const req_ctx_t *ctx, buf_t *out)
             return 0;
         buf_append(out, buf_rptr(&r->body), buf_readable(&r->body));
         return 1;
+    case KS_TLS_CLIENT: {
+        const tls_client_info_t *ci = ctx->client_cert;
+        if (!ci)
+            return 0;
+        const char *f = k->name ? k->name : "subject";
+        if (strcasecmp(f, "verified") == 0) {
+            buf_puts(out, ci->present && ci->verified ? "true" : "false");
+            return 1;
+        }
+        if (strcasecmp(f, "present") == 0) {
+            buf_puts(out, ci->present ? "true" : "false");
+            return 1;
+        }
+        if (!ci->present)
+            return 0;
+        if (strcasecmp(f, "subject") == 0)
+            buf_puts(out, ci->subject);
+        else if (strcasecmp(f, "issuer") == 0)
+            buf_puts(out, ci->issuer);
+        else if (strcasecmp(f, "serial") == 0)
+            buf_puts(out, ci->serial);
+        else if (strcasecmp(f, "fingerprint") == 0)
+            buf_puts(out, ci->fingerprint);
+        else
+            return 0;
+        return 1;
+    }
     default:
         return 0;
     }
