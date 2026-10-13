@@ -506,6 +506,56 @@ expect_eq "cookie-less requests are spread" "$both" "2"
 expect_contains "unknown cookie value gets a fresh assignment" "$(curl -s -D - -o /dev/null -b 'session=0000000000000000' http://127.0.0.1:9792/)" "Set-Cookie: session="
 kill -TERM $STP; wait $STP 2>/dev/null
 
+echo "# runtime admin api: drain, weights, overrides"
+rm -rf "$TMP/adminstore"
+cat > "$TMP/admin.conf" <<CFG
+{
+    admin 127.0.0.1:9794
+    storage $TMP/adminstore
+    log_level warn
+}
+:9793 {
+    reverse_proxy 127.0.0.1:9701 127.0.0.1:9702
+}
+CFG
+$BIN run -c "$TMP/admin.conf" >/dev/null 2>&1 & ADP=$!; PIDS+=($ADP)
+wait_port 9794
+A=http://127.0.0.1:9794
+dist() { for i in $(seq 1 8); do echo "$(curl -s http://127.0.0.1:9793/)"; done | sort | uniq -c | tr -s ' ' | tr '\n' ';'; }
+expect_contains "both upstreams serve before draining" "$(dist)" "4 hello from b"
+expect_contains "drain upstream" "$(curl -s -X POST $A/upstreams/127.0.0.1:9702/drain)" '"drained":true'
+sleep 0.4
+expect_eq "drained upstream gets no traffic" "$(dist)" " 8 hello from a;"
+expect_contains "status shows drained" "$(curl -s $A/upstreams)" '"address":"127.0.0.1:9702","weight":1,"drained":true,"healthy":false'
+expect_contains "overrides listed" "$(curl -s $A/overrides)" '"address":"127.0.0.1:9702","drained":true'
+expect_contains "undrain upstream" "$(curl -s -X POST $A/upstreams/127.0.0.1:9702/undrain)" '"drained":false'
+sleep 0.4
+expect_contains "traffic returns after undrain" "$(dist)" "4 hello from b"
+expect_contains "set weight" "$(curl -s -X POST $A/upstreams/127.0.0.1:9701/weight/3)" '"weight":3'
+sleep 0.4
+expect_contains "weight applied live (3:1)" "$(dist)" "6 hello from a"
+expect_eq "unknown upstream -> 404" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $A/upstreams/127.0.0.1:1/drain)" "404"
+expect_eq "bad action -> 400" "$(curl -s -o /dev/null -w '%{http_code}' -X POST $A/upstreams/127.0.0.1:9701/explode)" "400"
+expect_eq "GET on action -> 405" "$(curl -s -o /dev/null -w '%{http_code}' $A/upstreams/127.0.0.1:9701/drain)" "405"
+curl -s -X POST $A/upstreams/127.0.0.1:9702/drain >/dev/null
+kill -TERM $ADP; wait $ADP 2>/dev/null
+$BIN run -c "$TMP/admin.conf" >/dev/null 2>&1 & ADP=$!; PIDS+=($ADP)
+wait_port 9794
+expect_eq "overrides persist across restart (drain + weight)" "$(dist)" " 8 hello from a;"
+expect_contains "persisted weight visible" "$(curl -s $A/upstreams)" '"address":"127.0.0.1:9701","weight":3'
+expect_contains "clear overrides" "$(curl -s -X DELETE $A/overrides)" "cleared"
+sleep 0.4
+expect_contains "defaults restored after clearing" "$(dist)" "4 hello from b"
+kill -TERM $ADP; wait $ADP 2>/dev/null
+# multi-worker: a change on one worker reaches all workers via the master reload
+sed -i 's/    admin 127.0.0.1:9794/    admin 127.0.0.1:9794\n    workers 2/' "$TMP/admin.conf"
+$BIN run -c "$TMP/admin.conf" >/dev/null 2>&1 & ADP=$!; PIDS+=($ADP)
+wait_port 9794; sleep 0.3
+curl -s -X POST $A/upstreams/127.0.0.1:9702/drain >/dev/null
+sleep 0.8
+expect_eq "drain propagates to all workers" "$(for i in $(seq 1 16); do echo "$(curl -s http://127.0.0.1:9793/)"; done | sort -u)" "hello from a"
+kill -TERM $ADP; wait $ADP 2>/dev/null
+
 echo "# reload keeps virtual hosts"
 sed -i 's/respond "two"/respond "two-v2"/' "$TMP/Limerfile"
 kill -HUP $LIMER; sleep 0.5

@@ -48,23 +48,6 @@ static int file_exists(const char *p)
     return stat(p, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-static int mkdir_p(const char *path)
-{
-    char tmp[2048];
-    snprintf(tmp, sizeof tmp, "%s", path);
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = 0;
-            if (mkdir(tmp, 0700) < 0 && errno != EEXIST)
-                return -1;
-            *p = '/';
-        }
-    }
-    if (mkdir(tmp, 0700) < 0 && errno != EEXIST)
-        return -1;
-    return 0;
-}
-
 static int write_file_atomic(const char *path, const void *data, size_t n, mode_t mode)
 {
     char tmp[2048];
