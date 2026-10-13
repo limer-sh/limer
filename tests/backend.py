@@ -25,6 +25,7 @@ SLOW = 0.0
 FAIL_HEALTH = False
 TLS = None
 CLIENT_CA = None
+RECORD = None
 BIND = "127.0.0.1"
 args = sys.argv[3:]
 while args:
@@ -33,6 +34,8 @@ while args:
         BIND = args.pop(0)
     elif a == "--client-ca":
         CLIENT_CA = args.pop(0)   # require client certificates signed by this CA
+    elif a == "--record":
+        RECORD = args.pop(0)      # append "METHOD PATH body_len body" for each request
     elif a == "--slow":
         SLOW = float(args.pop(0))
     elif a == "--fail-health":
@@ -76,6 +79,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_any(self):
         path = self.path.split("?")[0]
+        if RECORD and path != "/early":
+            b = self._body()
+            with open(RECORD, "a") as rf:
+                rf.write("%s %s %d %s\n" % (self.command, self.path, len(b), b.decode("latin1")))
+            self._send(200, b"recorded")
+            return
         if path == "/early":
             # answer without reading the body (the proxy must not reuse the connection);
             # linger a little so the response is read before the reset

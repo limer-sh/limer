@@ -154,6 +154,7 @@ typedef struct uconn {
     int got_bytes;
     int reused;
     int connected;
+    int mirror;                 /* shadow request: discard the response, never touch a client */
     double idle_since;
     /* HTTP/2 upstream stream (pseudo uconn attached to a session) */
     struct h2u_session *h2u;
@@ -1540,6 +1541,91 @@ static void build_upstream_request(conn_t *c, uconn_t *uc)
         buf_append(out, buf_rptr(&r->body), buf_readable(&r->body));
 }
 
+/* Build a shadow copy of the current request for a mirror upstream. */
+static void build_mirror_request(conn_t *c, upstream_t *mu, pool_t *mp, buf_t *out)
+{
+    http_req_t *r = &c->req;
+    buf_reset(out);
+    if (str_has_prefix(r->uri, "http://") || str_has_prefix(r->uri, "https://"))
+        buf_printf(out, "%s %s%s%s HTTP/1.1\r\n", r->method, r->path, *r->query ? "?" : "", r->query);
+    else
+        buf_printf(out, "%s %s HTTP/1.1\r\n", r->method, r->uri);
+    hlist_t h = { 0 };
+    const char *orig_host = http_hdr_get(r->hdrs, r->nhdr, "Host");
+    const char *conn_hdr = http_hdr_get(r->hdrs, r->nhdr, "Connection");
+    if (mp->preserve_host && orig_host && *orig_host)
+        hlist_add(&h, "Host", orig_host);
+    else
+        hlist_add(&h, "Host", mu->hostport);
+    for (int i = 0; i < r->nhdr; i++) {
+        const char *n = r->hdrs[i].name;
+        if (strcasecmp(n, "Host") == 0 || strcasecmp(n, "Content-Length") == 0 || strcasecmp(n, "Expect") == 0 ||
+            strcasecmp(n, "X-Forwarded-For") == 0 || strcasecmp(n, "X-Forwarded-Proto") == 0 ||
+            strcasecmp(n, "X-Forwarded-Host") == 0 || strcasecmp(n, "X-Real-IP") == 0)
+            continue;
+        if (http_hdr_is_hop_by_hop(n) || http_hdr_connection_has(conn_hdr, n))
+            continue;
+        hlist_add(&h, n, r->hdrs[i].value);
+    }
+    hlist_add(&h, "Connection", "close");
+    hlist_add(&h, "X-Mirrored-By", "limer");
+    {
+        buf_t xff;
+        buf_init(&xff);
+        const char *prev = http_hdr_get(r->hdrs, r->nhdr, "X-Forwarded-For");
+        if (prev && *prev) {
+            buf_puts(&xff, prev);
+            buf_puts(&xff, ", ");
+        }
+        buf_puts(&xff, c->peer_ip);
+        buf_append(&xff, "", 1);
+        hlist_add(&h, "X-Forwarded-For", buf_rptr(&xff));
+        buf_free(&xff);
+    }
+    hlist_add(&h, "X-Forwarded-Proto", c->ctx.tls ? "https" : "http");
+    if (orig_host)
+        hlist_add(&h, "X-Forwarded-Host", orig_host);
+    hlist_add(&h, "X-Real-IP", c->peer_ip);
+    char tmp[32];
+    snprintf(tmp, sizeof tmp, "%zu", buf_readable(&r->body));
+    hlist_add(&h, "Content-Length", tmp);
+    if (mp->n_hdr_up)
+        hlist_apply_ops(&h, mp->hdr_up, mp->n_hdr_up, c);
+    hlist_write(&h, out);
+    hlist_free(&h);
+    buf_puts(out, "\r\n");
+    if (buf_readable(&r->body) > 0)
+        buf_append(out, buf_rptr(&r->body), buf_readable(&r->body));
+}
+
+/* Fire-and-forget a copy of the request to the mirror pool; the response is discarded. */
+static void conn_fire_mirror(conn_t *c, pool_t *mp)
+{
+    if (mp->nups == 0)
+        return;
+    int idx = -1;
+    char why[64];
+    upstream_t *mu = pool_select(mp, &c->ctx, 0, g_now, &idx, why, sizeof why);
+    if (!mu || mu->h2) /* HTTP/2 mirror upstreams are not supported */
+        return;
+    uconn_t *uc = uconn_connect(mu, mp, c->cfg);
+    if (!uc)
+        return;
+    uc->mirror = 1;
+    uc->idle_since = g_now;
+    build_mirror_request(c, mu, mp, &uc->wbuf);
+    g_stats.requests++; /* count the shadow request for visibility */
+    if (uc->connected) {
+        uc->state = US_ACTIVE;
+        int rc = uc_flush(uc);
+        if (rc < 0) {
+            uconn_close(uc);
+            return;
+        }
+        ev_mod(&uc->ev, EPOLLIN | EPOLLRDHUP | (rc == 0 ? EPOLLOUT : 0));
+    }
+}
+
 static void conn_try_upstream(conn_t *c)
 {
     pool_t *p = c->pool;
@@ -2003,6 +2089,19 @@ static void uconn_cb(ev_t *e, uint32_t events)
 
     if (events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) {
         if (!c) {
+            if (uc->mirror) {
+                for (;;) {
+                    ssize_t r = uc_read(uc);
+                    if (r > 0) {
+                        uc->got_bytes = 1;
+                        buf_reset(&uc->rbuf); /* response is discarded */
+                        continue;
+                    }
+                    if (r == -1)
+                        return; /* would block: wait for more or the close */
+                    break;      /* EOF or error: done with the shadow request */
+                }
+            }
             uconn_close(uc);
             return;
         }
@@ -2469,6 +2568,9 @@ static void conn_dispatch(conn_t *c)
         c->pool = route->pool;
         c->tried = 0;
         c->attempts = 0;
+        if (route->pool->mirror &&
+            (route->pool->mirror_sample >= 100 || (double)(random() % 10000) < route->pool->mirror_sample * 100.0))
+            conn_fire_mirror(c, route->pool->mirror);
         conn_try_upstream(c);
         return;
     }
@@ -4277,6 +4379,8 @@ static void tick(void)
     while (uc) {
         uconn_t *next = uc->next;
         if (!uc->dead && uc->state == US_IDLE && g_now - uc->idle_since > uc->pool->keepalive_timeout)
+            uconn_close(uc);
+        else if (!uc->dead && uc->mirror && g_now - uc->idle_since > uc->pool->response_timeout)
             uconn_close(uc);
         uc = next;
     }
