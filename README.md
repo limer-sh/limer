@@ -52,14 +52,21 @@ HTTPS with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
 - **Reverse proxy**: keep-alive on both sides with an upstream connection
   pool, retries on other upstreams, active HTTP health checks and passive
   ejection, Caddy-style forwarding headers, `header_up`/`header_down`,
-  WebSocket and `Upgrade` tunnelling, TLS to upstreams with verification.
+  WebSocket and `Upgrade` tunnelling, TLS to upstreams with verification,
+  cookie-based sticky sessions, and HTTP/2 to upstreams (`h2c://`, `h2://`)
+  with trailers intact, so gRPC passes through.
+- **Rate limiting**: token buckets per site or per route, keyed by any
+  placeholder (`{remote_ip}`, `{header.X-Api-Key}`, `{json.tenant}`...),
+  with `Retry-After` on rejection.
 - **Sites like Caddy's**: `example.com`, `www.example.com:8080`,
   `https://api.example.com`, `:8080`, `localhost`, wildcards. Sites sharing a
   port share one listener and are told apart by Host and SNI.
 - **Automatic HTTPS**: sites with public hostnames obtain and renew
-  certificates from Let's Encrypt (any ACME CA) over http-01; `localhost`
-  and `tls internal` get self-signed certificates; HTTP redirects to HTTPS.
-- **HTTP/2** (over TLS via ALPN, built on nghttp2) and HTTP/1.1 and 1.0.
+  certificates from Let's Encrypt (any ACME CA) over http-01, tls-alpn-01 or
+  dns-01 (wildcards included, through a script hook); `localhost` and
+  `tls internal` get self-signed certificates; HTTP redirects to HTTPS.
+- **HTTP/2** (over TLS via ALPN, or cleartext h2c with prior knowledge,
+  built on nghttp2) and HTTP/1.1 and 1.0.
 - **Static files**: `root`, `file_server` (index files, `browse` listings),
   `try_files`, conditional requests, byte ranges, path traversal protection.
 - **Compression**: `encode gzip zstd br` for proxied, static and local
@@ -73,8 +80,9 @@ HTTPS with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
 - **Operations**: `limer validate`, hot reload on `SIGHUP` / `limer reload` /
   `POST /reload` (bad configs are rejected and the old one keeps running),
   graceful shutdown with a grace period, multi-process `workers` with
-  `SO_REUSEPORT`, pidfile, access logs, admin API with JSON upstream status
-  and Prometheus metrics.
+  `SO_REUSEPORT`, pidfile, access logs, admin API with JSON upstream status,
+  Prometheus metrics, and runtime drain / weight overrides that survive
+  reloads.
 - **HTTP/1.1 done properly**: pipelining, chunked bodies both ways,
   `Expect: 100-continue`, HEAD/204/304 framing, close-delimited responses,
   request-smuggling guards, bounded buffering with backpressure.
@@ -143,6 +151,9 @@ replaced from the environment.
     email admin@example.com   # ACME account contact
     storage /var/lib/limer    # certificates and ACME state
     acme_ca https://acme-v02.api.letsencrypt.org/directory
+    acme_challenge http-01    # tls-alpn-01 | dns-01
+    acme_dns_script /etc/limer/dns-hook.sh   # for dns-01 (see Automatic HTTPS)
+    acme_dns_propagation 30s
     auto_https on             # off | disable_redirects
 }
 
@@ -187,6 +198,7 @@ exact match, then wildcard, then the site without a hostname.
 | `request_header [+|-]Name [value]` | Same for requests sent upstream. |
 | `basic_auth [realm] { user <bcrypt-hash> ... }` | Protect the whole site (`htpasswd -nbB user pass`). |
 | `encode [gzip] [zstd] [br] [{ minimum_length N }]` | Compress eligible responses; server order is the preference. |
+| `rate_limit [zone] [rate] [{ key; rate; burst; status; max_keys }]` | Limit requests per key for the whole site (see Rate limiting). |
 | `root <dir>` | Default root for `file_server` in this site. |
 | `max_body <size>` / `request_body { max_size <size> }` | Largest request body (`8m`); bodies are buffered so routing can inspect them. |
 | `read_timeout <dur>` / `idle_timeout <dur>` | Request read time (`30s`) and keep-alive idle time (`2m`). |
@@ -225,7 +237,7 @@ Path and host use glob matching with `*`. Regexes are POSIX extended.
 
 | Directive | Meaning |
 |---|---|
-| `reverse_proxy <upstreams...> [{ options }]` or `to <upstreams...>` | Proxy to a pool. `https://host` or `transport http { tls }` proxies over TLS. |
+| `reverse_proxy <upstreams...> [{ options }]` or `to <upstreams...>` | Proxy to a pool. `https://host` or `transport http { tls }` proxies over TLS; `h2c://host` and `h2://host` speak HTTP/2 to the upstream. |
 | `respond [status] [body]` / `respond <body> [status]` | Static response; placeholders allowed. |
 | `redir <location> [code|permanent|temporary]` | Redirect (`302` default). |
 | `error [message] <status>` | Error response. |
@@ -234,7 +246,7 @@ Path and host use glob matching with `*`. Regexes are POSIX extended.
 | `try_files <candidates...>` | With `file_server`: first existing file wins (`try_files {path} /index.html`). |
 | `rewrite <uri>` | Replace path and query (placeholders allowed). |
 | `uri strip_prefix <p>` / `uri strip_suffix <s>` / `uri replace <a> <b>` | Edit the path before the handler runs. |
-| `basic_auth`, `header`, `request_header` | As at site level, scoped to the route. |
+| `basic_auth`, `header`, `request_header`, `rate_limit` | As at site level, scoped to the route. |
 
 ### Proxy options (inside `reverse_proxy { }` or a proxy route)
 
@@ -253,7 +265,7 @@ Path and host use glob matching with `*`. Regexes are POSIX extended.
 | `header_up [+|-]Name [value]` / `header_down ...` | | Edit request / response headers. |
 | `preserve_host on|off` | `on` | Pass the client's `Host` through. |
 | `tls_insecure_skip_verify`, `tls_server_name <name>`, `tls_trusted_ca_certs <pem>` | | Upstream TLS verification. |
-| `transport http { keepalive_idle_conns N; tls; ... }` | | Caddy-compatible spelling of the above. |
+| `transport http { keepalive_idle_conns N; tls; versions h2|h2c|1.1; ... }` | | Caddy-compatible spelling of the above; `versions h2c` or `h2` makes every upstream in the pool HTTP/2. |
 
 Header values, `respond` bodies, `redir` targets, `rewrite` and
 `try_files` accept placeholders: `{remote_ip}`, `{host}`, `{path}`,
@@ -271,6 +283,7 @@ Header values, `respond` bodies, `redir` targets, `rewrite` and
 | `ip_hash` | Hash of the client IP. |
 | `uri_hash` | Hash of the request URI. |
 | `hash <source> [name]` | Rendezvous hash of an extracted key: `hash json customer.id`, `hash form cart_id`, `hash header X-Session`, `hash cookie sid`, `hash query user`, `hash body`, `hash path`, `hash client_ip`. `payload` is an alias for `hash`. |
+| `sticky_cookie [name]` | Cookie-based sticky sessions: the first request is balanced round robin and the response sets `name` (`limer_sticky`) to an opaque upstream id; later requests carrying it go to the same upstream while it is healthy. |
 
 When the hash key is missing from a request, that request falls back to round
 robin. Unhealthy upstreams are skipped, so their keys spill over to the
@@ -279,6 +292,55 @@ next-best upstream and return when the upstream recovers.
 Limer always forwards `X-Forwarded-For` (appending), `X-Forwarded-Proto`,
 `X-Forwarded-Host` and `X-Real-IP`, strips hop-by-hop headers, and keeps
 `Upgrade` requests working (WebSockets are tunnelled after a `101`).
+
+### HTTP/2 upstreams and gRPC
+
+```
+grpc.example.com {
+    reverse_proxy h2c://10.0.0.5:50051 h2c://10.0.0.6:50051
+}
+```
+
+Requests to an `h2c://` (cleartext) or `h2://` (TLS, ALPN `h2`) upstream are
+multiplexed as streams on one HTTP/2 session per upstream, and the response
+including its trailers is handed back to the client: an HTTP/2 client gets
+real trailers (`grpc-status`, `grpc-message`, trailing metadata, and a
+trailers-only error stays trailers-only), an HTTP/1.1 client gets a chunked
+response with the trailers at the end. Clients may use TLS with ALPN or
+plain HTTP/2 with prior knowledge on an http listener, so gRPC works without
+TLS on either side. Unary and server-streaming calls are supported. Because
+request bodies are buffered for payload routing, client-streaming and
+bidirectional calls are sent only once the request body is complete, so
+they are not a fit for long-lived streams. Active health checks are plain
+HTTP/1.1 and need an upstream that still answers HTTP/1.1; for h2-only
+upstreams rely on passive health.
+
+### Rate limiting
+
+```
+api.example.com {
+    rate_limit site 1000r/s             # one bucket for the whole site
+    route {
+        match path /login
+        rate_limit login {
+            key {remote_ip}             # one bucket per client
+            rate 5r/m
+            burst 5
+            status 429
+        }
+        reverse_proxy 10.0.0.2:8080
+    }
+}
+```
+
+Each `rate_limit` is a zone of token buckets: `rate` tokens per second or
+minute (`10r/s`, `600r/m`) refill a bucket of `burst` tokens (default: the
+per-second rate, at least 1), one bucket per distinct `key` (default: a
+single shared bucket). Keys accept every placeholder, so limits can be per
+client, per API key, per tenant in the JSON body, or per route. Rejected
+requests get `status` (`429`) with `Retry-After`, and zones are capped at
+`max_keys` (`100000`) buckets with least-recently-used eviction. Counts are
+per worker. `/metrics` exposes allowed and limited totals per zone.
 
 ## Automatic HTTPS
 
@@ -290,7 +352,7 @@ TLS configuration:
    https and answers ACME http-01 challenges.
 2. A certificate manager process registers an ACME account (`email`),
    orders a certificate for all of the site's names, proves control over
-   each over http-01, stores `cert.pem` and `key.pem` under
+   each (http-01 by default), stores `cert.pem` and `key.pem` under
    `<storage>/certs/<host>/`, and reloads the server.
 3. It checks every hour and renews 30 days before expiry, or when the stored
    certificate no longer covers the site's names.
@@ -299,10 +361,17 @@ Requirements: port 80 reachable from the internet (or `http_port` mapped to
 it), DNS pointing at the server, and a writable `storage` directory. Use
 `acme_ca` to point at another CA (staging, or
 [Pebble](https://github.com/letsencrypt/pebble) for tests, with
-`acme_ca_root` for its certificate). Wildcard names cannot be validated
-over http-01: give them `tls <cert> <key>`. `auto_https off` disables
+`acme_ca_root` for its certificate). `auto_https off` disables
 certificate management; `auto_https disable_redirects` keeps it but drops
 the http redirect.
+
+Challenge types (`acme_challenge` in the global block):
+
+| Challenge | Needs | Notes |
+|---|---|---|
+| `http-01` (default) | port 80 reachable | Answered by the http listener. |
+| `tls-alpn-01` | port 443 reachable | Answered on the https listener itself with the `acme-tls/1` ALPN protocol; use it when port 80 is closed. |
+| `dns-01` | `acme_dns_script` | Limer runs the script as `script present <domain> <txt-value>` before validation and `script cleanup <domain> <txt-value>` after, waits `acme_dns_propagation` (`30s`) in between, and the script creates or removes `_acme-challenge.<domain>` TXT records with your DNS provider's API. Required for wildcard names, which are always validated over dns-01 when a script is set. |
 
 ## Admin API
 
@@ -315,7 +384,14 @@ Enable with `admin <addr>` in the global block.
 | `GET /metrics` | Prometheus text format. |
 | `GET /config` | The running Limerfile. |
 | `POST /reload` | Reload the configuration from disk. |
+| `POST /upstreams/<host:port>/drain` | Stop sending new requests to the upstream (in-flight ones finish). |
+| `POST /upstreams/<host:port>/undrain` | Put it back into rotation. |
+| `POST /upstreams/<host:port>/weight/<n>` | Change its weight at runtime. |
+| `GET /overrides`, `DELETE /overrides` | List or clear the runtime overrides. |
 
+Drain and weight overrides apply to every pool using that upstream address,
+are persisted to `<storage>/overrides.conf` so they survive reloads and
+restarts, and reach every worker. Remove them with `DELETE /overrides`.
 With `workers > 1`, counters are per worker (each response names its worker).
 
 ## Reloading and signals
@@ -340,8 +416,8 @@ GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 | `make unit` | `tests/unit.c`: buffers, parsing helpers, CIDR matching, globbing, the HTTP head parsers (including every smuggling guard), the chunked decoder, the JSON path extractor, the Limerfile parser (site addresses, imports, snippets, every directive and ~60 rejected inputs), matchers and key extraction, and every balancing policy. |
 | `make fuzz` | `tests/fuzz.c`: a mutation fuzzer over the HTTP parsers, chunked decoder, JSON extractor, form/cookie extraction and config parser with invariant checks; reproducible by seed. |
 | `make integration` | `tests/run_tests.sh`: end-to-end proxying behaviour against Python backends: routing, hashing, weights, framing, keep-alive, pipelining, timeouts, retries, health checks, WebSocket upgrade, admin API, reload, graceful stop, TLS and multi-worker mode. |
-| `make features` | `tests/run_features.sh`: virtual hosts, SNI, redirects, handlers, basic auth, logging, static files, compression, TLS to upstreams, HTTP/2 and reload. |
-| `make acme` | `tests/run_acme.sh`: certificate issuance, storage and reuse against Pebble (skips when Pebble is not installed). |
+| `make features` | `tests/run_features.sh`: virtual hosts, SNI, redirects, handlers, basic auth, logging, static files, compression, TLS to upstreams, HTTP/2, rate limiting, sticky sessions, the runtime admin API, gRPC over h2c/h2 upstreams (needs `grpcio` and `grpcio-tools`; skipped otherwise) and reload. |
+| `make acme` | `tests/run_acme.sh`: certificate issuance over http-01, tls-alpn-01 and dns-01 (wildcard), storage and renewal against Pebble and pebble-challtestsrv (skips when they are not installed). |
 | `make security` | `tests/security_tests.py`: the black-box security suite described below. |
 
 ## Security
@@ -450,14 +526,16 @@ spread them over cores.
 ## Compared with Caddy: what is and is not there
 
 Present: reverse proxy with health checks and all common balancing policies
-(plus payload hashing, which Caddy lacks), site addresses and virtual hosts,
-automatic HTTPS (http-01), HTTP/2, static files, compression, the common
-handler directives, Caddyfile-style config with imports and snippets,
-reloads, metrics, multi-process workers.
+(plus payload hashing, which Caddy lacks), sticky sessions, rate limiting,
+site addresses and virtual hosts, automatic HTTPS (http-01, tls-alpn-01,
+dns-01 with wildcards), HTTP/2 on both sides including gRPC passthrough,
+static files, compression, the common handler directives, Caddyfile-style
+config with imports and snippets, reloads, metrics, a runtime admin API for
+draining and weights, multi-process workers.
 
-Not there: HTTP/3, DNS-01 and TLS-ALPN-01 challenges (so no wildcard
-certificates from ACME), on-demand TLS, client certificate authentication,
-templates, FastCGI, the JSON config API and the plugin ecosystem.
+Not there: HTTP/3, built-in DNS provider modules (dns-01 goes through a
+script), on-demand TLS, client certificate authentication, templates,
+FastCGI, the JSON config API and the plugin ecosystem.
 
 ## Layout
 
