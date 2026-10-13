@@ -1,0 +1,12 @@
+{
+    log_level warn
+}
+127.0.0.1:8080 {
+    route orders {
+        match method POST
+        match json type order
+        to 127.0.0.1:9001 127.0.0.1:9002
+        lb_policy hash json customer.id
+    }
+    reverse_proxy 127.0.0.1:9001 127.0.0.1:9002
+}

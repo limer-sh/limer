@@ -3,3 +3,4 @@
 *.o
 *.d
 /tests/tmp/
+/bench/backend
