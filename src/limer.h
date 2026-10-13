@@ -115,6 +115,7 @@ typedef struct chunk_state {
     int   ndigits;      /* hex digits seen in the current size line */
     size_t remaining;   /* bytes left in current chunk */
     int   done;
+    buf_t *trailers;    /* optional: raw trailer lines ("name: value\r\n"...) are appended here */
 } chunk_state_t;
 
 typedef struct http_req {
@@ -249,6 +250,8 @@ typedef struct upstream {
     int   port;
     int   weight;
     int   tls;                /* connect with TLS (https:// upstream) */
+    int   h2;                 /* speak HTTP/2 (h2c:// or transport versions h2) */
+    void *h2u;                /* runtime: current HTTP/2 session */
     struct sockaddr_storage addr;
     socklen_t addrlen;
     int   resolved;
@@ -296,6 +299,7 @@ typedef struct pool {
     hdr_op_t *hdr_up;   int n_hdr_up;
     hdr_op_t *hdr_down; int n_hdr_down;
     int   preserve_host;      /* pass Host header through (default on) */
+    int   upstream_h2;        /* 1 = h2 over TLS, 2 = h2c, applied to all upstreams */
     int   tls_insecure;       /* skip upstream certificate verification */
     char *tls_server_name;    /* SNI / verification name for upstream TLS */
     char *tls_ca;             /* PEM bundle to trust for upstream TLS */

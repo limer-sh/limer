@@ -155,6 +155,11 @@ typedef struct uconn {
     int reused;
     int connected;
     double idle_since;
+    /* HTTP/2 upstream stream (pseudo uconn attached to a session) */
+    struct h2u_session *h2u;
+    int32_t h2u_stream_id;
+    int h2u_submitted, h2u_head_done, h2u_dirty, h2u_trailers, h2u_skip, h2u_failed, h2u_stream_open;
+    size_t h2u_unconsumed;
     struct uconn *idle_next;
     struct uconn *prev, *next;      /* global list */
     int dead;
@@ -219,7 +224,7 @@ typedef struct conn {
     int32_t h2_stream_id;
     int h2_submitted, h2_eof, h2_deferred, h2_chunked, h2_detached;
     chunk_state_t h2_cs;
-    buf_t h2_body, h2_hdrs, h2_cookie, h2_reqbody;
+    buf_t h2_body, h2_hdrs, h2_cookie, h2_reqbody, h2_trailers;
     size_t h2_reqlen;
     char h2_method[24];
     char h2_path[4096];
@@ -279,6 +284,16 @@ static void conn_close(conn_t *c);
 static void conn_process(conn_t *c);
 #ifdef LIMER_H2
 #define H2_SEND_HIGH (1024 * 1024)
+struct h2u_session;
+static uconn_t *h2u_attach(upstream_t *u, pool_t *p, config_t *cfg);
+static void h2u_submit(uconn_t *uc);
+static void h2u_detach(uconn_t *uc);
+static void h2u_consumed(uconn_t *uc, size_t n);
+static void h2u_resume(uconn_t *uc);
+static void h2u_tick(void);
+static void h2u_retire_config(config_t *old);
+static void uconn_on_response_data(uconn_t *uc);
+static void conn_response_done(conn_t *c);
 static void h2_stream_flush(conn_t *st);
 static void h2_stream_close(conn_t *st);
 static void h2_session_close(conn_t *c);
@@ -866,6 +881,7 @@ static void conn_destroy(ev_t *e)
     buf_free(&c->enc_out);
     buf_free(&c->dechunk);
     buf_free(&c->h2_body);
+    buf_free(&c->h2_trailers);
     buf_free(&c->h2_hdrs);
     buf_free(&c->h2_cookie);
     buf_free(&c->h2_reqbody);
@@ -930,6 +946,23 @@ static void conn_finish(conn_t *c)
     conn_flush(c);
 }
 
+/* The client drained its buffer: let the upstream side deliver more. */
+static void conn_resume_upstream(conn_t *c)
+{
+    c->upstream_paused = 0;
+    uconn_t *uc = c->uc;
+    if (!uc)
+        return;
+#ifdef LIMER_H2
+    if (uc->h2u) {
+        h2u_resume(uc);
+        return;
+    }
+#endif
+    if (uc->ev.fd >= 0)
+        ev_mod(&uc->ev, EPOLLIN | EPOLLRDHUP | (buf_readable(&uc->wbuf) ? EPOLLOUT : 0));
+}
+
 static void conn_flush(conn_t *c)
 {
 #ifdef LIMER_H2
@@ -957,10 +990,8 @@ static void conn_flush(conn_t *c)
     }
     if (buf_readable(&c->wbuf) == 0 && c->state == CS_HEAD && c->wbuf.cap > 4096)
         buf_free(&c->wbuf);
-    if (c->upstream_paused && c->uc && buf_readable(&c->wbuf) < WBUF_LOW_WATER) {
-        c->upstream_paused = 0;
-        ev_mod(&c->uc->ev, EPOLLIN | (buf_readable(&c->uc->wbuf) ? EPOLLOUT : 0));
-    }
+    if (c->upstream_paused && c->uc && buf_readable(&c->wbuf) < WBUF_LOW_WATER)
+        conn_resume_upstream(c);
     conn_update_mask(c);
 }
 
@@ -1227,6 +1258,10 @@ static void uconn_close(uconn_t *uc)
     if (uc->dead)
         return;
     uc->dead = 1;
+#ifdef LIMER_H2
+    if (uc->h2u)
+        h2u_detach(uc);
+#endif
     if (uc->state == US_IDLE)
         idle_unlink(uc);
     if (uc->c) {
@@ -1295,7 +1330,7 @@ static void uconn_release(uconn_t *uc, int reusable)
         uc->c = NULL;
     }
     pool_t *p = uc->pool;
-    if (!reusable || uc->cfg != g_cfg || p->keepalive_idle <= 0 || uc->up->nidle >= p->keepalive_idle ||
+    if (!reusable || uc->ev.fd < 0 || uc->cfg != g_cfg || p->keepalive_idle <= 0 || uc->up->nidle >= p->keepalive_idle ||
         buf_readable(&uc->rbuf) > 0 || g_shutting_down) {
         uconn_close(uc);
         return;
@@ -1468,6 +1503,33 @@ static void conn_try_upstream(conn_t *c)
                           memcmp(buf_rptr(&ck), u->sticky_id, 16) == 0);
         buf_free(&ck);
     }
+#ifdef LIMER_H2
+    if (u->h2) {
+        uconn_t *huc = h2u_attach(u, p, c->cfg);
+        if (!huc) {
+            char reason[160];
+            snprintf(reason, sizeof reason, "connect: %s", strerror(errno));
+            upstream_report_failure(p, u, g_now, reason);
+            g_stats.upstream_errors++;
+            u->active--;
+            c->up = NULL;
+            if (c->attempts <= p->retries)
+                conn_try_upstream(c);
+            else
+                conn_send_error(c, 502, reason, 0);
+            return;
+        }
+        huc->c = c;
+        c->uc = huc;
+        c->state = CS_UPSTREAM;
+        c->deadline = g_now + (huc->connected ? p->response_timeout : p->connect_timeout);
+        build_upstream_request(c, huc);
+        h2u_submit(huc);
+        if (!c->dead)
+            conn_update_mask(c);
+        return;
+    }
+#endif
     uconn_t *uc = uconn_take_idle(u);
     if (!uc) {
         uc = uconn_connect(u, p, c->cfg);
@@ -1668,6 +1730,7 @@ static void uconn_forward_body(uconn_t *uc)
     size_t avail = buf_readable(&uc->rbuf);
     const char *data = buf_rptr(&uc->rbuf);
     int done = 0;
+    size_t before = avail;
     switch (c->resp_mode) {
     case RM_NONE:
         done = 1;
@@ -1712,6 +1775,12 @@ static void uconn_forward_body(uconn_t *uc)
         buf_consume(&uc->rbuf, avail);
         break;
     }
+#ifdef LIMER_H2
+    if (uc->h2u)
+        h2u_consumed(uc, before - buf_readable(&uc->rbuf));
+#else
+    (void)before;
+#endif
     conn_flush(c);
     if (c->dead || uc->dead)
         return; /* client went away */
@@ -1721,7 +1790,8 @@ static void uconn_forward_body(uconn_t *uc)
     }
     if (buf_readable(&c->wbuf) > WBUF_HIGH_WATER && !c->upstream_paused) {
         c->upstream_paused = 1;
-        ev_mod(&uc->ev, EPOLLRDHUP | (buf_readable(&uc->wbuf) ? EPOLLOUT : 0));
+        if (uc->ev.fd >= 0)
+            ev_mod(&uc->ev, EPOLLRDHUP | (buf_readable(&uc->wbuf) ? EPOLLOUT : 0));
     }
 }
 
@@ -2407,6 +2477,33 @@ static void conn_on_readable(conn_t *c)
         conn_close(c);
         return;
     }
+#ifdef LIMER_H2
+    /* HTTP/2 with prior knowledge (h2c): the connection opens with the client preface */
+    if (c->state == CS_HEAD && !c->req.method && buf_readable(&c->rbuf) > 0
+#ifdef LIMER_TLS
+        && !c->ssl
+#endif
+    ) {
+        static const char preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        size_t have = buf_readable(&c->rbuf);
+        size_t cmp = have < 24 ? have : 24;
+        if (memcmp(buf_rptr(&c->rbuf), preface, cmp) == 0) {
+            if (have < 24) {
+                if (c->rd_eof)
+                    conn_close(c);
+                else
+                    conn_update_mask(c);
+                return; /* wait for the rest of the preface */
+            }
+            if (h2_session_start(c) < 0) {
+                conn_close(c);
+                return;
+            }
+            h2_session_recv(c);
+            return;
+        }
+    }
+#endif
     if (c->state == CS_HEAD || c->state == CS_BODY) {
         conn_process(c);
         return;
@@ -3248,6 +3345,7 @@ static void conn_serve_files(conn_t *c, route_t *r)
 
 #ifdef LIMER_H2
 #include "h2.inc"
+#include "h2u.inc"
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -3512,6 +3610,9 @@ static void admin_handle(conn_t *c)
 
 static void retire_config(config_t *old)
 {
+#ifdef LIMER_H2
+    h2u_retire_config(old);
+#endif
     /* close idle upstream connections and health checks that belong to the old config */
     uconn_t *uc = g_uconns;
     while (uc) {
@@ -3668,7 +3769,7 @@ static void tick(void)
             case CS_UPSTREAM:
                 if (c->uc) {
                     uconn_t *uc = c->uc;
-                    int connecting = uc->state == US_CONNECTING || uc->state == US_HANDSHAKE;
+                    int connecting = uc->state == US_CONNECTING || uc->state == US_HANDSHAKE || !uc->connected;
                     uconn_fail(uc, connecting ? "connect timeout" : "response timeout", 504,
                                connecting || (!uc->got_bytes && (uc->reused || method_idempotent(c->req.method))));
                 } else {
@@ -3699,6 +3800,9 @@ static void tick(void)
         }
 
     health_tick();
+#ifdef LIMER_H2
+    h2u_tick();
+#endif
     reap_graveyard();
 }
 
@@ -3812,6 +3916,10 @@ int proxy_run(config_t *cfg, int worker_id)
         conn_close(g_conns);
     while (g_uconns)
         uconn_close(g_uconns);
+#ifdef LIMER_H2
+    while (g_h2u_sessions)
+        h2u_session_close(g_h2u_sessions);
+#endif
     reap_graveyard();
     while (g_listeners) {
         listener_t *l = g_listeners;
