@@ -201,6 +201,7 @@ typedef struct conn {
     int upstream_paused;
     int expect_sent;
     int upstream_reusable;      /* response framing allows pooling the upstream conn */
+    int set_sticky;             /* add the sticky-session cookie to the response */
     int resp_committed;         /* some response bytes reached the socket */
     size_t resp_head_mark;      /* wbuf readable length before the response head */
     int pre_head_close;         /* close_after_write before the head was built */
@@ -507,6 +508,18 @@ static void expand_placeholders(const char *v, conn_t *c, buf_t *out)
             snprintf(hn, sizeof hn, "%.*s", (int)(n - 7), name + 7);
             const char *h = http_hdr_get(c->req.hdrs, c->req.nhdr, hn);
             buf_puts(out, h ? h : "");
+        } else if ((n > 5 && memcmp(name, "json.", 5) == 0) || (n > 6 && memcmp(name, "query.", 6) == 0) ||
+                   (n > 7 && memcmp(name, "cookie.", 7) == 0) || (n > 5 && memcmp(name, "form.", 5) == 0)) {
+            size_t pl = name[0] == 'j' ? 5 : name[0] == 'q' ? 6 : name[0] == 'c' ? 7 : 5;
+            char kn[256];
+            snprintf(kn, sizeof kn, "%.*s", (int)(n - pl), name + pl);
+            keysrc_t ks = { name[0] == 'j' ? KS_JSON : name[0] == 'q' ? KS_QUERY : name[0] == 'c' ? KS_COOKIE : KS_FORM, kn };
+            buf_t v;
+            buf_init(&v);
+            c->ctx.req = &c->req;
+            if (key_extract(&ks, &c->ctx, &v))
+                buf_append(out, buf_rptr(&v), buf_readable(&v));
+            buf_free(&v);
         } else {
             buf_append(out, p, n + 2);
         }
@@ -715,6 +728,7 @@ static void conn_reset_request(conn_t *c)
     c->upstream_paused = 0;
     c->expect_sent = 0;
     c->upstream_reusable = 0;
+    c->set_sticky = 0;
     c->resp_committed = 0;
     c->resp_head_mark = 0;
     c->pre_head_close = 0;
@@ -1427,6 +1441,13 @@ static void conn_try_upstream(conn_t *c)
     c->up = u;
     u->active++;
     u->requests++;
+    if (p->policy == LB_STICKY) {
+        buf_t ck;
+        buf_init(&ck);
+        c->set_sticky = !(key_extract(&p->key, &c->ctx, &ck) && buf_readable(&ck) == 16 &&
+                          memcmp(buf_rptr(&ck), u->sticky_id, 16) == 0);
+        buf_free(&ck);
+    }
     uconn_t *uc = uconn_take_idle(u);
     if (!uc) {
         uc = uconn_connect(u, p, c->cfg);
@@ -1555,6 +1576,11 @@ static void build_client_response_head(conn_t *c, uconn_t *uc)
         hlist_add(&h, "Connection", "Upgrade");
     else
         hlist_add(&h, "Connection", keep ? "keep-alive" : "close");
+    if (c->set_sticky && c->up) {
+        char ck[160];
+        snprintf(ck, sizeof ck, "%s=%s; Path=/; HttpOnly%s", p->key.name, c->up->sticky_id, c->ctx.tls ? "; Secure" : "");
+        hlist_add(&h, "Set-Cookie", ck);
+    }
     if (c->srv->n_hdr_down)
         hlist_apply_ops(&h, c->srv->hdr_down, c->srv->n_hdr_down, c);
     hlist_apply_ops(&h, p->hdr_down, p->n_hdr_down, c);
@@ -1975,6 +2001,29 @@ static void apply_rewrites(conn_t *c, const route_t *r)
     }
 }
 
+/* Returns 1 when the request may proceed; otherwise a 429 was written. */
+static int conn_rate_limited(conn_t *c, rate_limit_cfg_t *rl)
+{
+    buf_t key;
+    buf_init(&key);
+    expand_placeholders(rl->key, c, &key);
+    buf_append(&key, "", 1);
+    double retry = 0;
+    int ok = ratelimit_check(rl->rl, key.data, g_now, &retry);
+    buf_free(&key);
+    if (ok)
+        return 0;
+    char extra[160];
+    snprintf(extra, sizeof extra, "Retry-After: %d\r\nX-RateLimit-Limit: %g\r\nX-RateLimit-Remaining: 0\r\n",
+             (int)(retry + 0.999), ratelimit_rate(rl->rl));
+    char body[128];
+    int n = snprintf(body, sizeof body, "%d %s\nrate limit exceeded\n", rl->status, http_status_reason(rl->status));
+    conn_write_simple_response(c, rl->status, "text/plain; charset=utf-8", body, (size_t)(n < 0 ? 0 : n), NULL, 0, extra);
+    c->state = CS_LOCAL;
+    conn_next_request(c);
+    return 1;
+}
+
 static void conn_respond_unauthorized(conn_t *c, const basic_auth_t *a)
 {
     char extra[512];
@@ -2042,6 +2091,8 @@ static void conn_dispatch(conn_t *c)
         return;
     }
 
+    if (c->srv->rl && conn_rate_limited(c, c->srv->rl))
+        return;
     if (c->srv->auth && !auth_verify(c->srv->auth, http_hdr_get(r->hdrs, r->nhdr, "Authorization"))) {
         conn_respond_unauthorized(c, c->srv->auth);
         return;
@@ -2058,6 +2109,8 @@ static void conn_dispatch(conn_t *c)
         conn_send_error(c, 404, "no route matched the request", 0);
         return;
     }
+    if (route->rl && conn_rate_limited(c, route->rl))
+        return;
     if (route->auth && !auth_verify(route->auth, http_hdr_get(r->hdrs, r->nhdr, "Authorization"))) {
         conn_respond_unauthorized(c, route->auth);
         return;
@@ -3230,10 +3283,10 @@ static void admin_upstreams_json(buf_t *b)
                     buf_puts(b, ",");
                 buf_puts(b, "{\"address\":");
                 json_escape(b, u->hostport);
-                buf_printf(b, ",\"weight\":%d,\"healthy\":%s,\"active_requests\":%d,\"idle_connections\":%d,"
+                buf_printf(b, ",\"weight\":%d,\"drained\":%s,\"healthy\":%s,\"active_requests\":%d,\"idle_connections\":%d,"
                               "\"requests\":%llu,\"responses\":%llu,\"failures\":%llu,\"passive_down_for\":%.1f,"
                               "\"active_check\":",
-                           u->weight, upstream_healthy(u, g_now) ? "true" : "false", u->active, u->nidle,
+                           u->weight, u->drained ? "true" : "false", upstream_healthy(u, g_now) ? "true" : "false", u->active, u->nidle,
                            (unsigned long long)u->requests, (unsigned long long)u->responses,
                            (unsigned long long)u->failures,
                            u->fail_until > g_now ? u->fail_until - g_now : 0.0);
@@ -3264,6 +3317,21 @@ static void admin_metrics(buf_t *b)
     buf_printf(b, "limer_connections_active{worker=\"%d\"} %d\n", g_worker_id, g_stats.active_conns);
     buf_puts(b, "# HELP limer_upstream_connections Open upstream connections (active + idle).\n# TYPE limer_upstream_connections gauge\n");
     buf_printf(b, "limer_upstream_connections{worker=\"%d\"} %d\n", g_worker_id, g_stats.active_uconns);
+    buf_puts(b, "# HELP limer_rate_limit_total Requests checked and limited per zone.\n# TYPE limer_rate_limit_total counter\n");
+    for (int i = 0; i < g_cfg->nservers; i++) {
+        server_t *s = g_cfg->servers[i];
+        for (int r = -1; r < s->nroutes; r++) {
+            rate_limit_cfg_t *rl = r < 0 ? s->rl : s->routes[r]->rl;
+            if (!rl)
+                continue;
+            uint64_t hits, limited;
+            int keys;
+            ratelimit_stats(rl->rl, &hits, &limited, &keys);
+            buf_printf(b, "limer_rate_limit_total{worker=\"%d\",zone=\"%s\",result=\"checked\"} %llu\n", g_worker_id, rl->name, (unsigned long long)hits);
+            buf_printf(b, "limer_rate_limit_total{worker=\"%d\",zone=\"%s\",result=\"limited\"} %llu\n", g_worker_id, rl->name, (unsigned long long)limited);
+            buf_printf(b, "limer_rate_limit_keys{worker=\"%d\",zone=\"%s\"} %d\n", g_worker_id, rl->name, keys);
+        }
+    }
     buf_puts(b, "# HELP limer_upstream_healthy Whether an upstream is eligible for traffic.\n# TYPE limer_upstream_healthy gauge\n");
     buf_puts(b, "# HELP limer_upstream_requests_total Requests sent to an upstream.\n# TYPE limer_upstream_requests_total counter\n");
     buf_puts(b, "# HELP limer_upstream_failures_total Failures recorded for an upstream.\n# TYPE limer_upstream_failures_total counter\n");

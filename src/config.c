@@ -593,6 +593,16 @@ static void auth_free(basic_auth_t *a)
     free(a);
 }
 
+static void rl_cfg_free(rate_limit_cfg_t *r)
+{
+    if (!r)
+        return;
+    free(r->name);
+    free(r->key);
+    ratelimit_free(r->rl);
+    free(r);
+}
+
 static void files_free(file_server_t *f)
 {
     if (!f)
@@ -647,6 +657,7 @@ static void route_free(route_t *r)
     free(r->rw);
     auth_free(r->auth);
     files_free(r->files);
+    rl_cfg_free(r->rl);
     free(r);
 }
 
@@ -668,6 +679,7 @@ static void server_free(server_t *s)
     hdr_ops_free(s->hdr_down, s->n_hdr_down);
     hdr_ops_free(s->hdr_up, s->n_hdr_up);
     auth_free(s->auth);
+    rl_cfg_free(s->rl);
     free(s->encode);
     if (s->log_fd > 2)
         close(s->log_fd);
@@ -762,6 +774,7 @@ static int pool_add_upstream(pool_t *p, const char *spec, int line, char *err, s
     else
         snprintf(hp, sizeof hp, "%s:%d", u->host, u->port);
     u->hostport = xstrdup(hp);
+    snprintf(u->sticky_id, sizeof u->sticky_id, "%016llx", (unsigned long long)hash64(hp, strlen(hp)));
     if (resolve_upstream(u, line, err, errlen) < 0) {
         free(u->host);
         free(u->hostport);
@@ -872,6 +885,11 @@ static int parse_lb_policy(pool_t *p, node_t *d, char *err, size_t errlen)
     } else if (strcaseeq(pol, "uri_hash")) {
         p->policy = LB_HASH;
         p->key.src = KS_URI;
+    } else if (strcaseeq(pol, "sticky_cookie") || strcaseeq(pol, "cookie_sticky")) {
+        p->policy = LB_STICKY;
+        p->key.src = KS_COOKIE;
+        p->key.name = xstrdup(d->nargs > 2 ? d->args[2] : "limer_sticky");
+        return 0;
     } else {
         int argi = 1;
         if (strcaseeq(pol, "hash") || strcaseeq(pol, "payload") || strcaseeq(pol, "payload_hash")) {
@@ -1175,6 +1193,99 @@ static void route_add_rewrite(route_t *r, int kind, const char *a, const char *b
     r->nrw++;
 }
 
+/* "10r/s", "600r/m", "100r/h", or a plain number per second */
+static int parse_rate(const char *s, double *out)
+{
+    char *end;
+    double v = strtod(s, &end);
+    if (end == s || v <= 0)
+        return -1;
+    if (*end == 0) {
+        *out = v;
+        return 0;
+    }
+    if (strcmp(end, "r/s") == 0 || strcmp(end, "/s") == 0)
+        *out = v;
+    else if (strcmp(end, "r/m") == 0 || strcmp(end, "/m") == 0)
+        *out = v / 60.0;
+    else if (strcmp(end, "r/h") == 0 || strcmp(end, "/h") == 0)
+        *out = v / 3600.0;
+    else
+        return -1;
+    return 0;
+}
+
+/* rate_limit [zone] [rate] { key <tmpl>; rate <r>; burst <n>; status <code>; max_keys <n> } */
+static int parse_rate_limit(rate_limit_cfg_t **out, node_t *d, char *err, size_t errlen)
+{
+    rate_limit_cfg_t *r = xcalloc(1, sizeof *r);
+    r->status = 429;
+    r->max_keys = 100000;
+    int ai = 1;
+    if (ai < d->nargs && parse_rate(d->args[ai], &r->rate) < 0) {
+        r->name = xstrdup(d->args[ai++]);
+        if (ai < d->nargs && parse_rate(d->args[ai], &r->rate) == 0)
+            ai++;
+    } else if (ai < d->nargs) {
+        ai++;
+    }
+    if (ai < d->nargs) {
+        rl_cfg_free(r);
+        FAIL("line %d: rate_limit accepts [zone] [rate] followed by an options block", d->line);
+    }
+    for (int i = 0; i < d->nkids; i++) {
+        node_t *k = d->kids[i];
+        const char *n = k->args[0];
+        int rc = 0;
+        if (strcaseeq(n, "key")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0) {
+                free(r->key);
+                r->key = xstrdup(k->args[1]);
+            }
+        } else if (strcaseeq(n, "rate") || strcaseeq(n, "events")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0 && parse_rate(k->args[1], &r->rate) < 0) {
+                snprintf(err, errlen, "line %d: invalid rate '%s' (use e.g. 10r/s, 600r/m)", k->line, k->args[1]);
+                rc = -1;
+            }
+        } else if (strcaseeq(n, "burst")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0) {
+                r->burst = atof(k->args[1]);
+                if (r->burst <= 0) {
+                    snprintf(err, errlen, "line %d: burst must be positive", k->line);
+                    rc = -1;
+                }
+            }
+        } else if (strcaseeq(n, "status")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0)
+                rc = arg_int(k, 1, &r->status, 400, 599, err, errlen);
+        } else if (strcaseeq(n, "max_keys")) {
+            if ((rc = want_args(k, 1, 1, err, errlen)) == 0)
+                rc = arg_int(k, 1, &r->max_keys, 1, 100000000, err, errlen);
+        } else {
+            snprintf(err, errlen, "line %d: unknown rate_limit option '%s'", k->line, n);
+            rc = -1;
+        }
+        if (rc < 0) {
+            rl_cfg_free(r);
+            return -1;
+        }
+    }
+    if (r->rate <= 0) {
+        rl_cfg_free(r);
+        FAIL("line %d: rate_limit needs a rate (e.g. 'rate 10r/s')", d->line);
+    }
+    if (!r->key)
+        r->key = xstrdup("{remote_ip}");
+    if (!r->name)
+        r->name = xstrdup("default");
+    if (r->burst <= 0)
+        r->burst = r->rate < 1 ? 1 : r->rate;
+    r->rl = ratelimit_new(r->rate, r->burst, r->max_keys);
+    rl_cfg_free(*out);
+    *out = r;
+    return 0;
+}
+
 static int parse_basic_auth(basic_auth_t **out, node_t *d, char *err, size_t errlen)
 {
     /* basic_auth [bcrypt] [realm] { user hash ... } */
@@ -1441,6 +1552,9 @@ static int parse_route_directive(route_t *r, pool_t *p, node_t *c, char **root_h
     }
     if (strcaseeq(k, "basic_auth") || strcaseeq(k, "basicauth")) {
         return parse_basic_auth(&r->auth, c, err, errlen) < 0 ? -1 : 1;
+    }
+    if (strcaseeq(k, "rate_limit")) {
+        return parse_rate_limit(&r->rl, c, err, errlen) < 0 ? -1 : 1;
     }
     if (strcaseeq(k, "header") || strcaseeq(k, "header_down")) {
         return add_hdr_ops(&p->hdr_down, &p->n_hdr_down, c, err, errlen) < 0 ? -1 : 1;
@@ -1918,6 +2032,8 @@ static int parse_server(config_t *cfg, node_t *d, char *err, size_t errlen)
             rc = add_hdr_ops(&s->hdr_up, &s->n_hdr_up, c, err, errlen);
         } else if (strcaseeq(k, "basic_auth") || strcaseeq(k, "basicauth")) {
             rc = parse_basic_auth(&s->auth, c, err, errlen);
+        } else if (strcaseeq(k, "rate_limit")) {
+            rc = parse_rate_limit(&s->rl, c, err, errlen);
         } else if (strcaseeq(k, "encode")) {
             if ((rc = want_args(c, 0, -1, err, errlen)) == 0) {
                 buf_t b;
