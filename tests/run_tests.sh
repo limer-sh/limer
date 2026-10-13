@@ -120,7 +120,7 @@ cat > "$TMP/Limerfile" <<'CFG'
     route cookie-sticky {
         match path /cookie
         to 127.0.0.1:9101 127.0.0.1:9102 127.0.0.1:9103
-        lb_policy cookie sid
+        lb_policy hash cookie sid
     }
 
     route slow {

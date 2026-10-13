@@ -937,7 +937,7 @@ static int add_hdr_ops(hdr_op_t **ops, int *n, node_t *d, char *err, size_t errl
 
 static int parse_lb_policy(pool_t *p, node_t *d, char *err, size_t errlen)
 {
-    if (want_args(d, 1, 3, err, errlen) < 0)
+    if (want_args(d, 1, 4, err, errlen) < 0)
         return -1;
     const char *pol = d->args[1];
     free(p->key.name);
@@ -958,9 +958,18 @@ static int parse_lb_policy(pool_t *p, node_t *d, char *err, size_t errlen)
         p->policy = LB_HASH;
         p->key.src = KS_URI;
     } else if (strcaseeq(pol, "sticky_cookie") || strcaseeq(pol, "cookie_sticky")) {
+        if (d->nargs > 3)
+            FAIL("line %d: 'lb_policy %s' takes at most a cookie name", d->line, pol);
         p->policy = LB_STICKY;
         p->key.src = KS_COOKIE;
         p->key.name = xstrdup(d->nargs > 2 ? d->args[2] : "limer_sticky");
+        return 0;
+    } else if (strcaseeq(pol, "cookie")) {
+        /* Caddy's `lb_policy cookie [name [secret]]`: same sticky sessions, Caddy's default name;
+         * the secret only shapes Caddy's cookie value and is accepted and ignored. */
+        p->policy = LB_STICKY;
+        p->key.src = KS_COOKIE;
+        p->key.name = xstrdup(d->nargs > 2 ? d->args[2] : "lb");
         return 0;
     } else {
         int argi = 1;

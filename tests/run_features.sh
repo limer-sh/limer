@@ -244,6 +244,9 @@ sleep 0.2
 expect_contains "json access log" "$(tail -1 $TMP/one.log)" '"host":"one.test"'
 expect_contains "json access log fields" "$(tail -1 $TMP/one.log)" '"uri":"/logme","proto":"HTTP/1.1","tls":false,"status":200'
 expect_contains "common access log file" "$(tail -1 $TMP/access.log)" 'route='
+curl -s $B/echo >/dev/null
+sleep 0.2
+expect_contains "common access log names the upstream" "$(tail -1 $TMP/access.log)" 'upstream=127.0.0.1:9701'
 
 echo "# static files"
 F=http://127.0.0.1:9785
@@ -391,10 +394,13 @@ if $BIN version | grep -q "http/2"; then
     expect_eq "h2 session reused across requests" "$($H2 -o /dev/null -o /dev/null -o /dev/null -w '%{num_connects} ' https://beta.test:9781/ https://beta.test:9781/echo https://beta.test:9781/)" "1 0 0 "
     expect_contains "h2 respond header ops" "$($H2 -D - -o /dev/null https://beta.test:9781/)" "x-site: beta"
     expect_eq "h1 still works on the same listener" "$(curl -sk --http1.1 --resolve beta.test:9781:127.0.0.1 -o /dev/null -w '%{http_version}' https://beta.test:9781/)" "1.1"
-    # http/2 on the static/encode site: give it a tls listener
+    # http/2 on the static/encode site: give it a tls listener. Every https site also gets an http
+    # redirect listener on http_port, which defaults to 80: set it, or an unprivileged test run
+    # (CI, a box where 80 is taken) cannot bind and limer exits before the first request.
     cat > "$TMP/h2files.conf" <<CFG
 {
     log_level warn
+    http_port 9870
 }
 https://localhost:9789 {
     tls internal
@@ -486,6 +492,10 @@ cat > "$TMP/sticky.conf" <<CFG
     log_level warn
 }
 :9792 {
+    log {
+        output file $TMP/sticky.log
+        format json
+    }
     reverse_proxy 127.0.0.1:9701 127.0.0.1:9702 {
         lb_policy sticky_cookie session
     }
@@ -505,6 +515,14 @@ expect_not_contains "no Set-Cookie when the cookie already matches" "$(curl -s -
 both=$(for i in 1 2 3 4 5 6; do echo "$(curl -s http://127.0.0.1:9792/)"; done | sort -u | wc -l)
 expect_eq "cookie-less requests are spread" "$both" "2"
 expect_contains "unknown cookie value gets a fresh assignment" "$(curl -s -D - -o /dev/null -b 'session=0000000000000000' http://127.0.0.1:9792/)" "Set-Cookie: session="
+sleep 0.2
+expect_contains "json access log names the upstream after the response" "$(tail -1 $TMP/sticky.log)" '"upstream":"127.0.0.1:970'
+printf '{\n    log_level warn\n}\n:9793 {\n    reverse_proxy 127.0.0.1:9701 127.0.0.1:9702 {\n        lb_policy cookie rct_lb somesecret\n    }\n}\n' > "$TMP/cookie.conf"
+out=$($BIN validate -c "$TMP/cookie.conf" 2>&1)
+expect_contains "caddy-style 'lb_policy cookie name secret' validates" "$out" "valid"
+printf '{\n    log_level warn\n}\n:9793 {\n    reverse_proxy 127.0.0.1:9701 127.0.0.1:9702 {\n        lb_policy round_robin extra\n    }\n}\n' > "$TMP/cookie-bad.conf"
+out=$($BIN validate -c "$TMP/cookie-bad.conf" 2>&1)
+expect_contains "extra lb_policy arguments are still rejected" "$out" "takes no arguments"
 kill -TERM $STP; wait $STP 2>/dev/null
 
 echo "# runtime admin api: drain, weights, overrides"
@@ -565,6 +583,7 @@ if $BIN version | grep -q "http/2" && python3 -c "import grpc, grpc_tools" 2>/de
     cat > "$TMP/grpc.conf" <<CFG
 {
     log_level warn
+    http_port 9871
 }
 https://localhost:9795 {
     tls internal
@@ -587,7 +606,8 @@ CFG
     wait_port 9795
     openssl s_client -connect 127.0.0.1:9795 -servername localhost </dev/null 2>/dev/null | openssl x509 > "$TMP/limer-localhost.crt" 2>/dev/null
     out=$(python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost 2>&1)
-    expect_contains "grpc unary call through limer (h2 in, h2c out)" "$out" "pong:hello:xff=127.0.0.1 server=grpc-"
+    # the client may reach localhost over ::1 or 127.0.0.1; either must be forwarded
+    case "$out" in pong:hello:xff=127.0.0.1\ server=grpc-*|pong:hello:xff=::1\ server=grpc-*) ok "grpc unary call through limer (h2 in, h2c out)";; *) fail "grpc unary call through limer (h2 in, h2c out)" "$out";; esac
     expect_contains "grpc trailing metadata preserved" "$out" "trailer-x-server=grpc-"
     expect_contains "grpc unary round robin reaches both" "$(for i in 1 2 3 4; do python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost 2>&1; done | grep -o 'server=grpc-[ab]' | sort -u | tr '\n' ' ')" "server=grpc-a server=grpc-b"
     out=$(python3 tests/grpc_service.py call localhost:9795 --tls "$TMP/limer-localhost.crt" --sni localhost --stream 500 2>&1)
@@ -622,6 +642,7 @@ cat > "$TMP/stream.conf" <<CFG
 {
     log_level warn
     admin off
+    http_port 9872
 }
 :9798 {
     request_body {
@@ -847,6 +868,7 @@ mkcert client ca "/O=Limer Test/OU=ops/CN=alice"
 mkcert rogue other-ca "/CN=mallory"
 cat > "$MT/Limerfile" <<CFG
 {
+    http_port 9873
     https_port 9815
     admin off
     log_level warn
