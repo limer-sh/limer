@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -529,4 +530,21 @@ char *path_clean(const char *path)
     char *out = xstrdup(b.data);
     buf_free(&b);
     return out;
+}
+
+int mkdir_p(const char *path)
+{
+    char tmp[2048];
+    snprintf(tmp, sizeof tmp, "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            if (mkdir(tmp, 0700) < 0 && errno != EEXIST)
+                return -1;
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, 0700) < 0 && errno != EEXIST)
+        return -1;
+    return 0;
 }

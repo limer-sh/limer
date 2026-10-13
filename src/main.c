@@ -168,7 +168,9 @@ static int run_master(config_t *cfg, const char *cfg_path, int nworkers)
             m_got_hup = 0;
             if (!stopping) {
                 char err[512];
+                config_lenient_resolve = 1; /* workers keep known addresses for names DNS cannot answer right now */
                 config_t *test = config_load(cfg_path, err, sizeof err);
+                config_lenient_resolve = 0;
                 if (!test) {
                     LOGE("reload: configuration invalid, not reloading workers: %s", err);
                 } else {
@@ -330,7 +332,9 @@ int main(int argc, char **argv)
         return 0;
     }
     if (strcmp(cmd, "version") == 0) {
-#ifdef LIMER_TLS
+#if defined(LIMER_TLS) && defined(LIMER_H2)
+        printf("limer %s (tls, http/2)\n", LIMER_VERSION);
+#elif defined(LIMER_TLS)
         printf("limer %s (tls)\n", LIMER_VERSION);
 #else
         printf("limer %s\n", LIMER_VERSION);

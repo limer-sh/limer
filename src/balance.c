@@ -12,6 +12,7 @@ const char *lb_policy_name(int p)
     case LB_RANDOM: return "random";
     case LB_FIRST: return "first";
     case LB_HASH: return "hash";
+    case LB_STICKY: return "sticky_cookie";
     }
     return "?";
 }
@@ -31,12 +32,15 @@ const char *keysrc_name(int s)
     case KS_BODY: return "body";
     case KS_METHOD: return "method";
     case KS_HOST: return "host";
+    case KS_TLS_CLIENT: return "tls_client";
     }
     return "?";
 }
 
 int upstream_healthy(const upstream_t *u, double now)
 {
+    if (u->drained)
+        return 0;
     if (u->hc_status < 0)
         return 0;
     if (u->fail_until > now)
@@ -174,6 +178,33 @@ upstream_t *pool_select(pool_t *p, const req_ctx_t *ctx, uint64_t tried, double 
             u = pick_wrr(p, tried, now, &idx);
             if (why)
                 snprintf(why, whylen, "hash(key missing; round_robin)");
+        }
+        buf_free(&key);
+        break;
+    }
+    case LB_STICKY: {
+        /* the cookie names the upstream; fall back to round robin when it is
+         * missing, unknown or points at an unhealthy upstream */
+        buf_t key;
+        buf_init(&key);
+        if (ctx && key_extract(&p->key, ctx, &key) && buf_readable(&key) == 16) {
+            for (int i = 0; i < p->nups; i++) {
+                if ((tried >> i) & 1 || !upstream_healthy(p->ups[i], now))
+                    continue;
+                if (memcmp(p->ups[i]->sticky_id, buf_rptr(&key), 16) == 0) {
+                    u = p->ups[i];
+                    idx = i;
+                    break;
+                }
+            }
+        }
+        if (u) {
+            if (why)
+                snprintf(why, whylen, "sticky_cookie");
+        } else {
+            u = pick_wrr(p, tried, now, &idx);
+            if (why)
+                snprintf(why, whylen, "sticky_cookie(new; round_robin)");
         }
         buf_free(&key);
         break;

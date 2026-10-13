@@ -70,6 +70,7 @@ int is_ip_literal(const char *s);
 size_t base64_encode(const unsigned char *in, size_t n, char *out, int url);  /* out needs 4*(n/3+1)+1 */
 int    base64_decode(const char *in, size_t n, unsigned char *out, size_t outcap);  /* -1 on error */
 char  *path_clean(const char *path);   /* collapse //, ., ..; result starts with '/'; NULL if escaping */
+int    mkdir_p(const char *path);
 
 /* ------------------------------------------------------------------ */
 /* Growable buffer                                                     */
@@ -114,6 +115,7 @@ typedef struct chunk_state {
     int   ndigits;      /* hex digits seen in the current size line */
     size_t remaining;   /* bytes left in current chunk */
     int   done;
+    buf_t *trailers;    /* optional: raw trailer lines ("name: value\r\n"...) are appended here */
 } chunk_state_t;
 
 typedef struct http_req {
@@ -195,6 +197,7 @@ enum lb_policy {
     LB_RANDOM,
     LB_FIRST,
     LB_HASH,            /* rendezvous hash on a key source */
+    LB_STICKY,          /* cookie-based sticky sessions */
 };
 
 enum key_src {
@@ -210,7 +213,20 @@ enum key_src {
     KS_BODY,
     KS_METHOD,
     KS_HOST,
+    KS_TLS_CLIENT,      /* client certificate: subject, issuer, serial, fingerprint, verified */
 };
+
+/* What the TLS client presented (filled after the handshake). */
+typedef struct tls_client_info {
+    int  present;             /* a certificate was presented */
+    int  verified;            /* ... and it chains to a trusted CA */
+    char subject[512];
+    char issuer[512];
+    char serial[96];
+    char fingerprint[72];     /* sha256, lowercase hex */
+} tls_client_info_t;
+
+enum client_auth_mode { CA_NONE = 0, CA_REQUEST, CA_REQUIRE, CA_VERIFY_IF_GIVEN, CA_REQUIRE_AND_VERIFY };
 
 typedef struct keysrc {
     int   src;      /* enum key_src */
@@ -230,6 +246,9 @@ typedef struct matcher {
     regex_t *re;        /* compiled for OP_RE / OP_NRE, one per value */
     double  *nums;      /* parsed for numeric ops */
     int      negate;
+    int      is_split;  /* traffic split: match a deterministic fraction of requests */
+    double   split_pct; /* 0..100 */
+    keysrc_t split_key; /* key the split hashes (default client_ip) */
 } matcher_t;
 
 typedef struct hdr_op {
@@ -246,11 +265,19 @@ typedef struct upstream {
     char *host;
     int   port;
     int   weight;
+    int   tls;                /* connect with TLS (https:// upstream) */
+    int   h2;                 /* speak HTTP/2 (h2c:// or transport versions h2) */
+    void *h2u;                /* runtime: current HTTP/2 session */
     struct sockaddr_storage addr;
     socklen_t addrlen;
     int   resolved;
+    int   dynamic;            /* came from a DNS lookup (dynamic a / srv) */
+    double resolve_next;      /* runtime: next re-resolution of a named static upstream */
+    int   gone;               /* removed from the pool; freed once nothing references it */
 
     /* runtime state */
+    int   drained;            /* runtime: take no new requests */
+    char  sticky_id[20];      /* value used in sticky cookies */
     int   active;             /* in-flight requests */
     uint64_t requests;
     uint64_t failures;
@@ -291,6 +318,27 @@ typedef struct pool {
     hdr_op_t *hdr_up;   int n_hdr_up;
     hdr_op_t *hdr_down; int n_hdr_down;
     int   preserve_host;      /* pass Host header through (default on) */
+    int   upstream_h2;        /* 1 = h2 over TLS, 2 = h2c, applied to all upstreams */
+    int   tls_insecure;       /* skip upstream certificate verification */
+    char *tls_server_name;    /* SNI / verification name for upstream TLS */
+    char *tls_ca;             /* PEM bundle to trust for upstream TLS */
+    char *tls_client_cert;    /* client certificate (chain) presented to upstreams */
+    char *tls_client_key;
+    int   tls_all;            /* `tls` in the pool block: every upstream speaks TLS */
+    struct pool *mirror;      /* shadow pool: a copy of the request is sent here, response discarded */
+    double mirror_sample;     /* 0..100 percent of requests to mirror (default 100) */
+    /* dynamic upstreams */
+    int   dyn_kind;           /* 0 static, 1 A/AAAA lookup, 2 SRV lookup */
+    char *dyn_name;
+    int   dyn_port;           /* for A lookups */
+    double refresh;           /* re-resolution interval, 0 = never */
+    double dyn_next;          /* runtime: next lookup */
+    int   dyn_inflight;       /* runtime: a lookup is queued */
+    upstream_t **retired;     /* runtime: removed upstreams still referenced */
+    int   nretired;
+#ifdef LIMER_TLS
+    SSL_CTX *client_ctx;      /* for https upstreams */
+#endif
 } pool_t;
 
 enum route_kind { ROUTE_PROXY = 0, ROUTE_RESPOND, ROUTE_REDIRECT, ROUTE_ERROR, ROUTE_ABORT, ROUTE_FILES };
@@ -314,6 +362,61 @@ typedef struct basic_auth {
     char *realm;
 } basic_auth_t;
 
+/* rate limiting (ratelimit.c) */
+typedef struct ratelimit ratelimit_t;
+ratelimit_t *ratelimit_new(double rate, double burst, int max_keys);
+void         ratelimit_free(ratelimit_t *rl);
+int          ratelimit_check(ratelimit_t *rl, const char *key, double now, double *retry_after);
+void         ratelimit_stats(const ratelimit_t *rl, uint64_t *hits, uint64_t *limited, int *keys);
+double       ratelimit_rate(const ratelimit_t *rl);
+
+typedef struct rate_limit_cfg {
+    char  *name;        /* zone name for metrics */
+    char  *key;         /* placeholder template, default {remote_ip} */
+    double rate;        /* requests per second */
+    double burst;
+    int    status;      /* default 429 */
+    int    max_keys;
+    ratelimit_t *rl;    /* runtime table */
+} rate_limit_cfg_t;
+
+typedef struct cache_cfg {
+    double ttl;           /* default freshness when the response has none (0 = only cache if it says so) */
+    double swr;           /* stale-while-revalidate window */
+    size_t max_object;    /* largest response body to store */
+    int    methods_head;  /* cache HEAD as well as GET (default yes) */
+} cache_cfg_t;
+
+/* cache.c: per-worker in-memory response cache */
+typedef struct cache cache_t;
+typedef struct cache_entry cache_entry_t;
+cache_t *cache_new(size_t capacity);
+void     cache_free(cache_t *c);
+cache_entry_t *cache_get(cache_t *c, const char *key);
+void     cache_touch_stats(cache_t *c, int hit);
+int      cache_entry_state(const cache_entry_t *e, double now);   /* 0 fresh, 1 serve-stale, 2 stale */
+double   cache_entry_age(const cache_entry_t *e, double now);
+int      cache_entry_status(const cache_entry_t *e);
+const char *cache_entry_reason(const cache_entry_t *e);
+const char *cache_entry_body(const cache_entry_t *e, size_t *len);
+const char *cache_entry_etag(const cache_entry_t *e);
+const char *cache_entry_last_modified(const cache_entry_t *e);
+int      cache_entry_nhdr(const cache_entry_t *e);
+const char *cache_entry_hdr_name(const cache_entry_t *e, int i);
+const char *cache_entry_hdr_value(const cache_entry_t *e, int i);
+const char *cache_entry_vary(const cache_entry_t *e);
+const char *cache_entry_vary_val(const cache_entry_t *e);
+void     cache_entry_set_revalidating(cache_entry_t *e, int v);
+void     cache_entry_refresh(cache_t *c, cache_entry_t *e, double now, double ttl, double swr);
+void     cache_store(cache_t *c, const char *key, int status, const char *reason,
+                     const char *const *hdr_names, const char *const *hdr_values, int nhdr,
+                     const char *body, size_t body_len, double now, double ttl, double swr,
+                     const char *etag, const char *last_modified, const char *vary, const char *vary_val);
+void     cache_stats(cache_t *c, uint64_t *hits, uint64_t *misses, uint64_t *stores, uint64_t *evictions,
+                     int *count, size_t *bytes, size_t *capacity);
+int      cache_purge(cache_t *c, const char *key);
+void     cache_clear(cache_t *c);
+
 typedef struct file_server {
     char *root;
     char **index;  int nindex;
@@ -334,6 +437,9 @@ typedef struct route {
     rewrite_t *rw; int nrw;
     basic_auth_t *auth;
     file_server_t *files;
+    rate_limit_cfg_t *rl;
+    cache_cfg_t *cache;     /* response caching for this route */
+    int       needs_body;   /* a matcher, hash key or placeholder reads the request body */
 } route_t;
 
 enum tls_mode { TLS_NONE = 0, TLS_FILES, TLS_INTERNAL, TLS_AUTO };
@@ -347,6 +453,8 @@ typedef struct server {
     route_t **routes;
     int     nroutes;
     size_t  max_body;
+    int     body_mode;   /* 0 stream when nothing reads the body, 1 always buffer */
+    int     needs_body;  /* a site-level rate limit key or request_header reads the body */
     double  read_timeout;
     double  idle_timeout;
     int     access_log;
@@ -356,9 +464,14 @@ typedef struct server {
     int     tls_mode;    /* enum tls_mode */
     char   *tls_cert;
     char   *tls_key;
+    int     client_auth_mode; /* enum client_auth_mode */
+    char  **client_ca;        /* PEM files with CAs that may sign client certificates */
+    int     nclient_ca;
     hdr_op_t *hdr_down; int n_hdr_down;   /* `header` directive: all responses */
     hdr_op_t *hdr_up;   int n_hdr_up;     /* `request_header`: all proxied requests */
     basic_auth_t *auth;                   /* server-wide basic_auth */
+    rate_limit_cfg_t *rl;                 /* server-wide rate limit */
+    cache_cfg_t *cache;                   /* server-wide response caching */
     char   *encode;      /* "gzip zstd br" or NULL */
     int     encode_min;
     int     redirect_https;   /* http listener that redirects to https (auto https) */
@@ -385,10 +498,61 @@ typedef struct config {
     char    *acme_ca_root;      /* PEM bundle to trust for the ACME CA (testing) */
     char    *acme_email;
     int      acme_disabled;     /* auto_https off */
+    int      acme_challenge;    /* 0 http-01, 1 tls-alpn-01, 2 dns-01 */
+    char    *acme_dns_script;   /* "script present|cleanup <domain> <txt>" for dns-01 */
+    double   acme_dns_propagation; /* wait after "present" */
+    char   **resolvers;       /* DNS servers for upstream lookups (ip[:port]); empty = system */
+    int      nresolvers;
+    size_t   cache_capacity;  /* total response cache size per worker (0 = default) */
     int      refs;
 } config_t;
 
 config_t *config_load(const char *path, char *err, size_t errlen);
+extern int config_lenient_resolve;   /* reloads: an unresolvable named upstream keeps its old address */
+/* runtime overrides (<storage>/overrides.conf): "hostport drained=<0|1> weight=<n>" per line */
+int  overrides_apply(config_t *cfg);
+int  overrides_apply_upstream(const config_t *cfg, upstream_t *u);
+/* dynamic upstreams */
+upstream_t *upstream_new_resolved(pool_t *p, const char *host, const struct sockaddr *sa, socklen_t len, int port, int weight);
+void upstream_free(upstream_t *u);
+void pool_recompute(pool_t *p);
+int  pool_add_runtime(pool_t *p, upstream_t *u);        /* 0 ok, -1 full */
+void pool_retire_upstream(pool_t *p, int idx);          /* move ups[idx] to the retired list */
+void pool_reap_retired(pool_t *p);                      /* free retired upstreams nothing uses */
+
+/* resolver.c: DNS lookups on a helper thread */
+#define RESOLVE_MAX_RESULTS 64
+enum { RESOLVE_ADDR = 0, RESOLVE_SRV = 1 };
+typedef struct resolve_result {
+    struct sockaddr_storage addr;
+    socklen_t len;
+    int  port;
+    int  weight;
+    char target[256];
+} resolve_result_t;
+typedef struct resolve_job {
+    int  kind;
+    char name[256];
+    int  port;
+    char resolvers[4][64];
+    int  nresolvers;
+    resolve_result_t res[RESOLVE_MAX_RESULTS];
+    int  nres;
+    char err[512];
+    void *user;               /* caller context */
+    void *user2;
+    int  tag;                 /* caller's job classification */
+    struct resolve_job *next;
+} resolve_job_t;
+int  resolver_start(void);                 /* returns the fd that becomes readable when results are ready */
+void resolver_submit(resolve_job_t *job);
+resolve_job_t *resolver_take_done(void);   /* finished jobs, oldest first; NULL when none */
+void resolver_stop(void);
+void resolve_sync(resolve_job_t *job);     /* blocking lookup on the calling thread */
+void resolve_job_init(resolve_job_t *job, const config_t *cfg, int kind, const char *name, int port);
+int  overrides_set(const config_t *cfg, const char *hostport, int drained, int weight, char *err, size_t errlen); /* -1 keeps a field */
+int  overrides_clear(const config_t *cfg);
+int  overrides_list(const config_t *cfg, buf_t *json);
 config_t *config_parse(const char *text, const char *path, char *err, size_t errlen);
 void      config_ref(config_t *c);
 void      config_unref(config_t *c);
@@ -405,12 +569,17 @@ typedef struct req_ctx {
     socklen_t peerlen;
     char peer_ip[64];
     int tls;
+    const tls_client_info_t *client_cert;   /* NULL on plain connections */
 } req_ctx_t;
 
 /* Extract a key from the request. Returns 1 and fills `out` when present. */
 int  key_extract(const keysrc_t *k, const req_ctx_t *ctx, buf_t *out);
 int  matcher_eval(const matcher_t *m, const req_ctx_t *ctx);
 int  route_matches(const route_t *r, const req_ctx_t *ctx);
+int  route_prematch(const route_t *r, const req_ctx_t *ctx);  /* 0 no match, 1 match, 2 the body decides */
+int  keysrc_needs_body(const keysrc_t *k);
+int  template_needs_body(const char *tmpl);   /* placeholder string reads {json.*}, {form.*} or {body} */
+int  route_compute_needs_body(route_t *r);
 
 /* ------------------------------------------------------------------ */
 /* Balancing                                                           */
@@ -461,8 +630,13 @@ int  tls_init_server(server_t *s, char *err, size_t errlen);   /* from files */
 int  tls_init_internal(server_t *s, char *err, size_t errlen); /* self-signed for its hosts */
 int  tls_load_pem(server_t *s, const char *cert, const char *key, char *err, size_t errlen);
 void tls_free_server(server_t *s);
+void tls_client_info(SSL *ssl, tls_client_info_t *out);   /* after the handshake */
+int  tls_init_pool_client(pool_t *p, char *err, size_t errlen);  /* client context for https upstreams */
+void tls_free_pool_client(pool_t *p);
 #ifdef LIMER_TLS
 void tls_set_sni_resolver(SSL_CTX *(*fn)(SSL *, const char *));
+/* tls-alpn-01: resolver returns 1 and the key authorisation for a name under validation */
+void tls_set_acme_resolver(int (*fn)(SSL *, const char *name, char *keyauth, size_t n));
 #endif
 /* basic auth */
 int  auth_verify(const basic_auth_t *a, const char *authorization_header);

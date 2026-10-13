@@ -122,6 +122,33 @@ int key_extract(const keysrc_t *k, const req_ctx_t *ctx, buf_t *out)
             return 0;
         buf_append(out, buf_rptr(&r->body), buf_readable(&r->body));
         return 1;
+    case KS_TLS_CLIENT: {
+        const tls_client_info_t *ci = ctx->client_cert;
+        if (!ci)
+            return 0;
+        const char *f = k->name ? k->name : "subject";
+        if (strcasecmp(f, "verified") == 0) {
+            buf_puts(out, ci->present && ci->verified ? "true" : "false");
+            return 1;
+        }
+        if (strcasecmp(f, "present") == 0) {
+            buf_puts(out, ci->present ? "true" : "false");
+            return 1;
+        }
+        if (!ci->present)
+            return 0;
+        if (strcasecmp(f, "subject") == 0)
+            buf_puts(out, ci->subject);
+        else if (strcasecmp(f, "issuer") == 0)
+            buf_puts(out, ci->issuer);
+        else if (strcasecmp(f, "serial") == 0)
+            buf_puts(out, ci->serial);
+        else if (strcasecmp(f, "fingerprint") == 0)
+            buf_puts(out, ci->fingerprint);
+        else
+            return 0;
+        return 1;
+    }
     default:
         return 0;
     }
@@ -196,6 +223,18 @@ static int eval_values(const matcher_t *m, const char *v, size_t vlen)
 int matcher_eval(const matcher_t *m, const req_ctx_t *ctx)
 {
     int res;
+    if (m->is_split) {
+        /* deterministic bucketing: the same key always lands on the same side */
+        buf_t k;
+        buf_init(&k);
+        if (!key_extract(&m->split_key, ctx, &k))
+            buf_puts(&k, ctx->peer_ip);
+        uint64_t h = hash64(buf_rptr(&k), buf_readable(&k));
+        buf_free(&k);
+        double threshold = m->split_pct * (double)(UINT64_MAX / 100);
+        res = (double)h < threshold;
+        return m->negate ? !res : res;
+    }
     if (m->key.src == KS_CLIENT_IP) {
         /* remote_ip matcher uses CIDR semantics */
         res = 0;
@@ -236,4 +275,71 @@ int route_matches(const route_t *r, const req_ctx_t *ctx)
         if (!matcher_eval(&r->m[i], ctx))
             return 0;
     return 1;
+}
+
+/* ---- does evaluating this read the request body? (decides body streaming) ---- */
+
+int keysrc_needs_body(const keysrc_t *k)
+{
+    return k->src == KS_JSON || k->src == KS_FORM || k->src == KS_BODY;
+}
+
+static int matcher_needs_body(const matcher_t *m)
+{
+    return keysrc_needs_body(&m->key) || (m->is_split && keysrc_needs_body(&m->split_key));
+}
+
+int template_needs_body(const char *tmpl)
+{
+    if (!tmpl)
+        return 0;
+    return strstr(tmpl, "{json.") != NULL || strstr(tmpl, "{form.") != NULL || strstr(tmpl, "{body}") != NULL;
+}
+
+static int hdr_ops_need_body(const hdr_op_t *ops, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (template_needs_body(ops[i].value))
+            return 1;
+    return 0;
+}
+
+int route_compute_needs_body(route_t *r)
+{
+    int need = 0;
+    for (int i = 0; i < r->nm; i++)
+        if (matcher_needs_body(&r->m[i]))
+            need = 1;
+    if (r->pool && r->pool->mirror)
+        need = 1; /* the mirror needs the whole request buffered */
+    if (r->pool) {
+        if (r->pool->policy == LB_HASH && keysrc_needs_body(&r->pool->key))
+            need = 1;
+        if (hdr_ops_need_body(r->pool->hdr_up, r->pool->n_hdr_up))
+            need = 1;
+    }
+    if (r->rl && template_needs_body(r->rl->key))
+        need = 1;
+    for (int i = 0; i < r->nrw; i++)
+        if (template_needs_body(r->rw[i].a) || template_needs_body(r->rw[i].b))
+            need = 1;
+    if (hdr_ops_need_body(r->hdr_down, r->n_hdr_down))
+        need = 1;
+    r->needs_body = need;
+    return need;
+}
+
+/* Match without the body: 0 cannot match, 1 matches, 2 undecided until the body is read. */
+int route_prematch(const route_t *r, const req_ctx_t *ctx)
+{
+    int undecided = 0;
+    for (int i = 0; i < r->nm; i++) {
+        if (matcher_needs_body(&r->m[i])) {
+            undecided = 1;
+            continue;
+        }
+        if (!matcher_eval(&r->m[i], ctx))
+            return 0;
+    }
+    return (undecided || r->needs_body) ? 2 : 1;
 }

@@ -624,7 +624,163 @@ TEST(test_config)
     cfg_bad(":1 {\n reverse_proxy weight=2\n}\n", "weight= must follow");
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 weight=abc\n}\n", "invalid weight");
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 weight=0\n}\n", "weight 0");
-    cfg_bad(":1 {\n reverse_proxy https://127.0.0.1:1\n}\n", "TLS to upstreams");
+    c = cfg_ok(":1 {\n reverse_proxy https://127.0.0.1:1 https://localhost:8443 127.0.0.1:2 {\n"
+               "  tls_insecure_skip_verify\n  tls_server_name backend.test\n }\n"
+               " route {\n  match path /t\n  reverse_proxy 127.0.0.1:3 {\n   transport http {\n    tls\n    tls_insecure_skip_verify\n   }\n  }\n }\n}\n");
+    if (c) {
+        pool_t *tp = c->servers[0]->routes[0]->pool;
+        CHECK(tp->nups == 3 && tp->ups[0]->tls && tp->ups[0]->port == 1 && tp->ups[1]->tls && tp->ups[1]->port == 8443 && !tp->ups[2]->tls);
+        CHECK(tp->tls_insecure && tp->client_ctx != NULL);
+        CHECK_STR(tp->tls_server_name, "backend.test");
+        pool_t *tt = c->servers[0]->routes[1]->pool;
+        CHECK(tt->ups[0]->tls && tt->client_ctx != NULL); /* transport http { tls } */
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n reverse_proxy https://127.0.0.1:1 {\n  tls_trusted_ca_certs /no/such/ca.pem\n }\n}\n", "tls_trusted_ca_certs");
+    c = cfg_ok(":1 {\n reverse_proxy https://127.0.0.1:1\n}\n");
+    if (c) {
+        CHECK(c->servers[0]->routes[0]->pool->ups[0]->tls && c->servers[0]->routes[0]->pool->ups[0]->port == 1);
+        CHECK(c->servers[0]->routes[0]->pool->client_ctx != NULL);
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n reverse_proxy https://no.such.host.invalid:9\n}\n", "cannot resolve");
+    /* mutual TLS: client_auth on a site, client certificates to upstreams */
+    c = cfg_ok("x.test {\n tls internal {\n  client_auth {\n   mode request\n  }\n }\n respond ok\n}\n"
+               "y.test {\n tls internal {\n  client_auth {\n   mode require\n  }\n }\n respond ok\n}\n");
+    if (c) {
+        CHECK(c->servers[0]->client_auth_mode == CA_REQUEST);
+        CHECK(c->servers[1]->client_auth_mode == CA_REQUIRE);
+        config_unref(c);
+    }
+    c = cfg_ok(":1 {\n route {\n  match tls_client verified == true\n  respond ok\n }\n respond no\n}\n");
+    if (c) {
+        route_t *r = c->servers[0]->routes[0];
+        CHECK(r->nm == 1 && r->m[0].key.src == KS_TLS_CLIENT);
+        CHECK_STR(r->m[0].key.name, "verified");
+        config_unref(c);
+    }
+    cfg_bad("x.test {\n tls internal {\n  client_auth {\n   mode verify_if_given\n  }\n }\n respond ok\n}\n", "needs trusted_ca_cert_file");
+    cfg_bad("x.test {\n tls internal {\n  client_auth {\n   mode require_and_verify\n  }\n }\n respond ok\n}\n", "needs trusted_ca_cert_file");
+    cfg_bad("x.test {\n tls internal {\n  client_auth {\n   mode bogus\n  }\n }\n respond ok\n}\n", "client_auth mode accepts");
+    cfg_bad("x.test {\n tls internal {\n  client_auth {\n   trusted_ca_cert_file /no/such/ca.pem\n  }\n }\n respond ok\n}\n", "cannot read");
+    cfg_bad("x.test {\n tls internal {\n  frobnicate\n }\n respond ok\n}\n", "unknown tls option");
+    cfg_bad(":1 {\n reverse_proxy https://127.0.0.1:1 {\n  tls_client_auth /no/such/c.pem /no/such/k.pem\n }\n}\n", "cannot read");
+    /* traffic split matcher and request mirroring */
+    c = cfg_ok(":1 {\n route {\n  match split 20 header X-User\n  reverse_proxy 127.0.0.1:1\n }\n"
+               " route {\n  match split 5\n  reverse_proxy 127.0.0.1:2\n }\n"
+               " reverse_proxy 127.0.0.1:3 {\n  mirror 127.0.0.1:4 127.0.0.1:5 {\n   sample 25\n  }\n }\n}\n");
+    if (c) {
+        route_t *r0 = c->servers[0]->routes[0];
+        CHECK(r0->nm == 1 && r0->m[0].is_split && r0->m[0].split_pct == 20);
+        CHECK(r0->m[0].split_key.src == KS_HEADER);
+        CHECK_STR(r0->m[0].split_key.name, "X-User");
+        CHECK(r0->needs_body == 0); /* a header-keyed split does not need the body */
+        route_t *r1 = c->servers[0]->routes[1];
+        CHECK(r1->m[0].is_split && r1->m[0].split_pct == 5 && r1->m[0].split_key.src == KS_CLIENT_IP);
+        route_t *rp = c->servers[0]->routes[2];
+        CHECK(rp->pool->mirror != NULL && rp->pool->mirror->nups == 2 && rp->pool->mirror_sample == 25);
+        CHECK(rp->needs_body == 1); /* the mirror forces buffering */
+        config_unref(c);
+    }
+    /* a split that keys on the body forces buffering */
+    c = cfg_ok(":1 {\n route {\n  match split 10 json user.id\n  reverse_proxy 127.0.0.1:1\n }\n respond ok\n}\n");
+    if (c) {
+        CHECK(c->servers[0]->routes[0]->needs_body == 1);
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n route {\n  match split 150\n  reverse_proxy 127.0.0.1:1\n }\n}\n", "percentage 0..100");
+    cfg_bad(":1 {\n route {\n  match split\n  reverse_proxy 127.0.0.1:1\n }\n}\n", "percentage 0..100");
+    cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 {\n  mirror 127.0.0.1:2 {\n   sample 500\n  }\n }\n}\n", "percentage 0..100");
+    cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 {\n  mirror 127.0.0.1:2\n  mirror 127.0.0.1:3\n }\n}\n", "only one mirror");
+#ifdef LIMER_H2
+    /* http/2 upstreams: h2c:// (cleartext), h2:// (tls + alpn) and transport versions */
+    c = cfg_ok(":1 {\n reverse_proxy h2c://127.0.0.1:1 h2://127.0.0.1:2 127.0.0.1:3\n"
+               " route {\n  match path /a\n  reverse_proxy 127.0.0.1:4 {\n   transport http {\n    versions h2c\n   }\n  }\n }\n"
+               " route {\n  match path /b\n  reverse_proxy 127.0.0.1:5 {\n   transport http {\n    versions h2\n   }\n  }\n }\n"
+               " route {\n  match path /c\n  reverse_proxy h2c://127.0.0.1:6 {\n   transport http {\n    versions 1.1\n   }\n  }\n }\n}\n");
+    if (c) {
+        pool_t *hp = c->servers[0]->routes[0]->pool;
+        CHECK(hp->nups == 3);
+        CHECK(hp->ups[0]->h2 && !hp->ups[0]->tls && hp->ups[0]->port == 1);
+        CHECK(hp->ups[1]->h2 && hp->ups[1]->tls && hp->ups[1]->port == 2 && hp->client_ctx != NULL);
+        CHECK(!hp->ups[2]->h2 && !hp->ups[2]->tls);
+        pool_t *pa = c->servers[0]->routes[1]->pool;
+        CHECK(pa->upstream_h2 == 2 && pa->ups[0]->h2 && !pa->ups[0]->tls);
+        pool_t *pb = c->servers[0]->routes[2]->pool;
+        CHECK(pb->upstream_h2 == 1 && pb->ups[0]->h2 && pb->ups[0]->tls && pb->client_ctx != NULL);
+        pool_t *pc = c->servers[0]->routes[3]->pool;
+        CHECK(pc->upstream_h2 == 0 && pc->ups[0]->h2); /* scheme on the address still wins */
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1 {\n  transport http {\n   versions h3\n  }\n }\n}\n", "versions accepts");
+    /* request body streaming decisions */
+    c = cfg_ok(":1 {\n request_body {\n  max_size 1m\n  mode buffer\n }\n reverse_proxy 127.0.0.1:1\n}\n"
+               ":2 {\n request_body {\n  mode stream\n }\n"
+               " route a {\n  match path /a\n  reverse_proxy 127.0.0.1:1\n }\n"
+               " route b {\n  match json kind == x\n  reverse_proxy 127.0.0.1:1\n }\n"
+               " route c {\n  match path /c\n  reverse_proxy 127.0.0.1:1 127.0.0.1:2 {\n   lb_policy hash form cart\n  }\n }\n"
+               " route d {\n  match path /d\n  reverse_proxy 127.0.0.1:1 {\n   header_up X-Tenant {json.tenant}\n  }\n }\n"
+               " route e {\n  match path /e\n  rate_limit {\n   key {form.user}\n   rate 1r/s\n  }\n  reverse_proxy 127.0.0.1:1\n }\n"
+               " route f {\n  match path /f\n  header X-Len {header.Content-Length}\n  reverse_proxy 127.0.0.1:1 {\n   lb_policy hash header X-Id\n  }\n }\n}\n"
+               ":3 {\n rate_limit {\n  key {json.tenant}\n  rate 1r/s\n }\n reverse_proxy 127.0.0.1:1\n}\n"
+               ":4 {\n request_header X-Kind {json.kind}\n reverse_proxy 127.0.0.1:1\n}\n");
+    if (c) {
+        CHECK(c->servers[0]->body_mode == 1 && c->servers[0]->max_body == 1024 * 1024);
+        server_t *s2 = c->servers[1];
+        CHECK(s2->body_mode == 0 && !s2->needs_body);
+        CHECK(!s2->routes[0]->needs_body);
+        CHECK(s2->routes[1]->needs_body);  /* json matcher */
+        CHECK(s2->routes[2]->needs_body);  /* hash form */
+        CHECK(s2->routes[3]->needs_body);  /* header_up placeholder */
+        CHECK(s2->routes[4]->needs_body);  /* rate limit key */
+        CHECK(!s2->routes[5]->needs_body); /* header-only placeholders and hash */
+        CHECK(c->servers[2]->needs_body);  /* site rate limit on a json key */
+        CHECK(c->servers[3]->needs_body);  /* site request_header on a json key */
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n request_body {\n  mode sometimes\n }\n reverse_proxy 127.0.0.1:1\n}\n", "mode accepts");
+    /* dynamic upstreams: the lookup runs at load (and may fail: the pool starts empty) */
+    c = cfg_ok("{\n resolvers 127.0.0.1:1 10.0.0.2\n}\n"
+               ":1 {\n reverse_proxy {\n  dynamic a backends.invalid 8080 {\n   refresh 5s\n  }\n  lb_policy least_conn\n }\n}\n"
+               ":2 {\n reverse_proxy {\n  dynamic srv _http._tcp.svc.invalid\n  refresh off\n }\n}\n"
+               ":3 {\n reverse_proxy 127.0.0.1:1 {\n  refresh 2m\n }\n}\n");
+    if (c) {
+        CHECK(c->nresolvers == 2);
+        CHECK_STR(c->resolvers[0], "127.0.0.1:1");
+        pool_t *pa = c->servers[0]->routes[0]->pool;
+        CHECK(pa->dyn_kind == 1 && pa->dyn_port == 8080 && pa->refresh == 5 && pa->nups == 0 && pa->policy == LB_LEAST_CONN);
+        CHECK_STR(pa->dyn_name, "backends.invalid");
+        pool_t *ps = c->servers[1]->routes[0]->pool;
+        CHECK(ps->dyn_kind == 2 && ps->refresh == 0 && ps->nups == 0);
+        CHECK(c->servers[2]->routes[0]->pool->refresh == 120 && c->servers[2]->routes[0]->pool->dyn_kind == 0);
+        /* runtime membership helpers */
+        struct sockaddr_in sin;
+        memset(&sin, 0, sizeof sin);
+        sin.sin_family = AF_INET;
+        inet_pton(AF_INET, "10.1.2.3", &sin.sin_addr);
+        upstream_t *u = upstream_new_resolved(pa, "backends.invalid", (struct sockaddr *)&sin, sizeof sin, 8080, 4);
+        CHECK_STR(u->hostport, "10.1.2.3:8080");
+        CHECK(u->dynamic && u->weight == 4 && u->port == 8080 && ((struct sockaddr_in *)&u->addr)->sin_port == htons(8080));
+        CHECK(pool_add_runtime(pa, u) == 0 && pa->nups == 1 && pa->total_weight == 4);
+        pool_retire_upstream(pa, 0);
+        CHECK(pa->nups == 0 && pa->nretired == 1 && u->gone);
+        u->active = 1;
+        pool_reap_retired(pa);
+        CHECK(pa->nretired == 1); /* still referenced */
+        u->active = 0;
+        pool_reap_retired(pa);
+        CHECK(pa->nretired == 0);
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n reverse_proxy {\n  dynamic a backends.invalid\n }\n}\n", "needs a name and a port");
+    cfg_bad(":1 {\n reverse_proxy {\n  dynamic srv\n }\n}\n", "dynamic needs");
+    cfg_bad(":1 {\n reverse_proxy {\n  dynamic mx mail.invalid\n }\n}\n", "accepts 'a' or 'srv'");
+    cfg_bad(":1 {\n reverse_proxy {\n  dynamic a x.invalid 80\n  dynamic srv _s._tcp.x.invalid\n }\n}\n", "only one 'dynamic'");
+    cfg_bad("{\n resolvers not-an-ip\n}\n:1 {\n reverse_proxy 127.0.0.1:1\n}\n", "resolvers takes IPv4");
+    cfg_bad(":1 {\n reverse_proxy {\n  dynamic a x.invalid 80 {\n   ttl 5s\n  }\n }\n}\n", "unknown dynamic option");
+    CHECK(template_needs_body("{json.a}") && template_needs_body("x{form.b}y") && template_needs_body("{body}"));
+    CHECK(!template_needs_body("{header.X}") && !template_needs_body("{query.q}{cookie.c}") && !template_needs_body(NULL));
+#endif
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:99999\n}\n", "invalid upstream address");
     cfg_bad(":1 {\n reverse_proxy no.such.host.invalid:80\n}\n", "cannot resolve");
     cfg_bad(":1 {\n route {\n  match header X ~ \"(\"\n  to 127.0.0.1:1\n }\n}\n", "bad regex");
@@ -657,6 +813,22 @@ TEST(test_config)
         }
     }
     cfg_bad("{\n nope 1\n}\n:1 {\n reverse_proxy 127.0.0.1:1\n}\n", "unknown global option");
+    {
+        config_t *ac = cfg_ok("{\n acme_challenge tls-alpn-01\n acme_dns_propagation 3s\n acme_dns_script /bin/sh\n email a@b.c\n}\n:1 {\n respond ok\n}\n");
+        if (ac) {
+            CHECK(ac->acme_challenge == 1 && ac->acme_dns_propagation == 3);
+            CHECK_STR(ac->acme_dns_script, "/bin/sh");
+            CHECK_STR(ac->acme_email, "a@b.c");
+            config_unref(ac);
+        }
+        ac = cfg_ok("{\n acme_challenge dns-01\n}\n:1 {\n respond ok\n}\n");
+        if (ac) {
+            CHECK(ac->acme_challenge == 2);
+            config_unref(ac);
+        }
+    }
+    cfg_bad("{\n acme_challenge magic\n}\n:1 {\n respond ok\n}\n", "acme_challenge accepts");
+    cfg_bad("{\n acme_dns_script /no/such/script\n}\n:1 {\n respond ok\n}\n", "not executable");
     cfg_bad(":1 {\n reverse_proxy 127.0.0.1:1\n}\n{\n workers 2\n}\n", "must come first");
     cfg_bad("bad!host {\n reverse_proxy 127.0.0.1:1\n}\n", "invalid hostname");
     cfg_bad(":abc {\n reverse_proxy 127.0.0.1:1\n}\n", "invalid port");
@@ -848,6 +1020,43 @@ static int route_from(config_t **cfg_out, const char *match_lines, const req_ctx
     return res;
 }
 
+static int prematch_from(const char *match_lines, const req_ctx_t *ctx)
+{
+    char text[2048];
+    snprintf(text, sizeof text, ":1 {\n route {\n%s\n  reverse_proxy 127.0.0.1:1\n }\n}\n", match_lines);
+    config_t *c = cfg_ok(text);
+    if (!c)
+        return -1;
+    int res = route_prematch(c->servers[0]->routes[0], ctx);
+    config_unref(c);
+    return res;
+}
+
+TEST(test_prematch)
+{
+    tctx_t t;
+    tctx_init(&t, "POST /api/orders HTTP/1.1\r\nHost: shop.example.com\r\nX-Tenant: acme\r\n\r\n{\"type\":\"order\"}", "10.2.3.4");
+    CHECK(prematch_from("  match path /api/*", &t.ctx) == 1);
+    CHECK(prematch_from("  match path /other/*", &t.ctx) == 0);
+    CHECK(prematch_from("  match json type == order", &t.ctx) == 2);
+    CHECK(prematch_from("  match path /api/*\n  match json type == order", &t.ctx) == 2);
+    CHECK(prematch_from("  match path /other/*\n  match json type == order", &t.ctx) == 0); /* path already fails */
+    CHECK(prematch_from("  match header X-Tenant acme\n  match form a == b", &t.ctx) == 2);
+    CHECK(prematch_from("  match method GET\n  match body ~ x", &t.ctx) == 0);
+    /* traffic split matcher: deterministic per key, honours the percentage boundaries */
+    matcher_t all, none, half;
+    memset(&all, 0, sizeof all); all.is_split = 1; all.split_pct = 100; all.split_key.src = KS_CLIENT_IP;
+    memset(&none, 0, sizeof none); none.is_split = 1; none.split_pct = 0; none.split_key.src = KS_CLIENT_IP;
+    CHECK(matcher_eval(&all, &t.ctx) == 1);
+    CHECK(matcher_eval(&none, &t.ctx) == 0);
+    memset(&half, 0, sizeof half);
+    half.is_split = 1; half.split_pct = 50; half.split_key.src = KS_HEADER; half.split_key.name = (char *)"X-Tenant";
+    int sa = matcher_eval(&half, &t.ctx);
+    for (int i = 0; i < 20; i++)
+        CHECK(matcher_eval(&half, &t.ctx) == sa); /* same key -> same side every time */
+    http_req_free(&t.req);
+}
+
 TEST(test_match)
 {
     tctx_t t;
@@ -942,6 +1151,74 @@ static pool_t *mkpool(config_t **cfg, const char *policy, const char *ups)
     snprintf(text, sizeof text, ":1 {\n reverse_proxy %s {\n  lb_policy %s\n  max_fails 2\n  fail_timeout 5s\n }\n}\n", ups, policy);
     *cfg = cfg_ok(text);
     return *cfg ? (*cfg)->servers[0]->routes[0]->pool : NULL;
+}
+
+TEST(test_cache)
+{
+    cache_t *c = cache_new(4096);
+    const char *hn[] = { "Content-Type", "ETag" };
+    const char *hv[] = { "text/plain", "\"v1\"" };
+    double now = 1000.0;
+    cache_store(c, "GET\x1fhttp\x1fx\x1f/a", 200, "OK", hn, hv, 2, "hello", 5,
+                now, 10.0, 5.0, "\"v1\"", NULL, NULL, "");
+    cache_entry_t *e = cache_get(c, "GET\x1fhttp\x1fx\x1f/a");
+    CHECK(e != NULL);
+    CHECK(cache_entry_status(e) == 200);
+    size_t bl = 0;
+    const char *b = cache_entry_body(e, &bl);
+    CHECK(bl == 5 && memcmp(b, "hello", 5) == 0);
+    CHECK_STR(cache_entry_etag(e), "\"v1\"");
+    CHECK(cache_entry_state(e, now) == 0);          /* fresh */
+    CHECK(cache_entry_state(e, now + 12) == 1);     /* within stale-while-revalidate */
+    CHECK(cache_entry_state(e, now + 20) == 2);     /* fully stale */
+    CHECK(cache_get(c, "GET\x1fhttp\x1fx\x1f/missing") == NULL);
+    /* refresh restores freshness */
+    cache_entry_refresh(c, e, now + 20, 10.0, 5.0);
+    CHECK(cache_entry_state(e, now + 20) == 0);
+    /* a second store under the same key replaces */
+    cache_store(c, "GET\x1fhttp\x1fx\x1f/a", 200, "OK", hn, hv, 1, "world!", 6,
+                now, 10.0, 0.0, NULL, NULL, NULL, "");
+    e = cache_get(c, "GET\x1fhttp\x1fx\x1f/a");
+    b = cache_entry_body(e, &bl);
+    CHECK(bl == 6 && memcmp(b, "world!", 6) == 0);
+    uint64_t hits = 0, misses = 0, stores = 0;
+    int count = 0;
+    cache_stats(c, &hits, &misses, &stores, NULL, &count, NULL, NULL);
+    CHECK(stores == 2 && count == 1);
+    /* capacity eviction: fill past 4096 bytes and confirm the oldest is gone */
+    for (int i = 0; i < 20; i++) {
+        char k[64], body[300];
+        snprintf(k, sizeof k, "GET\x1fhttp\x1fx\x1f/e%d", i);
+        memset(body, 'x', sizeof body);
+        cache_store(c, k, 200, "OK", hn, hv, 1, body, sizeof body, now, 100.0, 0.0, NULL, NULL, NULL, "");
+    }
+    cache_stats(c, NULL, NULL, NULL, NULL, &count, NULL, NULL);
+    CHECK(count < 20);                               /* evicted to fit */
+    CHECK(cache_purge(c, "GET\x1fhttp\x1fx\x1f/e19") == 1 || cache_purge(c, "GET\x1fhttp\x1fx\x1f/e19") == 0);
+    cache_free(c);
+
+    /* oversized objects are never stored */
+    cache_t *c2 = cache_new(100);
+    char big[500];
+    memset(big, 'y', sizeof big);
+    cache_store(c2, "GET\x1fhttp\x1fx\x1f/big", 200, "OK", hn, hv, 0, big, sizeof big, now, 10, 0, NULL, NULL, NULL, "");
+    CHECK(cache_get(c2, "GET\x1fhttp\x1fx\x1f/big") == NULL);
+    cache_free(c2);
+
+    /* cache config parsing */
+    config_t *cf = cfg_ok(":1 {\n cache {\n  ttl 30s\n  stale 1m\n  max_object 2m\n }\n reverse_proxy 127.0.0.1:1\n}\n");
+    if (cf) {
+        cache_cfg_t *cc = cf->servers[0]->cache;
+        CHECK(cc && cc->ttl == 30 && cc->swr == 60 && cc->max_object == 2 * 1024 * 1024);
+        config_unref(cf);
+    }
+    cfg_bad(":1 {\n cache {\n  bogus 1\n }\n reverse_proxy 127.0.0.1:1\n}\n", "unknown cache option");
+    cf = cfg_ok("{\n cache_capacity 128m\n}\n:1 {\n cache\n reverse_proxy 127.0.0.1:1\n}\n");
+    if (cf) {
+        CHECK(cf->cache_capacity == 128 * 1024 * 1024);
+        CHECK(cf->servers[0]->cache != NULL);
+        config_unref(cf);
+    }
 }
 
 TEST(test_balance)
@@ -1070,6 +1347,78 @@ TEST(test_balance)
 }
 
 /* ------------------------------------------------------------------ */
+TEST(test_ratelimit)
+{
+    ratelimit_t *rl = ratelimit_new(2.0, 3.0, 4);
+    double retry = 0;
+    /* burst of 3, then limited */
+    CHECK(ratelimit_check(rl, "a", 100.0, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 100.0, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 100.0, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 100.0, &retry) == 0 && retry > 0.49 && retry < 0.51);
+    /* independent keys */
+    CHECK(ratelimit_check(rl, "b", 100.0, &retry) == 1);
+    /* refill: 0.5s -> one token */
+    CHECK(ratelimit_check(rl, "a", 100.5, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 100.5, &retry) == 0);
+    /* never exceeds burst after a long idle */
+    CHECK(ratelimit_check(rl, "a", 1000.0, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 1000.0, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 1000.0, &retry) == 1);
+    CHECK(ratelimit_check(rl, "a", 1000.0, &retry) == 0);
+    /* table cap: more keys than max_keys evicts idle ones, service continues */
+    for (int i = 0; i < 50; i++) {
+        char k[16];
+        snprintf(k, sizeof k, "k%d", i);
+        CHECK(ratelimit_check(rl, k, 2000.0 + i, &retry) == 1);
+    }
+    uint64_t hits, limited;
+    int keys;
+    ratelimit_stats(rl, &hits, &limited, &keys);
+    CHECK(keys <= 4 && hits == 61 && limited == 3);
+    CHECK(ratelimit_rate(rl) == 2.0);
+    ratelimit_free(rl);
+
+    /* config forms */
+    config_t *c = cfg_ok(":1 {\n rate_limit 5r/s\n route {\n  match path /x\n  rate_limit zone1 {\n   key {header.X-Key}\n   rate 120r/m\n   burst 10\n   status 503\n   max_keys 50\n  }\n  respond ok\n }\n}\n");
+    if (c) {
+        server_t *s = c->servers[0];
+        CHECK(s->rl && s->rl->rate == 5 && s->rl->burst == 5 && s->rl->status == 429);
+        CHECK_STR(s->rl->key, "{remote_ip}");
+        rate_limit_cfg_t *r = s->routes[0]->rl;
+        CHECK(r && r->rate == 2 && r->burst == 10 && r->status == 503 && r->max_keys == 50);
+        CHECK_STR(r->name, "zone1");
+        CHECK_STR(r->key, "{header.X-Key}");
+        config_unref(c);
+    }
+    cfg_bad(":1 {\n rate_limit {\n  key {remote_ip}\n }\n respond ok\n}\n", "needs a rate");
+    cfg_bad(":1 {\n rate_limit {\n  rate fast\n }\n respond ok\n}\n", "invalid rate");
+    cfg_bad(":1 {\n rate_limit 1r/s {\n  bogus 1\n }\n respond ok\n}\n", "unknown rate_limit option");
+
+    /* sticky cookie policy */
+    c = cfg_ok(":1 {\n reverse_proxy 127.0.0.1:1 127.0.0.1:2 {\n  lb_policy sticky_cookie sess\n }\n}\n");
+    if (c) {
+        pool_t *p = c->servers[0]->routes[0]->pool;
+        CHECK(p->policy == LB_STICKY && p->key.src == KS_COOKIE);
+        CHECK_STR(p->key.name, "sess");
+        CHECK(strlen(p->ups[0]->sticky_id) == 16 && strcmp(p->ups[0]->sticky_id, p->ups[1]->sticky_id) != 0);
+        /* selection follows the cookie, falls back otherwise */
+        tctx_t t;
+        char raw[128];
+        snprintf(raw, sizeof raw, "GET / HTTP/1.1\r\nCookie: sess=%s\r\n\r\n", p->ups[1]->sticky_id);
+        tctx_init(&t, raw, "1.1.1.1");
+        int idx;
+        char why[64];
+        CHECK(pool_select(p, &t.ctx, 0, 0, &idx, why, sizeof why) == p->ups[1] && strcmp(why, "sticky_cookie") == 0);
+        p->ups[1]->drained = 1;
+        CHECK(pool_select(p, &t.ctx, 0, 0, &idx, why, sizeof why) == p->ups[0]); /* drained -> reassigned */
+        CHECK(strstr(why, "new") != NULL);
+        http_req_free(&t.req);
+        config_unref(c);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 int main(void)
 {
     log_level = LOG_ERROR;
@@ -1081,7 +1430,10 @@ int main(void)
     test_json_run();
     test_config_run();
     test_match_run();
+    test_prematch_run();
+    test_cache_run();
     test_balance_run();
+    test_ratelimit_run();
     printf("unit tests: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

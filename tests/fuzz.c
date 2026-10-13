@@ -142,7 +142,7 @@ static void fuzz_http(const char *in, size_t n)
         struct sockaddr_in sa;
         memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET;
-        req_ctx_t ctx = { &r, (struct sockaddr *)&sa, sizeof sa, "1.2.3.4", 0 };
+        req_ctx_t ctx = { &r, (struct sockaddr *)&sa, sizeof sa, "1.2.3.4", 0, NULL };
         for (size_t k = 0; k < sizeof keys / sizeof keys[0]; k++)
             key_extract(&keys[k], &ctx, &out);
         buf_free(&out);
@@ -219,7 +219,7 @@ static void fuzz_json(const char *in, size_t n)
     buf_append(&r.body, in, n);
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
-    req_ctx_t ctx = { &r, (struct sockaddr *)&sa, sizeof sa, "1.2.3.4", 0 };
+    req_ctx_t ctx = { &r, (struct sockaddr *)&sa, sizeof sa, "1.2.3.4", 0, NULL };
     keysrc_t k = { KS_FORM, (char *)"a" };
     key_extract(&k, &ctx, &out);
     k.src = KS_JSON; k.name = (char *)"user.id";
