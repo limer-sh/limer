@@ -721,6 +721,7 @@ static void config_free(config_t *c)
     for (int i = 0; i < c->ntrusted_proxies; i++)
         free(c->trusted_proxies[i]);
     free(c->trusted_proxies);
+    free(c->server_header);
     free(c);
 }
 
@@ -965,7 +966,7 @@ static int parse_lb_policy(pool_t *p, node_t *d, char *err, size_t errlen)
             FAIL("line %d: 'lb_policy %s' takes at most a cookie name", d->line, pol);
         p->policy = LB_STICKY;
         p->key.src = KS_COOKIE;
-        p->key.name = xstrdup(d->nargs > 2 ? d->args[2] : "limer_sticky");
+        p->key.name = xstrdup(d->nargs > 2 ? d->args[2] : "lb");
         return 0;
     } else if (strcaseeq(pol, "cookie")) {
         /* Caddy's `lb_policy cookie [name [secret]]`: same sticky sessions, Caddy's default name;
@@ -2722,6 +2723,12 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
             }
             if (g->ban_window <= 0)
                 g->ban_window = 10.0;
+        } else if (strcaseeq(k, "server_header") || strcaseeq(k, "server_tokens")) {
+            if (want_args(c, 1, 1, err, errlen) < 0)
+                return -1;
+            free(cfg->server_header);
+            cfg->server_header = (strcaseeq(c->args[1], "off") || strcaseeq(c->args[1], "none"))
+                                 ? NULL : xstrdup(c->args[1]);
         } else {
             FAIL("line %d: unknown global option '%s'", c->line, k);
         }

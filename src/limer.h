@@ -533,6 +533,7 @@ typedef struct config {
     int      ntrusted_proxies;
     size_t   cache_capacity;  /* total response cache size per worker (0 = default) */
     ipguard_cfg_t ipguard;    /* per-source-IP admission control */
+    char    *server_header;   /* value for the Server header on local responses; NULL = omit */
     int      refs;
 } config_t;
 

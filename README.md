@@ -182,6 +182,7 @@ replaced from the environment.
     cache_capacity 64m        # total response-cache size per worker
     trusted_proxies 10.0.0.0/8    # believe X-Forwarded-For from these hops (see below)
     ip_guard { }              # per-source-IP DoS mitigation (see below)
+    server_header off         # Server header on limer's own responses; off = omit (default)
 }
 
 # snippets can be imported into any block, with {args.N} substitution
@@ -670,6 +671,11 @@ proxy keeps serving after every attack.
   still advertises a body is never pooled.
 - **Admin API isolation**: the admin endpoints exist only on the `admin`
   listener; bind it to localhost or a management network.
+- **No software fingerprint**: limer does not advertise itself. Its own
+  responses carry no `Server` header by default (`server_header <value>` sets
+  one, e.g. `server_header nginx` to masquerade); proxied responses pass the
+  upstream's `Server` through untouched. Default header values carry no
+  product name — the sticky-session cookie is `lb`, not a limer-branded name.
 - **Memory safety**: the suites run clean under AddressSanitizer,
   UndefinedBehaviorSanitizer and Valgrind, and the fuzzer runs on every CI
   build.
