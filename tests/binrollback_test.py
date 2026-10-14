@@ -116,6 +116,67 @@ def upgrade():
     subprocess.run([LIVE, "upgrade", "-c", CFG], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def upgrade_after_reload():
+    """A reload restarts the certificate manager from inside the master's loop, where the master
+    blocks its signals. The next upgrade stops that manager first: it must not wait on it forever."""
+    print("upgrade after a reload restarted the certificate manager")
+    d = os.path.join(TMP, "acme-upgrade")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    live = os.path.join(d, "limer")
+    shutil.copy2(GOOD_BIN, live)
+    cfg, pidf, logf = os.path.join(d, "Limerfile"), os.path.join(d, "limer.pid"), os.path.join(d, "limer.log")
+    with open(cfg, "w") as f:
+        # a public name starts the certificate manager; its CA is a closed local port, so nothing leaves the machine
+        f.write(f"""{{
+    log_level info
+    admin off
+    storage {d}/storage
+    pidfile {pidf}
+    acme_ca https://127.0.0.1:1/directory
+    http_port 9893
+    https_port 9894
+}}
+upgrade.example.com {{
+    respond "public"
+}}
+127.0.0.1:9895 {{
+    respond "local"
+}}
+""")
+    log = open(logf, "w")
+    p = subprocess.Popen([live, "run", "-c", cfg], stdout=subprocess.DEVNULL, stderr=log)
+
+    def log_has(text, count=1, timeout=10):
+        end = time.time() + timeout
+        while time.time() < end:
+            if open(logf).read().count(text) >= count:
+                return True
+            time.sleep(0.1)
+        return False
+
+    try:
+        if not wait_port(9895) or not log_has("certificate manager started"):
+            bad("instance with a certificate manager starts", open(logf).read()[-300:])
+            return
+        subprocess.run([live, "reload", "-c", cfg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        (ok if log_has("certificate manager started", 2) else bad)("a reload restarts the certificate manager")
+        subprocess.run([live, "upgrade", "-c", cfg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        (ok if log_has("re-executing into the new binary", timeout=8) else bad)(
+            "the upgrade goes through within seconds", open(logf).read()[-400:])
+        try:
+            body = urllib.request.urlopen("http://127.0.0.1:9895/", timeout=5).read().decode()
+        except OSError as e:
+            body = str(e)
+        (ok if body == "local" else bad)("the site answers after the upgrade", body)
+    finally:
+        p.terminate()
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
 def main():
     print("building a broken variant of limer...")
     broken = build_broken()
@@ -199,6 +260,7 @@ def main():
         except subprocess.TimeoutExpired:
             p.kill()
 
+    upgrade_after_reload()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
 

@@ -1101,6 +1101,14 @@ int acme_manager_start(config_t *cfg)
         /* child: drop inherited sockets, run the manager */
         for (int fd = 3; fd < 65536; fd++)
             close(fd);
+        /* The master forks this from its loop, where it blocks its signals and handles them
+         * itself: start clean, or the SIGTERM that stops the manager is never delivered. */
+        signal(SIGCHLD, SIG_DFL);
+        signal(SIGUSR2, SIG_DFL);
+        signal(SIGALRM, SIG_DFL);
+        sigset_t none;
+        sigemptyset(&none);
+        sigprocmask(SIG_SETMASK, &none, NULL);
         _exit(manager_main(cfg));
     }
     manager_pid = pid;
@@ -1112,7 +1120,20 @@ void acme_manager_stop(void)
 {
     if (manager_pid > 0) {
         kill(manager_pid, SIGTERM);
-        waitpid(manager_pid, NULL, 0);
+        /* never let the master hang on it: 5 s to finish, then SIGKILL */
+        int done = 0;
+        for (int i = 0; i < 500 && !done; i++) {
+            pid_t r = waitpid(manager_pid, NULL, WNOHANG);
+            if (r == manager_pid || (r < 0 && errno == ECHILD))
+                done = 1;
+            else
+                usleep(10000);
+        }
+        if (!done) {
+            LOGW("acme: certificate manager %d did not stop on SIGTERM; killing it", (int)manager_pid);
+            kill(manager_pid, SIGKILL);
+            waitpid(manager_pid, NULL, 0);
+        }
         manager_pid = 0;
     }
 }
