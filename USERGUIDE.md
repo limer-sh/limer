@@ -87,8 +87,10 @@ HTTPS with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
   certificates from Let's Encrypt (any ACME CA) over http-01, tls-alpn-01 or
   dns-01 (wildcards included, through a script hook); `localhost` and
   `tls internal` get self-signed certificates; HTTP redirects to HTTPS.
-- **HTTP/2** (over TLS via ALPN, or cleartext h2c with prior knowledge,
-  built on nghttp2) and HTTP/1.1 and 1.0.
+- **HTTP/3** over QUIC on every HTTPS port (`http3` in the global block,
+  built on ngtcp2 and nghttp3), advertised with `Alt-Svc`; **HTTP/2** (over
+  TLS via ALPN, or cleartext h2c with prior knowledge, built on nghttp2);
+  and HTTP/1.1 and 1.0.
 - **Static files**: `root`, `file_server` (index files, `browse` listings),
   `try_files`, conditional requests, byte ranges, path traversal protection.
 - **Compression**: `encode gzip zstd br` for proxied, static and local
@@ -118,8 +120,12 @@ HTTPS with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
 - **HTTP/1.1 done properly**: pipelining, chunked bodies both ways,
   `Expect: 100-continue`, HEAD/204/304 framing, close-delimited responses,
   request-smuggling guards, bounded buffering with backpressure.
-- Dependencies: libc; OpenSSL for TLS/ACME, nghttp2 for HTTP/2, zlib/zstd/
-  brotli for compression, all optional and auto-detected. Linux (epoll).
+- **Upstream status policy**: `retry_status 404 503` asks the next upstream
+  when one answers with a listed status, and `redirect_on 404 /` turns the
+  final answer into a redirect when no upstream had it.
+- Dependencies: libc; OpenSSL for TLS/ACME, nghttp2 for HTTP/2, ngtcp2 +
+  nghttp3 + GnuTLS for HTTP/3, zlib/zstd/brotli for compression, all
+  optional and auto-detected. Linux (epoll).
 
 ## Building
 
@@ -127,14 +133,20 @@ HTTPS with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
 make            # builds ./limer with whatever optional libraries are found
 make TLS=0      # force a build without OpenSSL (no HTTPS, ACME or HTTP/2)
 make H2=0       # build without nghttp2
+make H3=0       # build without HTTP/3 (ngtcp2, nghttp3, GnuTLS)
 make ENCODE=0   # build without compression
-make check      # unit tests, fuzzing, integration, feature, ACME and security suites
+make check      # all thirteen test suites (see Testing)
 make install    # installs to /usr/local/bin
 limer version   # prints which optional features are compiled in
 ```
 
 On Debian/Ubuntu the optional libraries are `libssl-dev libnghttp2-dev
-zlib1g-dev libzstd-dev libbrotli-dev` (plus `pkg-config`).
+zlib1g-dev libzstd-dev libbrotli-dev` (plus `pkg-config`). HTTP/3 needs
+ngtcp2 (with its GnuTLS crypto library, `libngtcp2_crypto_gnutls`), nghttp3
+and GnuTLS 3.7 or later; where the distribution's packages are too old,
+build ngtcp2 and nghttp3 from source with `./configure --with-gnutls` and
+make sure `pkg-config` finds them. `limer version` lists `http/3` when it is
+compiled in.
 
 ## Running
 
@@ -195,6 +207,7 @@ replaced from the environment.
     server_header off         # Server header on limer's own responses; off = omit (default)
     auto_rollback { }         # canary new configs/binaries and revert ones that cause 5xx (see below)
     scale_up { }              # run a command when load spikes (see below)
+    http3                     # also serve HTTP/3 over QUIC on every https port (see below)
 }
 
 # snippets can be imported into any block, with {args.N} substitution
@@ -298,6 +311,8 @@ Path and host use glob matching with `*`. Regexes are POSIX extended.
 |---|---|---|
 | `lb_policy <policy> [args]` | `round_robin` | See below. |
 | `lb_retries <n>` | `2` | Extra upstreams to try when a connection fails before any response byte. |
+| `retry_status <codes...>` | off | Also try the next upstream when one answers with a listed status (`retry_status 404 503`); bounded by `lb_retries`, each upstream asked at most once. See Retrying and redirecting on status. |
+| `redirect_on <codes...> <target> [code\|permanent\|temporary]` | off | When the final answer has a listed status, send a redirect to `target` instead (placeholders allowed; `302` default). |
 | `max_fails <n>` / `fail_timeout <dur>` | `3` / `10s` | Passive health: eject an upstream after `n` consecutive failures. `max_fails 0` disables. |
 | `unhealthy_status 5xx` | off | Count 5xx responses as passive failures. |
 | `health_uri <path>` | off | Active health check URL. |
@@ -366,6 +381,36 @@ A route whose matcher, hash key or placeholder reads the body buffers it
 first, which suits unary and server-streaming but not long-lived client
 streams. Active health checks are plain HTTP/1.1 and need an upstream that
 still answers HTTP/1.1; for h2-only upstreams rely on passive health.
+
+### Retrying and redirecting on status
+
+When objects are spread over several backends, or a backend answers `503`
+while it warms up, `retry_status` lets another upstream answer instead:
+
+```
+assets.example.com {
+    reverse_proxy 10.0.0.5:8080 10.0.0.6:8080 10.0.0.7:8080 {
+        lb_policy first
+        retry_status 404 503         # not here? ask the next one
+        redirect_on 404 https://www.example.com/not-found?from={path}
+    }
+}
+```
+
+- A listed status from one upstream makes limer.sh discard that response
+  and send the request to an upstream it has not asked yet, up to
+  `lb_retries` extra attempts (default 2). The request body is replayed,
+  so buffered POSTs retry too; a request whose body is being streamed
+  (see Streaming request bodies) is not retried, because the bytes are
+  already gone.
+- The listed response does not count as a failure for passive health; use
+  `unhealthy_status 5xx` for that.
+- When every candidate gave a listed status, the last response is passed to
+  the client as it is, or, with `redirect_on`, replaced by a redirect
+  (`permanent` = 301, `temporary` = 302, or any 3xx code). The target
+  accepts placeholders such as `{path}` and `{query}`.
+- `redirect_on` works without `retry_status` too, as a fallback page for a
+  single backend.
 
 ### Rate limiting
 
@@ -628,6 +673,49 @@ Challenge types (`acme_challenge` in the global block):
 | `tls-alpn-01` | port 443 reachable | Answered on the https listener itself with the `acme-tls/1` ALPN protocol; use it when port 80 is closed. |
 | `dns-01` | `acme_dns_script` | limer.sh runs the script as `script present <domain> <txt-value>` before validation and `script cleanup <domain> <txt-value>` after, waits `acme_dns_propagation` (`30s`) in between, and the script creates or removes `_acme-challenge.<domain>` TXT records with your DNS provider's API. Required for wildcard names, which are always validated over dns-01 when a script is set. |
 
+### HTTP/3
+
+```
+{
+    http3
+}
+
+example.com {
+    reverse_proxy 10.0.0.5:8080
+}
+```
+
+With `http3` in the global block, every HTTPS listener also opens a UDP
+socket on the same address and port and serves HTTP/3 over QUIC (RFC 9000,
+9114) with the same certificates, including ACME and `tls internal`
+certificates and renewals. HTTP/1.1 and HTTP/2 responses over TLS carry
+`Alt-Svc: h3=":443"; ma=86400` so browsers switch on their next request.
+Everything behind the listener is shared: routing, matchers, handlers,
+proxying (upstreams stay HTTP/1.1 or HTTP/2), request-body streaming,
+caching, compression, rate limits, `ip_guard`, canary probation and access
+logs (the protocol shows as `HTTP/3`). Open UDP 443 in the firewall.
+
+Each worker binds the UDP port with `SO_REUSEPORT`; the kernel hashes a
+client's address to one worker, so all packets of a QUIC connection reach
+the worker that owns it (connection migration is disabled for the same
+reason). Reloads keep QUIC
+connections open; removing a site's last HTTPS listener or turning `http3`
+off closes its UDP socket after in-flight connections finish.
+
+Limitations:
+
+- When the set of worker processes changes (a crashed worker is replaced,
+  `limer upgrade`, a change of `workers`), the kernel may hash a QUIC
+  connection's packets to a different worker, which does not know it, and
+  the client reconnects. Browsers retry such a request over a new
+  connection or fall back to HTTP/2, so this shows up as a reconnect, not an
+  error.
+- No 0-RTT and no Retry tokens (address validation relies on QUIC's
+  handshake limits and `ip_guard`); a client that changes address (a phone
+  moving from Wi-Fi to mobile) reconnects instead of migrating.
+- Client certificates (`tls client_auth`) are not requested over HTTP/3;
+  sites that require them should leave `http3` off.
+
 ## Admin API
 
 Enable with `admin <addr>` in the global block.
@@ -758,7 +846,7 @@ Some things to keep in mind:
 
 ## Testing
 
-`make check` runs eleven suites; `make check-asan` runs them on a build
+`make check` runs thirteen suites; `make check-asan` runs them on a build
 instrumented with AddressSanitizer and UndefinedBehaviorSanitizer. The
 GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 
@@ -775,6 +863,8 @@ GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 | `make drain` | `tests/drain_test.py`: a backend drains and undrains itself through `POST /drain` / `/undrain`. |
 | `make rollback` | `tests/rollback_test.py`: under continuous traffic, a healthy reload is committed after its canary probation, a reload to a dead backend is reverted with only the canary share affected, and the rejected (and an invalid) Limerfile is quarantined while the good one is restored. |
 | `make binrollback` | `tests/binrollback_test.py`: builds a deliberately broken limer, then upgrades under traffic — a good binary is committed, the broken one is rolled back with the same pid, and the previous binary is restored at its install path. |
+| `make h3` | `tests/h3_test.py`: HTTP/3 with the aioquic client — local and proxied responses, forwarded headers, path and query, small and 200 KB POST bodies, a 3 MiB response, 20 concurrent streams on one connection, a bodiless 204, `Alt-Svc` on HTTPS over TCP, HTTP/3 after a reload, and a graceful stop (skips when aioquic is not installed). |
+| `make status` | `tests/status_test.py`: `retry_status` sends a request to the next upstream on 404 and 503 and replays a POST body, a 404 from every upstream passes through, and `redirect_on` turns it into a redirect. |
 
 ## Security
 
@@ -917,12 +1007,12 @@ Present: reverse proxy with health checks and all common balancing policies
 response caching, streaming request bodies, dynamic upstreams (DNS A/SRV),
 traffic splitting and request mirroring, mutual TLS, site addresses and
 virtual hosts, automatic HTTPS (http-01, tls-alpn-01, dns-01 with
-wildcards), HTTP/2 on both sides including gRPC passthrough, static files,
+wildcards), HTTP/3, HTTP/2 on both sides including gRPC passthrough, static files,
 compression, the common handler directives, Caddyfile-style config with
 imports and snippets, reloads, metrics, a runtime admin API for draining and
 weights, multi-process workers.
 
-Not there: HTTP/3, built-in DNS provider modules (dns-01 goes through a
+Not there: built-in DNS provider modules (dns-01 goes through a
 script), on-demand TLS, templates, FastCGI, the JSON config API and the
 plugin ecosystem.
 
@@ -934,6 +1024,7 @@ src/main.c     CLI, master/worker supervision
 src/config.c   Limerfile tokenizer, imports/snippets, block parser, validation
 src/proxy.c    epoll loop, client/upstream state machines, files, health checks, admin API, reload
 src/h2.inc     HTTP/2 sessions and streams (nghttp2), included by proxy.c
+src/h3.inc     HTTP/3 over QUIC (ngtcp2, nghttp3, GnuTLS), included by proxy.c
 src/acme.c     ACME client and certificate manager
 src/tls.c      OpenSSL glue: certificates, SNI, internal certs, upstream contexts
 src/http.c     HTTP/1.x head parsing, chunked coding

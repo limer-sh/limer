@@ -6,8 +6,8 @@ what's *inside* the request.**
 Most proxies only see the method and the path. limer.sh routes and balances on
 JSON fields, form fields, body regexes, headers, cookies, the query, the path,
 or the client address. It works like [Caddy](https://caddyserver.com): one
-binary, a readable `Limerfile`, automatic HTTPS, HTTP/2 and gRPC, zero-downtime
-reloads and an admin API.
+binary, a readable `Limerfile`, automatic HTTPS, HTTP/3, HTTP/2 and gRPC,
+zero-downtime reloads and an admin API.
 
 🌐 **[limer.sh](https://limer.sh)** &nbsp;·&nbsp; 📖 **[User guide](USERGUIDE.md)**
 
@@ -31,7 +31,8 @@ example.com {
 ```
 
 That site gets a certificate from Let's Encrypt automatically, serves HTTPS
-with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
+with HTTP/2 and HTTP/1.1 (add `http3` to the global block for HTTP/3), and
+redirects plain HTTP to HTTPS.
 
 ## Why limer.sh
 
@@ -43,8 +44,10 @@ with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
   traffic splitting and mirroring, mutual TLS, static files and compression.
 - **Automatic HTTPS** — Let's Encrypt over http-01, tls-alpn-01 or dns-01
   (wildcards included); `tls internal` for local dev.
-- **HTTP/2 and gRPC** both sides, trailers intact, including bidirectional
-  streaming.
+- **HTTP/3, HTTP/2 and gRPC** — HTTP/3 over QUIC to clients; HTTP/2 both
+  sides, trailers intact, including bidirectional gRPC streaming.
+- **Retry and fallback on status** — `retry_status 404 503` asks the next
+  backend, `redirect_on 404 /` redirects when none had it.
 - **Safe deploys** — `limer upgrade` swaps the binary with no downtime and the
   same pid; with `auto_rollback`, new configs and binaries run as a 5% canary
   and are reverted automatically if they cause 5xx, and the bad file is moved

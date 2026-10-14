@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>limer.sh — ultra-fast, payload-aware HTTP server &amp; load balancer</title>
-<meta name="description" content="limer.sh is an ultra-fast HTTP server and load balancer in C that routes and balances on what is inside the request — JSON fields, form fields, headers, cookies, the body. One binary, a readable Limerfile, automatic HTTPS, HTTP/2 and gRPC.">
-<meta name="keywords" content="ultra-fast HTTP server, reverse proxy, load balancer, payload routing, JSON routing, Caddy alternative, automatic HTTPS, HTTP/2, gRPC proxy, rate limiting, C">
+<meta name="description" content="limer.sh is an ultra-fast HTTP server and load balancer in C that routes and balances on what is inside the request — JSON fields, form fields, headers, cookies, the body. One binary, a readable Limerfile, automatic HTTPS, HTTP/3, HTTP/2 and gRPC.">
+<meta name="keywords" content="ultra-fast HTTP server, reverse proxy, load balancer, payload routing, JSON routing, Caddy alternative, automatic HTTPS, HTTP/3, QUIC, HTTP/2, gRPC proxy, rate limiting, C">
 <meta name="author" content="limer.sh">
 <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
 <meta name="theme-color" content="#0b0d09">
@@ -14,7 +14,7 @@
 <!-- Open Graph -->
 <meta property="og:site_name" content="limer.sh">
 <meta property="og:title" content="limer.sh — the reverse proxy that routes on what's inside the request">
-<meta property="og:description" content="An ultra-fast HTTP server and load balancer that distributes traffic by JSON fields, form fields, headers, cookies or the body. One binary, automatic HTTPS, HTTP/2 and gRPC.">
+<meta property="og:description" content="An ultra-fast HTTP server and load balancer that distributes traffic by JSON fields, form fields, headers, cookies or the body. One binary, automatic HTTPS, HTTP/3, HTTP/2 and gRPC.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://limer.sh/">
 <meta property="og:image" content="https://limer.sh/og.png">
@@ -27,7 +27,7 @@
 <!-- Twitter -->
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="limer.sh — routes on what's inside the request">
-<meta name="twitter:description" content="An ultra-fast, payload-aware HTTP server and load balancer in C. One binary, automatic HTTPS, HTTP/2 and gRPC.">
+<meta name="twitter:description" content="An ultra-fast, payload-aware HTTP server and load balancer in C. One binary, automatic HTTPS, HTTP/3, HTTP/2 and gRPC.">
 <meta name="twitter:image" content="https://limer.sh/og.png">
 <meta name="twitter:image:alt" content="limer.sh — payload-aware HTTP server and load balancer">
 
@@ -41,7 +41,7 @@
       "name": "limer.sh",
       "applicationCategory": "DeveloperApplication",
       "operatingSystem": "Linux",
-      "description": "An ultra-fast HTTP server and load balancer written in C with payload-based request distribution: it routes and balances on JSON fields, form fields, body regexes, headers, cookies, the path or the client address. One binary, a readable Limerfile, automatic HTTPS, HTTP/2 and gRPC.",
+      "description": "An ultra-fast HTTP server and load balancer written in C with payload-based request distribution: it routes and balances on JSON fields, form fields, body regexes, headers, cookies, the path or the client address. One binary, a readable Limerfile, automatic HTTPS, HTTP/3, HTTP/2 and gRPC.",
       "url": "https://limer.sh/",
       "image": "https://limer.sh/og.png",
       "softwareVersion": "0.1.0",
@@ -258,7 +258,7 @@
     <h1>The reverse proxy that<br>routes on <span class="accent">what&rsquo;s inside</span><br>the request.</h1>
     <p class="lede">limer.sh is an ultra-fast HTTP server and load balancer that distributes traffic by
       <b>JSON fields, form fields, body regexes, headers, cookies, the path, or the client address</b> —
-      not just the URL. One binary, a readable <b>Limerfile</b>, automatic HTTPS, HTTP/2 and gRPC.</p>
+      not just the URL. One binary, a readable <b>Limerfile</b>, automatic HTTPS, HTTP/3, HTTP/2 and gRPC.</p>
 
     <div class="cta">
       <a class="btn btn-primary" href="#start">Get started →</a>
@@ -352,10 +352,10 @@
         <h3>Automatic HTTPS</h3><p>Let&rsquo;s Encrypt over http-01, tls-alpn-01 or dns-01 with wildcards. Renews itself. <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">tls internal</code> for local dev.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg></div>
-        <h3>HTTP/2 &amp; gRPC</h3><p>HTTP/2 both sides via <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">h2c://</code>/<code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">h2://</code>, trailers intact. Unary and bidirectional streaming gRPC pass straight through.</p></div>
+        <h3>HTTP/3, HTTP/2 &amp; gRPC</h3><p>HTTP/3 over QUIC with one line: <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">http3</code>. HTTP/2 both sides via <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">h2c://</code>/<code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">h2://</code>, trailers intact. Unary and bidirectional streaming gRPC pass straight through.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 8l9-5 9 5M3 16l9 5 9-5"/></svg></div>
-        <h3>Smart load balancing</h3><p>Round robin, least-conn, random, IP/URI hash, sticky cookies — with weights, active health checks and passive ejection.</p></div>
+        <h3>Smart load balancing</h3><p>Round robin, least-conn, random, IP/URI hash, sticky cookies — with weights, active health checks and passive ejection. A 404 or 503 can ask the next backend, then fall back to a redirect.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg></div>
         <h3>Caching &amp; rate limits</h3><p>In-memory LRU cache honouring Cache-Control, ETag and stale-while-revalidate. Token-bucket rate limits keyed by any placeholder.</p></div>
