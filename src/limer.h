@@ -412,6 +412,7 @@ typedef struct rollback_cfg {
     double error_rate;    /* 5xx share during probation that triggers a revert (0..1); default 0.5 */
     double window;        /* probation after a reload (s); default 15 */
     int    min_requests;  /* responses needed before judging; default 20 */
+    int    canary;        /* % of new connections that use the new config during probation; default 10, 100 = all */
 } rollback_cfg_t;
 
 /* scale-up hook: run a command when load spikes, e.g. to add backends */
@@ -648,7 +649,17 @@ void upstream_report_success(pool_t *p, upstream_t *u);
 int  proxy_run(config_t *cfg, int worker_id);  /* blocks until shutdown */
 void proxy_request_reload(void);
 void proxy_request_shutdown(void);
-/* counters shared with the master across fork: [0] responses, [1] 5xx responses */
+/* Page shared with the master across fork. Workers write the counters, the
+ * master writes the canary controls. */
+enum {
+    SH_REQ = 0,     /* responses (new config while a canary runs, else all) */
+    SH_ERR,         /* ...of which 5xx */
+    SH_OLD_REQ,     /* responses served by the previous config during a canary */
+    SH_OLD_ERR,     /* ...of which 5xx */
+    SH_CANARY,      /* % of new connections that get the new config; 0 = no canary */
+    SH_CANARY_GEN,  /* bumped by the master at the start of each probation */
+    SH_SLOTS
+};
 void proxy_set_shared_stats(uint64_t *counters);
 
 /* ------------------------------------------------------------------ */

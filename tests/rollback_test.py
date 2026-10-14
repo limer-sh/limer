@@ -68,6 +68,7 @@ def write_cfg(upstream_port):
         error_rate 30%
         window 6s
         min_requests 10
+        canary 10%
     }}
 }}
 127.0.0.1:{SITE} {{
@@ -120,6 +121,11 @@ def main():
         t1 = time.time()
         reload()
         time.sleep(8)
+        probation = [s for s in window(t1 + 0.5, t1 + 5.5) if s[1] == 200]
+        on_new = sum(1 for s in probation if s[2] == "hello from next")
+        share = on_new / max(1, len(probation))
+        (ok if probation and 0.03 <= share <= 0.25 else bad)(
+            f"during probation the new config takes only a canary share ({share:.0%} of {len(probation)})")
         tail = window(time.time() - 1.5, time.time())
         if tail and all(s[1] == 200 and s[2] == "hello from next" for s in tail):
             ok("a healthy reload is applied and kept")
@@ -139,6 +145,9 @@ def main():
         tail = window(time.time() - 1.0, time.time())
         logtext = open(LOG).read()
         (ok if saw_errors else bad)("the broken config did produce 5xx", f"{len(after)} samples")
+        failed_share = sum(1 for s in after if s[1] is None or s[1] >= 500) / max(1, len(after))
+        (ok if failed_share < 0.35 else bad)(
+            f"only the canary slice was hurt by the broken config ({failed_share:.0%} of requests failed)")
         (ok if "auto-rollback" in logtext else bad)("the master detected it and rolled back")
         if tail and all(s[1] == 200 and s[2] == "hello from next" for s in tail):
             ok("traffic is served by the previous config again")

@@ -294,7 +294,7 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
 
     /* Response counters shared with the workers (inherited across fork), so the
      * master can judge a reload by the 5xx share that follows it. */
-    uint64_t *shared = mmap(NULL, 2 * sizeof(uint64_t), PROT_READ | PROT_WRITE,
+    uint64_t *shared = mmap(NULL, SH_SLOTS * sizeof(uint64_t), PROT_READ | PROT_WRITE,
                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (shared == MAP_FAILED)
         shared = NULL;
@@ -303,6 +303,7 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
     int probation = 0;
     double probation_until = 0;
     uint64_t prob_req0 = 0, prob_err0 = 0;  /* counters when the probation began */
+    uint64_t prob_oreq0 = 0, prob_oerr0 = 0; /* ...and for the previous config during a canary */
     uint64_t good_req0 = 0, good_err0 = 0;  /* counters when the running config was committed */
     double baseline = 0;                    /* 5xx share of the known-good config */
     rollback_cfg_t rb;
@@ -387,29 +388,42 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                     if (good->auto_rollback.enabled && cfg->text)
                         quarantine(cfg_path, NULL, cfg->text, "reload");
                 } else {
+                    /* The protection in force is the known-good config's, so a new
+                     * config cannot switch off its own rollback. */
+                    config_t *good = probation ? prev_cfg : cfg;
+                    rb = good->auto_rollback.enabled ? good->auto_rollback : test->auto_rollback;
+                    int canary = rb.enabled && shared && rb.canary > 0 && rb.canary < 100 ? rb.canary : 0;
+                    if (rb.enabled && shared) {
+                        if (!probation) {
+                            uint64_t r = sh_load(shared, SH_REQ) - good_req0, e = sh_load(shared, SH_ERR) - good_err0;
+                            baseline = r ? (double)e / (double)r : 0;
+                            __atomic_add_fetch(&shared[SH_CANARY_GEN], 1, __ATOMIC_RELAXED);
+                        }
+                        /* publish the canary share before the workers reload */
+                        __atomic_store_n(&shared[SH_CANARY], (uint64_t)canary, __ATOMIC_RELAXED);
+                    }
                     LOGI("master: reloading workers");
                     for (int i = 0; i < nworkers; i++)
                         if (pids[i] > 0)
                             kill(pids[i], SIGHUP);
                     acme_manager_stop();
-                    /* The protection in force is the known-good config's, so a new
-                     * config cannot switch off its own rollback. */
-                    config_t *good = probation ? prev_cfg : cfg;
-                    rb = good->auto_rollback.enabled ? good->auto_rollback : test->auto_rollback;
                     if (rb.enabled && shared) {
-                        if (probation) {
+                        if (probation)
                             config_unref(cfg);   /* replace the config on probation; prev_cfg stays known-good */
-                        } else {
+                        else
                             prev_cfg = cfg;      /* hold on to the known-good config */
-                            uint64_t r = sh_load(shared, 0) - good_req0, e = sh_load(shared, 1) - good_err0;
-                            baseline = r ? (double)e / (double)r : 0;
-                        }
                         probation = 1;
                         probation_until = now_mono() + rb.window;
-                        prob_req0 = sh_load(shared, 0);
-                        prob_err0 = sh_load(shared, 1);
+                        prob_req0 = sh_load(shared, SH_REQ);
+                        prob_err0 = sh_load(shared, SH_ERR);
+                        prob_oreq0 = sh_load(shared, SH_OLD_REQ);
+                        prob_oerr0 = sh_load(shared, SH_OLD_ERR);
                         alarm(1);
-                        LOGI("reload: new configuration on probation for %.0fs", rb.window);
+                        if (canary)
+                            LOGI("reload: new configuration on probation for %.0fs, taking %d%% of new connections",
+                                 rb.window, canary);
+                        else
+                            LOGI("reload: new configuration on probation for %.0fs", rb.window);
                     } else {
                         config_unref(cfg);
                     }
@@ -503,6 +517,13 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
             if (probation && !stopping) {
                 uint64_t r = sh_load(shared, 0) - prob_req0, e = sh_load(shared, 1) - prob_err0;
                 double share = r ? (double)e / (double)r : 0;
+                /* during a canary the yardstick is the previous config over the same window */
+                double base = baseline;
+                if (!bin_probation && sh_load(shared, SH_CANARY) > 0) {
+                    uint64_t orq = sh_load(shared, SH_OLD_REQ) - prob_oreq0, oer = sh_load(shared, SH_OLD_ERR) - prob_oerr0;
+                    if (orq >= (uint64_t)rb.min_requests)
+                        base = (double)oer / (double)orq;
+                }
                 if (bin_probation && r >= (uint64_t)rb.min_requests && share >= rb.error_rate) {
                     char why[160];
                     snprintf(why, sizeof why, "%.0f%% of %llu responses from the new binary were 5xx",
@@ -527,10 +548,11 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                     good_err0 = sh_load(shared, 1);
                 } else if (bin_probation) {
                     rearm = 1;
-                } else if (r >= (uint64_t)rb.min_requests && share >= rb.error_rate && share > baseline) {
-                    LOGW("auto-rollback: %.0f%% of %llu responses were 5xx after the reload (%.0f%% before); "
+                } else if (r >= (uint64_t)rb.min_requests && share >= rb.error_rate && share > base) {
+                    LOGW("auto-rollback: %.0f%% of %llu responses on the new configuration were 5xx (%.0f%% on the previous one); "
                          "reverting to the previous configuration - fix %s and reload",
-                         share * 100, (unsigned long long)r, baseline * 100, cfg_path);
+                         share * 100, (unsigned long long)r, base * 100, cfg_path);
+                    __atomic_store_n(&shared[SH_CANARY], 0, __ATOMIC_RELAXED);
                     if (prev_cfg->text)
                         quarantine(cfg_path, NULL, prev_cfg->text, "auto-rollback");
                     config_t *bad = cfg;
@@ -563,6 +585,7 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                 } else if (now_mono() >= probation_until) {
                     LOGI("reload: new configuration committed (%.0f%% 5xx over %llu responses)",
                          share * 100, (unsigned long long)r);
+                    __atomic_store_n(&shared[SH_CANARY], 0, __ATOMIC_RELAXED);  /* workers drop the previous config */
                     config_unref(prev_cfg);
                     prev_cfg = NULL;
                     probation = 0;
@@ -671,7 +694,7 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
     if (prev_cfg)
         config_unref(prev_cfg);
     if (shared)
-        munmap(shared, 2 * sizeof(uint64_t));
+        munmap(shared, SH_SLOTS * sizeof(uint64_t));
     free(pids);
     free(spawned);
     if (pidfile && read_pidfile(pidfile) == getpid())

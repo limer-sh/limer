@@ -53,7 +53,25 @@ typedef struct ev {
 static int g_epfd = -1;
 static config_t *g_cfg;
 static ipguard_t *g_ipguard;    /* per-source-IP admission control (DoS mitigation) */
-static uint64_t *g_shared_stats; /* master-visible counters: [0] responses, [1] 5xx */
+static uint64_t *g_shared_stats; /* page shared with the master (SH_* slots) */
+static config_t *g_canary_old;   /* known-good config still served while a new one is on probation */
+static uint64_t g_canary_gen;    /* SH_CANARY_GEN of the probation g_canary_old belongs to */
+
+static uint64_t sh_get(int slot)
+{
+    return g_shared_stats ? __atomic_load_n(&g_shared_stats[slot], __ATOMIC_RELAXED) : 0;
+}
+
+static uint32_t canary_rand(void)
+{
+    static uint32_t s;
+    if (!s)
+        s = (uint32_t)getpid() * 2654435761u ^ (uint32_t)(now_mono() * 1e6);
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    return s;
+}
 static int g_worker_id;
 static double g_now;
 static volatile sig_atomic_t g_reload_flag;
@@ -1228,9 +1246,12 @@ static void conn_next_request(conn_t *c)
     if (c->resp_status >= 100 && c->resp_status < 600) {
         g_stats.resp_class[c->resp_status / 100]++;
         if (g_shared_stats && !c->srv->is_admin) {
-            __atomic_fetch_add(&g_shared_stats[0], 1, __ATOMIC_RELAXED);
+            /* during a canary, judge the new config on its own traffic and
+             * keep the previous config's results as the live baseline */
+            int slot = g_canary_old && c->cfg == g_canary_old ? SH_OLD_REQ : SH_REQ;
+            __atomic_fetch_add(&g_shared_stats[slot], 1, __ATOMIC_RELAXED);
             if (c->resp_status >= 500)
-                __atomic_fetch_add(&g_shared_stats[1], 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&g_shared_stats[slot + 1], 1, __ATOMIC_RELAXED);
         }
     }
 #ifdef LIMER_H2
@@ -3608,6 +3629,17 @@ static void listener_cb(ev_t *e, uint32_t events)
         c->ev.destroy = conn_destroy;
         c->srv = l->default_srv;
         c->cfg = l->cfg;
+        if (g_canary_old) {
+            /* canary: only the configured share of connections gets the new config */
+            int pct = (int)sh_get(SH_CANARY);
+            if (pct > 0 && (int)(canary_rand() % 100) >= pct) {
+                server_t *os = select_server(g_canary_old, l->addr, NULL);
+                if (os) {
+                    c->cfg = g_canary_old;
+                    c->srv = os;
+                }
+            }
+        }
         config_ref(c->cfg);
         snprintf(c->listen_addr, sizeof c->listen_addr, "%s", l->addr);
         memcpy(&c->peer, &peer, pl);
@@ -5011,12 +5043,25 @@ static void do_reload(void)
         }
     config_t *old = g_cfg;
     g_cfg = cfg;
-    retire_config(old);
-    if (g_worker_id == 0) {
-        acme_manager_stop();
-        acme_manager_start(cfg);
+    /* The master publishes a canary share before asking for the reload: keep
+     * the known-good config for most new connections until it decides. */
+    int pct = (int)sh_get(SH_CANARY);
+    if (pct > 0 && pct < 100) {
+        uint64_t gen = sh_get(SH_CANARY_GEN);
+        if (g_canary_old && gen == g_canary_gen) {
+            retire_config(old);              /* a newer config replaces the one on probation */
+        } else {
+            if (g_canary_old)
+                retire_config(g_canary_old); /* left over from an earlier, already decided probation */
+            g_canary_old = old;
+            g_canary_gen = gen;
+        }
+        LOGI("configuration reloaded as a canary: %d%% of new connections use it", pct);
+    } else {
+        retire_config(old);
+        LOGI("configuration reloaded");
     }
-    LOGI("configuration reloaded");
+    /* the certificate manager belongs to the master */
 }
 
 static void begin_shutdown(void)
@@ -5147,6 +5192,13 @@ static void tick(void)
     if (!g_shutting_down)
         scale_check();
 
+    /* the master ended the canary (committed): every new connection uses the new config */
+    if (g_canary_old && sh_get(SH_CANARY) == 0) {
+        retire_config(g_canary_old);
+        g_canary_old = NULL;
+        LOGI("canary over: all new connections use the current configuration");
+    }
+
     /* client timeouts */
     conn_t *c = g_conns;
     while (c) {
@@ -5268,8 +5320,7 @@ int proxy_run(config_t *cfg, int worker_id)
         return 1;
     }
 
-    if (worker_id == 0)
-        acme_manager_start(cfg);
+    /* the certificate manager is started by the master, not by a worker */
 
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     struct itimerspec its;
@@ -5322,8 +5373,6 @@ int proxy_run(config_t *cfg, int worker_id)
     }
 
     /* teardown */
-    if (worker_id == 0)
-        acme_manager_stop();
     while (g_conns)
         conn_close(g_conns);
     while (g_uconns)

@@ -2730,6 +2730,7 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
             rb->error_rate = 0.5;
             rb->window = 15.0;
             rb->min_requests = 20;
+            rb->canary = 10;
             for (int j = 0; j < c->nkids; j++) {
                 node_t *o = c->kids[j];
                 const char *n = o->args[0];
@@ -2753,6 +2754,17 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
                 } else if (strcaseeq(n, "min_requests")) {
                     if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
                         rc = arg_int(o, 1, &rb->min_requests, 1, 100000000, err, errlen);
+                } else if (strcaseeq(n, "canary")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0) {
+                        char *end;
+                        double v = strtod(o->args[1], &end);
+                        if (end == o->args[1] || (*end && strcmp(end, "%") != 0) || v <= 0 || v > 100) {
+                            snprintf(err, errlen, "line %d: canary must be a percentage like 10%%", o->line);
+                            rc = -1;
+                        } else {
+                            rb->canary = (int)(v + 0.5);
+                        }
+                    }
                 } else {
                     snprintf(err, errlen, "line %d: unknown auto_rollback option '%s'", o->line, n);
                     rc = -1;
