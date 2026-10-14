@@ -30,6 +30,7 @@
 #define H3_CHUNK       16384
 #define H3_CID_BUCKETS 4096
 #define H3_MAX_CIDS    16
+#define H3_SOCKBUF     (4 << 20)   /* UDP socket buffers, per direction */
 
 /* GnuTLS credentials of one bind; refcounted so a reload can swap them while
  * older connections keep using theirs. */
@@ -286,6 +287,14 @@ static h3sock_t *h3_sock_open(const char *addr, char *err, size_t errlen)
             } else {
                 setsockopt(s, IPPROTO_IP, IP_PKTINFO, &one, sizeof one);
             }
+            /* The kernel default (~208 KB) overflows when many connections burst
+             * at once, and each dropped datagram costs a QUIC loss-recovery
+             * timeout. The FORCE variants pass net.core.[rw]mem_max as root. */
+            int buf = H3_SOCKBUF;
+            if (setsockopt(s, SOL_SOCKET, SO_RCVBUFFORCE, &buf, sizeof buf) < 0)
+                setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf);
+            if (setsockopt(s, SOL_SOCKET, SO_SNDBUFFORCE, &buf, sizeof buf) < 0)
+                setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
             if (bind(s, ai->ai_addr, ai->ai_addrlen) < 0) {
                 last_errno = errno;
                 close(s);

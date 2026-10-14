@@ -932,6 +932,30 @@ Over TLS with h2load (10 connections, 10 streams each): HTTP/2 serves about
 22,000 req/s per worker and 61,000 req/s with 4 workers; HTTP/1.1 over TLS
 about 27,000 req/s per worker.
 
+### HTTP/3 vs HTTP/2 vs HTTP/1.1
+
+`bench/protocols.sh` drives one worker with a `tls internal` site over each
+protocol with h2load (HTTP/3 needs an h2load built with `--enable-http3`;
+set `H2LOAD`). Measured on a 1-vCPU VM, 100,000 requests per run, best of 3;
+h2load, the two backends and limer.sh share the one core:
+
+| Shape | HTTP/1.1 over TLS | HTTP/2 | HTTP/3 |
+|---|---|---|---|
+| 10 connections × 1 in flight | 20,500 req/s, p99 0.76 ms | 14,399 req/s, p99 1.0 ms | 10,753 req/s, p99 1.6 ms |
+| 10 connections × 10 in flight | (no multiplexing) | 17,470 req/s, p99 8.9 ms | 25,209 req/s, p99 6.8 ms |
+| 100 connections × 1 in flight | 20,101 req/s, p99 7.6 ms | 13,986 req/s, p99 9.7 ms | 8,797 req/s, p99 16 ms |
+
+Every request succeeded on every protocol. With several requests in flight
+per connection HTTP/3 is the fastest, about 45% ahead of HTTP/2; one
+request at a time it costs more, because each QUIC packet is encrypted
+and acknowledged individually in user space (on both sides, and here the
+client competes for the same core). Over loopback there is no packet loss,
+which is where HTTP/3 gains most on real networks. limer.sh sizes its UDP
+socket buffers at 4 MiB, beyond `net.core.rmem_max` when running as root,
+so bursts from many connections are not dropped (with the kernel default
+of 208 KB, the 100-connection run lost 92,000 datagrams and p99 rose to
+100 ms).
+
 ### Compared with Caddy
 
 `bench/run.sh` also benchmarks Caddy when a `caddy` binary is on the PATH,
