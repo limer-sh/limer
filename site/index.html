@@ -188,6 +188,9 @@
   .card .ic svg{width:18px;height:18px;stroke:var(--lime);fill:none;stroke-width:1.8}
   .card h3{margin:0 0 7px;font-size:1.03rem;letter-spacing:-.01em}
   .card p{margin:0;color:var(--muted);font-size:14px;line-height:1.56}
+  .uc-tag{font-family:var(--mono);font-size:11.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--lime-dim);margin-bottom:11px}
+  .uc-code{display:block;margin-top:14px;font-family:var(--mono);font-size:12px;line-height:1.5;color:var(--lime-soft);
+    background:var(--bg-soft);border:1px solid var(--line-soft);border-radius:8px;padding:9px 11px;overflow-x:auto;white-space:pre}
 
   /* ---- perf table ---- */
   .perf-note{color:var(--faint);font-size:13.5px;margin-top:16px;font-family:var(--mono)}
@@ -241,6 +244,7 @@
     <div class="nav-links">
       <a class="nav-hide" href="#routing">Routing</a>
       <a class="nav-hide" href="#features">Features</a>
+      <a class="nav-hide" href="#usecases">Use cases</a>
       <a class="nav-hide" href="#performance">Performance</a>
       <a class="nav-hide" href="#start">Quickstart</a>
       <a class="gh" href="https://github.com/limer-sh/limer">GitHub ↗</a>
@@ -374,6 +378,70 @@
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.9 10.9 0 0 1 12 5c6 0 10 7 10 7a18 18 0 0 1-3 3.6M6.6 6.6A18 18 0 0 0 2 12s4 7 10 7a10.9 10.9 0 0 0 3.9-.7"/></svg></div>
         <h3>Low profile</h3><p>limer doesn&rsquo;t announce itself: no <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">Server</code> header by default, neutral cookie names, proxied responses untouched. Set <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">server_header nginx</code> to masquerade.</p></div>
     </div>
+  </div>
+</section>
+
+<div class="wrap"><div class="divider"></div></div>
+
+<!-- USE CASES -->
+<section id="usecases">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="kicker">Use cases</div>
+      <h2>Where payload-aware routing pays off.</h2>
+      <p>The same binary is a plain reverse proxy and a content-aware one. A few shapes it fits particularly well:</p>
+    </div>
+    <div class="grid">
+      <div class="card fade">
+        <div class="uc-tag">Stateful sharding</div>
+        <h3>Pin a customer to one backend</h3>
+        <p>Per-tenant caches, in-memory sessions and sharded data need the same key to land on the same node — and only its keys to move when a node leaves.</p>
+        <code class="uc-code">lb_policy hash json customer.id</code>
+      </div>
+
+      <div class="card fade">
+        <div class="uc-tag">Content routing</div>
+        <h3>Route by what&rsquo;s in the request</h3>
+        <p>Send refunds to the finance pool, premium tenants to bigger boxes, v2 payloads to the new service — decided by a field in the body, not the URL.</p>
+        <code class="uc-code">match json type == refund
+to finance-1:8080 finance-2:8080</code>
+      </div>
+
+      <div class="card fade">
+        <div class="uc-tag">API edge</div>
+        <h3>One binary in front of your API</h3>
+        <p>Automatic HTTPS, per-key rate limits and per-IP DoS mitigation at the edge — no sidecars, no cert cron, no extra WAF to run for L7 abuse.</p>
+        <code class="uc-code">rate_limit { key {header.X-Api-Key}
+            rate 100r/s }
+ip_guard { max_conns_per_ip 200 }</code>
+      </div>
+
+      <div class="card fade">
+        <div class="uc-tag">gRPC</div>
+        <h3>Balance gRPC, trailers intact</h3>
+        <p>Multiplex gRPC over HTTP/2 to a pool, with real trailers (<code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">grpc-status</code>) preserved — unary and bidirectional streaming both pass through.</p>
+        <code class="uc-code">reverse_proxy h2c://10.0.0.5:50051 \
+             h2c://10.0.0.6:50051</code>
+      </div>
+
+      <div class="card fade">
+        <div class="uc-tag">Progressive delivery</div>
+        <h3>Canary a sticky slice of users</h3>
+        <p>Peel a deterministic percentage of traffic to a canary — the same users every time — and mirror a copy of prod to staging to test on real load.</p>
+        <code class="uc-code">match split 5 cookie session
+reverse_proxy canary.internal:8080</code>
+      </div>
+
+      <div class="card fade">
+        <div class="uc-tag">Drop-in edge</div>
+        <h3>Replace nginx or Caddy</h3>
+        <p>Static files, compression, redirects, virtual hosts and TLS in a familiar Caddy-style config — at roughly 3&ndash;5&times; the throughput.</p>
+        <code class="uc-code">root /srv/www
+file_server
+encode gzip zstd br</code>
+      </div>
+    </div>
+    <p class="perf-note">Full, runnable examples in <a href="https://github.com/limer-sh/limer/blob/main/USECASE.md" style="color:var(--lime-soft)">USECASE.md</a>.</p>
   </div>
 </section>
 

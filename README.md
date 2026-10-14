@@ -74,7 +74,8 @@ curl -X POST localhost:8080/echo -d '{"tenant":"acme","event":"signup"}'
 
 The full reference — every directive, matcher, load-balancing policy, the
 admin API, automatic HTTPS, security model and benchmarks — lives in
-**[USERGUIDE.md](USERGUIDE.md)**.
+**[USERGUIDE.md](USERGUIDE.md)**. Worked, runnable examples for common
+scenarios are in **[USECASE.md](USECASE.md)**.
 
 ## License
 
