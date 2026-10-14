@@ -305,6 +305,12 @@ typedef struct pool {
     int   max_fails;
     double fail_timeout;
     int   unhealthy_5xx;      /* count 5xx as passive failures */
+    int  *retry_status;       /* try the next upstream when one answers with one of these */
+    int   nretry_status;
+    int  *redirect_status;    /* when the final answer has one of these, redirect the client instead */
+    int   nredirect_status;
+    char *redirect_to;        /* redirect target, placeholders allowed */
+    int   redirect_code;      /* 302 unless configured */
     char *health_uri;
     char *health_host;
     double health_interval;

@@ -2099,6 +2099,66 @@ static void uconn_forward_body(uconn_t *uc)
     }
 }
 
+static int status_listed(const int *list, int n, int status)
+{
+    for (int i = 0; i < n; i++)
+        if (list[i] == status)
+            return 1;
+    return 0;
+}
+
+/* Is there a healthy upstream this request has not tried yet? */
+static int pool_untried_left(const pool_t *p, uint64_t tried)
+{
+    for (int k = 0; k < p->nups && k < 64; k++)
+        if (!(tried & ((uint64_t)1 << k)) && !p->ups[k]->drained && upstream_healthy(p->ups[k], g_now))
+            return 1;
+    return 0;
+}
+
+/* retry_status / redirect_on: act on the upstream's status before any of its
+ * response reaches the client. Returns 1 when the response was taken over. */
+static int uconn_status_policy(uconn_t *uc)
+{
+    conn_t *c = uc->c;
+    pool_t *p = c->pool;
+    int status = uc->resp.status;
+    if (!p || c->cache_sink || status == 101)
+        return 0;
+    int retry = status_listed(p->retry_status, p->nretry_status, status) && !c->body_stream &&
+                c->attempts <= p->retries && pool_untried_left(p, c->tried);
+    int redirect = !retry && p->redirect_to && status_listed(p->redirect_status, p->nredirect_status, status);
+    if (!retry && !redirect)
+        return 0;
+    upstream_t *u = uc->up;
+    LOGD("upstream %s answered %d: %s", u ? u->hostport : "?", status,
+         retry ? "trying another upstream" : "redirecting the client");
+    if (u)
+        upstream_report_success(p, u);   /* it answered: not a health failure */
+    uconn_close(uc);                     /* its response body is never read */
+    if (c->up) {
+        c->up->active--;
+        c->up = NULL;
+    }
+    if (retry) {
+        g_stats.retries++;
+        conn_try_upstream(c);
+        return 1;
+    }
+    buf_t loc;
+    buf_init(&loc);
+    expand_placeholders(p->redirect_to, c, &loc);
+    buf_append(&loc, "", 1);
+    char extra[2048];
+    snprintf(extra, sizeof extra, "Location: %s\r\n", buf_rptr(&loc));
+    buf_free(&loc);
+    c->deadline = 0;
+    conn_write_simple_response(c, p->redirect_code, "text/plain; charset=utf-8", "", 0, NULL, 0, extra);
+    c->state = CS_LOCAL;
+    conn_next_request(c);
+    return 1;
+}
+
 static void uconn_on_response_data(uconn_t *uc)
 {
     conn_t *c = uc->c;
@@ -2152,6 +2212,8 @@ static void uconn_on_response_data(uconn_t *uc)
             conn_next_request(c);
             return;
         }
+        if (uconn_status_policy(uc))
+            return;
         uc->head_done = 1;
         c->deadline = 0;
         if (c->body_stream && !c->body_done)

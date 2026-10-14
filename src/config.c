@@ -636,6 +636,9 @@ static void pool_free(pool_t *p)
     free(p->key.name);
     free(p->health_uri);
     free(p->health_host);
+    free(p->retry_status);
+    free(p->redirect_status);
+    free(p->redirect_to);
     hdr_ops_free(p->hdr_up, p->n_hdr_up);
     hdr_ops_free(p->hdr_down, p->n_hdr_down);
     free(p->tls_server_name);
@@ -1042,6 +1045,47 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
     } else if (strcaseeq(k, "fail_timeout") || strcaseeq(k, "fail_duration")) {
         if (want_args(d, 1, 1, err, errlen) < 0 || arg_duration(d, 1, &p->fail_timeout, err, errlen) < 0)
             return -1;
+    } else if (strcaseeq(k, "retry_status") || strcaseeq(k, "retry_on_status")) {
+        /* retry_status 404 503 ... */
+        if (want_args(d, 1, 16, err, errlen) < 0)
+            return -1;
+        for (int i = 1; i < d->nargs; i++) {
+            int code;
+            if (arg_int(d, i, &code, 200, 599, err, errlen) < 0)
+                return -1;
+            p->retry_status = xrealloc(p->retry_status, sizeof(int) * (size_t)(p->nretry_status + 1));
+            p->retry_status[p->nretry_status++] = code;
+        }
+    } else if (strcaseeq(k, "redirect_on") || strcaseeq(k, "redirect_status")) {
+        /* redirect_on 404 [410 ...] <target> [code|permanent|temporary] */
+        int i = 1;
+        while (i < d->nargs && strlen(d->args[i]) == 3 && isdigit((unsigned char)d->args[i][0]) &&
+               isdigit((unsigned char)d->args[i][1]) && isdigit((unsigned char)d->args[i][2])) {
+            int code = atoi(d->args[i]);
+            if (code < 200 || code > 599)
+                FAIL("line %d: redirect_on: %d is not a response status", d->line, code);
+            p->redirect_status = xrealloc(p->redirect_status, sizeof(int) * (size_t)(p->nredirect_status + 1));
+            p->redirect_status[p->nredirect_status++] = code;
+            i++;
+        }
+        if (p->nredirect_status == 0 || i >= d->nargs)
+            FAIL("line %d: redirect_on needs one or more statuses and a target, e.g. 'redirect_on 404 /'", d->line);
+        free(p->redirect_to);
+        p->redirect_to = xstrdup(d->args[i++]);
+        p->redirect_code = 302;
+        if (i < d->nargs) {
+            const char *c = d->args[i++];
+            if (strcaseeq(c, "permanent"))
+                p->redirect_code = 301;
+            else if (strcaseeq(c, "temporary"))
+                p->redirect_code = 302;
+            else if (atoi(c) >= 300 && atoi(c) <= 308)
+                p->redirect_code = atoi(c);
+            else
+                FAIL("line %d: redirect_on: '%s' is not a redirect code", d->line, c);
+        }
+        if (i < d->nargs)
+            FAIL("line %d: redirect_on: unexpected '%s'", d->line, d->args[i]);
     } else if (strcaseeq(k, "unhealthy_status")) {
         if (want_args(d, 1, 1, err, errlen) < 0)
             return -1;
