@@ -97,6 +97,9 @@ def window(t0, t1):
 
 
 def main():
+    for f in os.listdir(TMP):
+        if f.startswith("Limerfile.rejected-"):
+            os.unlink(os.path.join(TMP, f))
     for port, name in ((GOOD, "good"), (NEXT, "next")):
         PROCS.append(subprocess.Popen([sys.executable, "tests/backend.py", str(port), name],
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
@@ -145,6 +148,28 @@ def main():
         if bad_window:
             span = bad_window[-1][0] - bad_window[0][0]
             print(f"         (errors lasted {span:.1f}s, {len(bad_window)} failed requests)")
+
+        # the bad file must not survive a restart: kept aside, good one restored
+        on_disk = open(CFG).read()
+        rejected = sorted(f for f in os.listdir(TMP) if f.startswith("Limerfile.rejected-"))
+        (ok if f"127.0.0.1:{NEXT}" in on_disk and f":{DEAD}" not in on_disk else bad)(
+            "the known-good config is back on disk after the rollback", on_disk[-80:])
+        (ok if rejected and f":{DEAD}" in open(os.path.join(TMP, rejected[-1])).read() else bad)(
+            "the rolled-back config is kept as Limerfile.rejected-<time>", str(rejected))
+
+        # 3) an invalid config reaching the master is quarantined the same way
+        for f in rejected:
+            os.unlink(os.path.join(TMP, f))
+        with open(CFG, "w") as f:
+            f.write("{\n    this is not valid\n")
+        os.kill(int(open(PIDFILE).read()), 1)   # raw SIGHUP; `limer reload` would refuse it up front
+        time.sleep(1.5)
+        on_disk = open(CFG).read()
+        rejected = [f for f in os.listdir(TMP) if f.startswith("Limerfile.rejected-")]
+        (ok if f"127.0.0.1:{NEXT}" in on_disk else bad)("an invalid config is replaced by the running one on disk")
+        (ok if rejected else bad)("the invalid config is kept as Limerfile.rejected-<time>")
+        tail = window(time.time() - 1.0, time.time())
+        (ok if tail and all(s[1] == 200 for s in tail) else bad)("traffic unaffected by the invalid reload")
     finally:
         stop_traffic.set()
         if t.is_alive():

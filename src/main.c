@@ -9,10 +9,12 @@
  */
 #include "limer.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -89,6 +91,134 @@ static char **g_argv;   /* this process's argv, for re-exec on a graceful upgrad
 static uint64_t sh_load(uint64_t *s, int i)
 {
     return s ? __atomic_load_n(&s[i], __ATOMIC_RELAXED) : 0;
+}
+
+/* Write `len` bytes (or, with src_path, the contents of that file) to dst
+ * through a temporary file renamed into place, so dst is never half-written.
+ * Mode and owner follow `like` when it exists. */
+static int replace_file(const char *dst, const char *src_path, const char *data, size_t len, mode_t mode, const char *like)
+{
+    char tmp[1200];
+    snprintf(tmp, sizeof tmp, "%s.limer-tmp", dst);
+    struct stat st;
+    int have_like = like && stat(like, &st) == 0;
+    if (have_like)
+        mode = st.st_mode & 07777;
+    int o = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    if (o < 0)
+        return -1;
+    int rc = 0;
+    if (src_path) {
+        int in = open(src_path, O_RDONLY | O_CLOEXEC);
+        if (in < 0) {
+            rc = -1;
+        } else {
+            char buf[65536];
+            ssize_t n;
+            while ((n = read(in, buf, sizeof buf)) > 0)
+                if (write(o, buf, (size_t)n) != n) {
+                    rc = -1;
+                    break;
+                }
+            if (n < 0)
+                rc = -1;
+            close(in);
+        }
+    } else if (len && write(o, data, len) != (ssize_t)len) {
+        rc = -1;
+    }
+    if (fchmod(o, mode) < 0)
+        rc = -1;
+    if (have_like)
+        (void)!fchown(o, st.st_uid, st.st_gid);
+    if (close(o) < 0)
+        rc = -1;
+    if (rc == 0 && rename(tmp, dst) < 0)
+        rc = -1;
+    if (rc < 0)
+        unlink(tmp);
+    return rc;
+}
+
+/* Copy the running executable to <dir>/limer.previous so an upgrade can be
+ * undone. /proc/self/exe still reads the running image even after the file on
+ * disk has been replaced by the new version. */
+static int save_running_binary(const char *dir, char *out, size_t outlen)
+{
+    if (!dir)
+        return -1;
+    mkdir_p(dir);
+    snprintf(out, outlen, "%s/limer.previous", dir);
+    return replace_file(out, "/proc/self/exe", NULL, 0, 0755, NULL);
+}
+
+/* Keep a rejected file for inspection as <path>.rejected-<timestamp> and put
+ * known-good content back at <path>, so a restart of limer or of the machine
+ * never picks up what was just rolled back. <path> is replaced atomically. */
+static int quarantine(const char *path, const char *good_src, const char *good_text, const char *what)
+{
+    char stamp[32], rejected[1200];
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tm);
+    snprintf(rejected, sizeof rejected, "%s.rejected-%s", path, stamp);
+    if (link(path, rejected) < 0) {
+        /* no hard links here: fall back to a copy */
+        if (replace_file(rejected, path, NULL, 0, 0644, path) < 0) {
+            LOGE("%s: cannot keep a copy of the rejected file as %s: %s", what, rejected, strerror(errno));
+            return -1;
+        }
+    }
+    if (replace_file(path, good_src, good_text, good_text ? strlen(good_text) : 0, 0644, path) < 0) {
+        LOGE("%s: cannot restore the known-good file at %s: %s", what, path, strerror(errno));
+        return -1;
+    }
+    LOGW("%s: kept the rejected file as %s and restored the known-good one at %s", what, rejected, path);
+    return 0;
+}
+
+/* Undo a binary upgrade: stop the new workers, and re-exec the saved previous
+ * binary in place (same pid), handing it every worker so it can drain them once
+ * its own are up. Returns only if the exec failed. */
+static void bin_rollback(const char *why, const char *prev_bin, const pid_t *pids, int nworkers,
+                         const pid_t *old_pids, int n_old, const sigset_t *unblocked, const sigset_t *block)
+{
+    LOGW("upgrade rollback: %s; returning to the previous binary", why);
+    for (int i = 0; i < nworkers; i++)
+        if (pids[i] > 0)
+            kill(pids[i], SIGTERM);
+    char list[4096];
+    size_t off = 0;
+    list[0] = 0;
+    for (int i = 0; i < n_old && off < sizeof list - 16; i++)
+        if (old_pids[i] > 0)
+            off += (size_t)snprintf(list + off, sizeof list - off, "%s%d", off ? "," : "", (int)old_pids[i]);
+    for (int i = 0; i < nworkers && off < sizeof list - 16; i++)
+        if (pids[i] > 0)
+            off += (size_t)snprintf(list + off, sizeof list - off, "%s%d", off ? "," : "", (int)pids[i]);
+    setenv("LIMER_UPGRADE_WORKERS", list, 1);
+    unsetenv("LIMER_PREV_BIN");
+    unsetenv("LIMER_BIN_PROBATION");
+    /* Put the previous binary back where the new one was installed (keeping the
+     * new one as .rejected-<time>), so a restart does not run it again. */
+    const char *target = prev_bin;
+    char self[1024];
+    ssize_t sn = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (sn > 0) {
+        self[sn] = 0;
+        if (!strstr(self, " (deleted)") && strcmp(self, prev_bin) != 0 &&
+            quarantine(self, prev_bin, NULL, "upgrade rollback") == 0)
+            target = self;
+    }
+    acme_manager_stop();
+    sigprocmask(SIG_SETMASK, unblocked, NULL);
+    execv(target, g_argv);
+    if (target != prev_bin)
+        execv(prev_bin, g_argv);
+    sigprocmask(SIG_BLOCK, block, NULL);
+    unsetenv("LIMER_UPGRADE_WORKERS");
+    LOGE("upgrade rollback: cannot exec %s: %s; staying on the new binary", prev_bin, strerror(errno));
 }
 
 static void master_sig(int sig)
@@ -178,11 +308,32 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
     rollback_cfg_t rb;
     memset(&rb, 0, sizeof rb);
 
+    /* A binary upgrade made under auto_rollback hands us the saved previous
+     * binary: run as a canary next to the old workers until the window passes. */
+    int bin_probation = 0;
+    int prob_crashes = 0;
+    char prev_bin[1024] = "";
+    const char *pbin = getenv("LIMER_PREV_BIN");
+    const char *pspec = getenv("LIMER_BIN_PROBATION");
+    if (upgrading && pbin && *pbin && pspec) {
+        double rate = 0.5, win = 15;
+        int minr = 20;
+        sscanf(pspec, "%lf,%lf,%d", &rate, &win, &minr);
+        rb.enabled = 1;
+        rb.error_rate = rate;
+        rb.window = win;
+        rb.min_requests = minr;
+        snprintf(prev_bin, sizeof prev_bin, "%s", pbin);
+        bin_probation = 1;
+    }
+    unsetenv("LIMER_PREV_BIN");
+    unsetenv("LIMER_BIN_PROBATION");
+
     if (!upgrading)
         write_pidfile(pidfile);  /* a fresh start owns the pidfile; an upgrade keeps the same pid, so it is still valid */
 
-    LOGI("limer.sh %s master starting %d worker%s%s", LIMER_VERSION, nworkers,
-         nworkers == 1 ? "" : "s", upgrading ? " (upgrade)" : "");
+    LOGI("limer.sh %s master starting %d worker%s%s", LIMER_VERSION, nworkers, nworkers == 1 ? "" : "s",
+         bin_probation ? " (upgrade, on probation)" : upgrading ? " (upgrade)" : "");
     for (int i = 0; i < nworkers; i++) {
         pids[i] = spawn_worker(cfg, i);
         spawned[i] = now_mono();
@@ -221,13 +372,20 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
         }
         if (m_got_hup) {
             m_got_hup = 0;
-            if (!stopping) {
+            if (!stopping && bin_probation) {
+                LOGW("reload: ignored while a binary upgrade is on probation; try again in a few seconds");
+            } else if (!stopping) {
                 char err[512];
                 config_lenient_resolve = 1; /* workers keep known addresses for names DNS cannot answer right now */
                 config_t *test = config_load(cfg_path, err, sizeof err);
                 config_lenient_resolve = 0;
                 if (!test) {
                     LOGE("reload: configuration invalid, not reloading workers: %s", err);
+                    /* with auto_rollback, also keep the invalid file from being
+                     * loaded (or blocking startup) on the next restart */
+                    config_t *good = probation ? prev_cfg : cfg;
+                    if (good->auto_rollback.enabled && cfg->text)
+                        quarantine(cfg_path, NULL, cfg->text, "reload");
                 } else {
                     LOGI("master: reloading workers");
                     for (int i = 0; i < nworkers; i++)
@@ -286,6 +444,20 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                         if (pids[i] > 0)
                             off += (size_t)snprintf(list + off, sizeof list - off, "%s%d", off ? "," : "", (int)pids[i]);
                     setenv("LIMER_UPGRADE_WORKERS", list, 1);
+                    /* with auto_rollback, keep a copy of this binary so the new one can be undone */
+                    char saved[1024];
+                    if (cfg->auto_rollback.enabled) {
+                        if (save_running_binary(cfg->storage, saved, sizeof saved) == 0) {
+                            char spec[96];
+                            snprintf(spec, sizeof spec, "%g,%g,%d", cfg->auto_rollback.error_rate,
+                                     cfg->auto_rollback.window, cfg->auto_rollback.min_requests);
+                            setenv("LIMER_PREV_BIN", saved, 1);
+                            setenv("LIMER_BIN_PROBATION", spec, 1);
+                        } else {
+                            LOGW("upgrade: cannot save the running binary to %s (%s); the upgrade will not be rolled back automatically",
+                                 cfg->storage, strerror(errno));
+                        }
+                    }
                     acme_manager_stop();  /* the replacement image starts its own certificate manager */
                     LOGI("upgrade: re-executing into the new binary");
                     sigprocmask(SIG_SETMASK, &old, NULL);
@@ -293,6 +465,8 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                     /* only reached if exec failed: resume serving unchanged */
                     sigprocmask(SIG_BLOCK, &block, NULL);
                     unsetenv("LIMER_UPGRADE_WORKERS");
+                    unsetenv("LIMER_PREV_BIN");
+                    unsetenv("LIMER_BIN_PROBATION");
                     acme_manager_start(cfg);
                     LOGE("upgrade: re-exec failed: %s", strerror(errno));
                 }
@@ -301,12 +475,21 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
         if (m_got_alarm) {
             m_got_alarm = 0;
             int rearm = 0;
-            if (upgrading && !retire_sent) {
+            if (upgrading && !retire_sent && !(bin_probation && probation)) {
                 int ready = 1;
                 for (int i = 0; i < nworkers; i++)
                     if (pids[i] <= 0)
                         ready = 0;
-                if (ready) {
+                if (ready && bin_probation) {
+                    /* canary: keep the previous workers serving, judge only the new ones */
+                    probation = 1;
+                    probation_until = now_mono() + rb.window;
+                    prob_req0 = sh_load(shared, 0);
+                    prob_err0 = sh_load(shared, 1);
+                    baseline = 0;
+                    LOGI("upgrade: new binary on probation for %.0fs; the previous workers keep serving alongside it", rb.window);
+                    rearm = 1;
+                } else if (ready) {
                     LOGI("master: new workers ready, draining the previous ones");
                     for (int i = 0; i < n_old; i++)
                         if (old_pids[i] > 0)
@@ -320,10 +503,36 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
             if (probation && !stopping) {
                 uint64_t r = sh_load(shared, 0) - prob_req0, e = sh_load(shared, 1) - prob_err0;
                 double share = r ? (double)e / (double)r : 0;
-                if (r >= (uint64_t)rb.min_requests && share >= rb.error_rate && share > baseline) {
+                if (bin_probation && r >= (uint64_t)rb.min_requests && share >= rb.error_rate) {
+                    char why[160];
+                    snprintf(why, sizeof why, "%.0f%% of %llu responses from the new binary were 5xx",
+                             share * 100, (unsigned long long)r);
+                    bin_rollback(why, prev_bin, pids, nworkers, old_pids, n_old, &old, &block);
+                    /* exec failed: carry on with the new binary */
+                    bin_probation = 0;
+                    probation = 0;
+                    acme_manager_start(cfg);
+                    rearm = 1;
+                } else if (bin_probation && now_mono() >= probation_until) {
+                    LOGI("upgrade: new binary committed (%.0f%% 5xx over %llu responses); draining the previous workers",
+                         share * 100, (unsigned long long)r);
+                    for (int i = 0; i < n_old; i++)
+                        if (old_pids[i] > 0)
+                            kill(old_pids[i], SIGTERM);
+                    retire_sent = 1;
+                    bin_probation = 0;
+                    probation = 0;
+                    unlink(prev_bin);
+                    good_req0 = sh_load(shared, 0);
+                    good_err0 = sh_load(shared, 1);
+                } else if (bin_probation) {
+                    rearm = 1;
+                } else if (r >= (uint64_t)rb.min_requests && share >= rb.error_rate && share > baseline) {
                     LOGW("auto-rollback: %.0f%% of %llu responses were 5xx after the reload (%.0f%% before); "
                          "reverting to the previous configuration - fix %s and reload",
                          share * 100, (unsigned long long)r, baseline * 100, cfg_path);
+                    if (prev_cfg->text)
+                        quarantine(cfg_path, NULL, prev_cfg->text, "auto-rollback");
                     config_t *bad = cfg;
                     cfg = prev_cfg;
                     prev_cfg = NULL;
@@ -370,6 +579,7 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
             m_got_chld = 0;
             int status;
             pid_t p;
+            int crash_rollback = 0;
             while ((p = waitpid(-1, &status, WNOHANG)) > 0) {
                 /* an adopted old worker finished draining: reap it, never respawn */
                 int is_old = 0;
@@ -404,6 +614,10 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                     LOGW("worker %d exited (%s %d), restarting", i,
                          WIFSIGNALED(status) ? "signal" : "status",
                          WIFSIGNALED(status) ? WTERMSIG(status) : code);
+                    if (bin_probation && ++prob_crashes >= 2) {
+                        crash_rollback = 1;   /* the new binary's workers keep dying: undo the upgrade */
+                        break;
+                    }
                     if (now_mono() - spawned[i] < 1.0) {
                         if (++crashes > 10) {
                             LOGE("workers are crashing repeatedly, giving up");
@@ -423,6 +637,21 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                     pids[i] = spawn_worker(cfg, i);
                     spawned[i] = now_mono();
                 }
+            }
+            if (crash_rollback) {
+                char why[96];
+                snprintf(why, sizeof why, "the new binary's workers crashed %d times", prob_crashes);
+                bin_rollback(why, prev_bin, pids, nworkers, old_pids, n_old, &old, &block);
+                /* exec failed: carry on with the new binary and refill the worker slots */
+                bin_probation = 0;
+                probation = 0;
+                acme_manager_start(cfg);
+                for (int i = 0; i < nworkers; i++)
+                    if (pids[i] <= 0) {
+                        pids[i] = spawn_worker(cfg, i);
+                        spawned[i] = now_mono();
+                    }
+                alarm(1);
             }
         }
         if (stopping) {
