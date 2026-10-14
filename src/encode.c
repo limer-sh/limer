@@ -95,6 +95,10 @@ int encode_compressible(const char *content_type)
 {
     if (!content_type)
         return 0;
+    /* An event stream stays open for as long as the page does: compressing it would hold an encoder
+     * for the life of every stream and delay each event behind the encoder's buffering. It goes as is. */
+    if (strncasecmp(content_type, "text/event-stream", 17) == 0)
+        return 0;
     static const char *prefixes[] = {
         "text/", "application/json", "application/javascript", "application/x-javascript",
         "application/ecmascript", "application/xml", "application/xhtml+xml", "application/rss+xml",

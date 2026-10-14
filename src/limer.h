@@ -666,6 +666,10 @@ void upstream_report_success(pool_t *p, upstream_t *u);
 /* ------------------------------------------------------------------ */
 
 int  proxy_run(config_t *cfg, int worker_id);  /* blocks until shutdown */
+/* The master, before forking: bind the listeners the workers will share, where the kernel does not
+ * balance SO_REUSEPORT across processes (a no-op on Linux); drop the ones a reload removed. */
+int  proxy_prebind(config_t *cfg, char *err, size_t errlen);
+void proxy_prebind_prune(config_t *cfg);
 void proxy_request_reload(void);
 void proxy_request_shutdown(void);
 /* Page shared with the master across fork. Workers write the counters, the

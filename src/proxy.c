@@ -388,6 +388,7 @@ static void h3_teardown(void);
 static int  g_h3_live;
 #endif
 static void conn_flush(conn_t *c);
+static int cc_directive(const char *cc, const char *name, double *num);
 static void conn_try_upstream(conn_t *c);
 static void conn_send_error(conn_t *c, int status, const char *msg, int close);
 static void uconn_close(uconn_t *uc);
@@ -1184,12 +1185,17 @@ static void conn_body_finish(conn_t *c)
 }
 
 /* Decide whether (and how) to compress a response. Returns the encoding name. */
-static const char *conn_pick_encoding(conn_t *c, const char *content_type, int64_t length, int status, const char *existing_encoding)
+static const char *conn_pick_encoding(conn_t *c, const char *content_type, int64_t length, int status, const char *existing_encoding,
+                                      const char *cache_control)
 {
     server_t *s = c->srv;
     if (!s || !s->encode || !encode_available())
         return NULL;
     if (existing_encoding && *existing_encoding && strcasecmp(existing_encoding, "identity") != 0)
+        return NULL;
+    /* "Cache-Control: no-transform" (RFC 9111, 5.2.2.6): the origin asks that nothing on the way change
+     * the body, and an encoding does. */
+    if (cache_control && cc_directive(cache_control, "no-transform", NULL))
         return NULL;
     if (status < 200 || status == 204 || status == 206 || status == 304 || status >= 300)
         return NULL;
@@ -1248,7 +1254,7 @@ static void conn_write_simple_response(conn_t *c, int status, const char *ctype,
     char tmp[64];
     buf_t packed;
     buf_init(&packed);
-    const char *encname = conn_pick_encoding(c, ctype, (int64_t)blen, status, NULL);
+    const char *encname = conn_pick_encoding(c, ctype, (int64_t)blen, status, NULL, NULL);
     if (encname) {
         encoder_t *e = encoder_new(encname);
         if (e && encoder_write(e, body, blen, &packed, 2) == 0) {
@@ -1518,8 +1524,11 @@ static void uconn_release(uconn_t *uc, int reusable)
         uc->c = NULL;
     }
     pool_t *p = uc->pool;
+    /* A connection with request bytes still to send is out of step with the upstream: it answered
+     * before the body had all been sent (a 413 at its own limit, say), and whatever it reads next is,
+     * to it, the rest of that body. Pooled, it would swallow the next request whole. Close it. */
     if (!reusable || uc->ev.fd < 0 || uc->cfg != g_cfg || p->keepalive_idle <= 0 || uc->up->nidle >= p->keepalive_idle ||
-        buf_readable(&uc->rbuf) > 0 || g_shutting_down) {
+        buf_readable(&uc->rbuf) > 0 || buf_readable(&uc->wbuf) > 0 || g_shutting_down) {
         uconn_close(uc);
         return;
     }
@@ -1897,7 +1906,8 @@ static void build_client_response_head(conn_t *c, uconn_t *uc)
     if (c->resp_mode != RM_NONE)
         encname = conn_pick_encoding(c, http_hdr_get(r->hdrs, r->nhdr, "Content-Type"),
                                      c->resp_mode == RM_LENGTH ? r->content_length : -1, r->status,
-                                     http_hdr_get(r->hdrs, r->nhdr, "Content-Encoding"));
+                                     http_hdr_get(r->hdrs, r->nhdr, "Content-Encoding"),
+                                     http_hdr_get(r->hdrs, r->nhdr, "Cache-Control"));
     if (encname && (c->enc = encoder_new(encname)) != NULL) {
         c->body_sync = c->resp_mode != RM_LENGTH;
         if (c->resp_mode == RM_CHUNKED)
@@ -3009,13 +3019,16 @@ static void conn_serve_cached(conn_t *c, cache_entry_t *e, double now, int x_cac
     }
 
     /* compression for this client */
-    const char *ctype = NULL;
-    for (int i = 0; i < cache_entry_nhdr(e); i++)
+    const char *ctype = NULL, *cc = NULL;
+    for (int i = 0; i < cache_entry_nhdr(e); i++) {
         if (strcasecmp(cache_entry_hdr_name(e, i), "Content-Type") == 0)
             ctype = cache_entry_hdr_value(e, i);
+        else if (strcasecmp(cache_entry_hdr_name(e, i), "Cache-Control") == 0)
+            cc = cache_entry_hdr_value(e, i);
+    }
     buf_t packed;
     buf_init(&packed);
-    const char *encname = is_head ? NULL : conn_pick_encoding(c, ctype, (int64_t)blen, status, NULL);
+    const char *encname = is_head ? NULL : conn_pick_encoding(c, ctype, (int64_t)blen, status, NULL, cc);
     const char *out_body = body;
     size_t out_len = blen;
     if (encname) {
@@ -3868,6 +3881,78 @@ static int bind_listener(const char *addr, char *err, size_t errlen)
     return fd;
 }
 
+/* Listening sockets bound by the master before it forks, where the kernel does not spread
+ * SO_REUSEPORT connections across processes (macOS and the BSDs hand them all to the socket
+ * bound last): every worker inherits them and accepts from the same socket. Linux binds in each
+ * worker instead, and its SO_REUSEPORT balances. The master binds at start only (a reload can
+ * no longer hand a socket to running workers, which bind an added address themselves; the
+ * master drops the sockets of addresses a reload removed), and a worker closes the inherited
+ * originals once it holds its own copies, so a removed address closes with the last worker. */
+#define PREBOUND_MAX 64
+static struct { char *addr; int fd; } g_prebound[PREBOUND_MAX];
+static int g_nprebound;
+
+static int prebound_listener(const char *addr)
+{
+    for (int k = 0; k < g_nprebound; k++)
+        if (strcmp(g_prebound[k].addr, addr) == 0)
+            return g_prebound[k].fd;
+    return -1;
+}
+
+int proxy_prebind(config_t *cfg, char *err, size_t errlen)
+{
+#ifdef __linux__
+    (void)cfg; (void)err; (void)errlen;
+    return 0;
+#else
+    for (int i = 0; i < cfg->nservers; i++) {
+        server_t *s = cfg->servers[i];
+        for (int a = 0; a < s->naddr; a++) {
+            const char *addr = s->addrs[a];
+            if (prebound_listener(addr) >= 0)
+                continue;
+            if (g_nprebound == PREBOUND_MAX)
+                return 0;   /* the rest bind in the workers */
+            int fd = bind_listener(addr, err, errlen);
+            if (fd < 0)
+                return -1;
+            g_prebound[g_nprebound].addr = xstrdup(addr);
+            g_prebound[g_nprebound].fd = fd;
+            g_nprebound++;
+        }
+    }
+    return 0;
+#endif
+}
+
+void proxy_prebind_prune(config_t *cfg)
+{
+    for (int k = 0; k < g_nprebound; k++) {
+        int kept = 0;
+        for (int i = 0; i < cfg->nservers && !kept; i++)
+            for (int a = 0; a < cfg->servers[i]->naddr && !kept; a++)
+                if (strcmp(cfg->servers[i]->addrs[a], g_prebound[k].addr) == 0)
+                    kept = 1;
+        if (kept)
+            continue;
+        close(g_prebound[k].fd);
+        free(g_prebound[k].addr);
+        g_prebound[k] = g_prebound[--g_nprebound];
+        k--;
+    }
+}
+
+/* A worker, once its listeners are its own copies: the inherited originals go. */
+static void prebound_release(void)
+{
+    for (int k = 0; k < g_nprebound; k++) {
+        close(g_prebound[k].fd);
+        free(g_prebound[k].addr);
+    }
+    g_nprebound = 0;
+}
+
 static listener_t *find_listener(const char *addr)
 {
     for (listener_t *l = g_listeners; l; l = l->next)
@@ -3906,9 +3991,10 @@ static int apply_listeners(config_t *cfg, char *err, size_t errlen)
                     l = f;
             if (!l) {
                 listener_t *old = find_listener(addr);
+                int pre = old ? -1 : prebound_listener(addr);
                 int fd;
-                if (old) {
-                    fd = dup(old->ev.fd);
+                if (old || pre >= 0) {
+                    fd = dup(old ? old->ev.fd : pre);
                     if (fd < 0) {
                         snprintf(err, errlen, "dup: %s", strerror(errno));
                         goto fail;
@@ -4630,7 +4716,7 @@ static void conn_serve_files(conn_t *c, route_t *r)
     conn_add_altsvc(&h, c);
     hlist_add(&h, "ETag", etag);
     hlist_add(&h, "Last-Modified", lastmod);
-    const char *encname = status == 200 ? conn_pick_encoding(c, ctype, (int64_t)length, 200, NULL) : NULL;
+    const char *encname = status == 200 ? conn_pick_encoding(c, ctype, (int64_t)length, 200, NULL, NULL) : NULL;
     if (encname && !is_head && (c->enc = encoder_new(encname)) != NULL) {
         hlist_add(&h, "Content-Encoding", encname);
         hlist_add(&h, "Vary", "Accept-Encoding");
@@ -5654,6 +5740,7 @@ int proxy_run(config_t *cfg, int worker_id)
         LOGE("%s", err);
         return 1;
     }
+    prebound_release();
 #ifdef LIMER_H3
     h3_apply();
 #endif

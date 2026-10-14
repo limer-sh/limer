@@ -30,7 +30,8 @@ H() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 make -s || exit 1
 python3 tests/backend.py 9701 a & PIDS+=($!)
 python3 tests/backend.py 9702 b & PIDS+=($!)
-wait_port 9701; wait_port 9702
+python3 tests/backend.py 9705 narrow --rcvbuf 4096 & PIDS+=($!)   # reads slowly: the proxy's writes to it back up
+wait_port 9701; wait_port 9702; wait_port 9705
 
 # bcrypt hash for "secret" (cost 5 to keep tests fast); a constant, because
 # perl's crypt() is the system one, which has no bcrypt on macOS
@@ -148,7 +149,7 @@ http://*.wild.test:9782 {
         import conf.d/imported.conf
     }
     route {
-        match path /echo /chunked /big
+        match path /echo /chunked /big /stream /notransform
         reverse_proxy 127.0.0.1:9701
     }
     respond "fallback" 200
@@ -289,6 +290,9 @@ expect_eq "q=0 disables an encoding" "$(curl -s -D - -o /dev/null -H 'Accept-Enc
 expect_contains "proxied response compressed" "$(curl -s -D - -o /dev/null -H 'Accept-Encoding: gzip' $B/echo)" "Content-Encoding: gzip"
 expect_contains "proxied compressed body decodes" "$(curl -s --compressed $B/echo)" '"path": "/echo"'
 expect_contains "proxied chunked response compressed and re-chunked" "$(curl -s -D - --compressed http://127.0.0.1:9783/chunked)" "alpha-beta-gamma"
+expect_not_contains "an event stream is not compressed" "$(curl -s -D - -o /dev/null -H 'Accept-Encoding: gzip' $B/stream)" "Content-Encoding"
+expect_contains "an event stream passes as it is" "$(curl -s -H 'Accept-Encoding: gzip' $B/stream)" "event: tick"
+expect_not_contains "Cache-Control: no-transform is not compressed" "$(curl -s -D - -o /dev/null -H 'Accept-Encoding: gzip' $B/notransform)" "Content-Encoding"
 head -c 3000 /dev/urandom > "$TMP/site/blob.bin"
 expect_not_contains "non-compressible content left alone" "$(curl -s -D - -o /dev/null -H 'Accept-Encoding: gzip' $F/blob.bin)" "Content-Encoding"
 expect_eq "large proxied body compressed intact" "$(curl -s --compressed $B/big | wc -c)" "3145728"
@@ -681,9 +685,12 @@ https://localhost:9801 {
     }
     reverse_proxy 127.0.0.1:9701
 }
+:9803 {
+    reverse_proxy 127.0.0.1:9705
+}
 CFG
 $BIN run -c "$TMP/stream.conf" >/dev/null 2>"$TMP/stream.log" & SP=$!; PIDS+=($SP)
-wait_port 9798; wait_port 9801
+wait_port 9798; wait_port 9801; wait_port 9803
 head -c 20000000 /dev/urandom > "$TMP/upload.bin"
 SUM=$(sha256sum "$TMP/upload.bin" | cut -d' ' -f1)
 r=$(curl -s --data-binary @"$TMP/upload.bin" -H 'Content-Type: application/octet-stream' http://127.0.0.1:9798/upload)
@@ -713,6 +720,11 @@ r=$(curl -s -D - --data-binary @"$TMP/upload.bin" http://127.0.0.1:9798/early)
 expect_contains "early upstream response delivered" "$r" "HTTP/1.1 413"
 expect_contains "early response closes the client connection" "$r" "Connection: close"
 expect_eq "proxy healthy after early response" "$(H http://127.0.0.1:9798/get)" "200"
+# the upstream answers before the body has all been sent, and keeps the connection: with bytes still to
+# send, that connection must not be pooled (the upstream would take the next request for the rest of the body)
+head -c 900000 /dev/zero > "$TMP/body900k"
+expect_eq "early keep-alive answer while the body is still being sent" "$(H --data-binary @"$TMP/body900k" http://127.0.0.1:9803/early-keepalive)" "413"
+expect_eq "the next request is not swallowed by that connection" "$(H --max-time 3 http://127.0.0.1:9803/get)" "200"
 # HTTP/2 clients stream too, with and without content-length
 r=$(curl -sk --http2 --data-binary @"$TMP/upload.bin" https://localhost:9801/upload)
 expect_contains "h2 upload streamed to an http/1.1 upstream" "$r" "$SUM"

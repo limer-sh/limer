@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Small test upstream: identifies itself and echoes request details as JSON.
 
-Usage: backend.py PORT NAME [--bind IP] [--slow SECONDS] [--fail-health] [--tls CERT KEY] [--client-ca CA]
+Usage: backend.py PORT NAME [--bind IP] [--slow SECONDS] [--fail-health] [--tls CERT KEY] [--client-ca CA] [--rcvbuf BYTES]
 Endpoints:
   /healthz      -> 200 "ok" (or 503 with --fail-health)
   /echo         -> JSON with name, method, path, headers, body
   /chunked      -> chunked response body
+  /stream       -> a short text/event-stream (chunked)
+  /notransform  -> 1 KB text with Cache-Control: no-transform
+  /early        -> 413 before reading the body, then closes
+  /early-keepalive -> 413 before reading the body, then discards it and keeps the connection (as Node does)
   /nolength     -> close-delimited response body (HTTP/1.0 style)
   /slow         -> sleeps --slow seconds before answering
   /status/NNN   -> responds with status NNN
@@ -27,6 +31,7 @@ TLS = None
 CLIENT_CA = None
 RECORD = None
 BIND = "127.0.0.1"
+RCVBUF = 0
 args = sys.argv[3:]
 while args:
     a = args.pop(0)
@@ -42,6 +47,8 @@ while args:
         FAIL_HEALTH = True
     elif a == "--tls":
         TLS = (args.pop(0), args.pop(0))  # cert, key
+    elif a == "--rcvbuf":
+        RCVBUF = int(args.pop(0))  # a small receive buffer: a proxy's writes back up at once
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -94,6 +101,14 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             time.sleep(0.5)
             return
+        if path == "/early-keepalive":
+            # answer before reading the body, keep the connection, then discard the body as sent:
+            # whatever arrives next is, to this server, the rest of that body
+            self.wfile.write(b"HTTP/1.1 413 Payload Too Large\r\nX-Backend: " + NAME.encode() +
+                             b"\r\nContent-Length: 5\r\n\r\nearly")
+            self.wfile.flush()
+            self._body()
+            return
         body = self._body()
         if path == "/healthz":
             if FAIL_HEALTH:
@@ -125,6 +140,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
                 self.wfile.flush()
             self.wfile.write(b"0\r\n\r\n")
+        elif path == "/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("X-Backend", NAME)
+            self.end_headers()
+            for part in [b"retry: 1000\n\n", b"event: tick\ndata: 1\n\n", b"event: tick\ndata: 2\n\n"]:
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+        elif path == "/notransform":
+            self._send(200, (NAME + " says: leave this body as it is. ").encode() * 30, "text/plain",
+                       {"Cache-Control": "no-transform, max-age=60"})
         elif path == "/nolength":
             self.close_connection = True
             self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Backend: " + NAME.encode() +
@@ -176,6 +205,11 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+    def server_bind(self):
+        if RCVBUF:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF)
+        super().server_bind()
 
     def handle_error(self, request, client_address):
         pass  # clients (and the proxy) are expected to drop connections in tests

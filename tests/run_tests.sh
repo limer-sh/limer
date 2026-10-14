@@ -511,6 +511,10 @@ MW=$!; PIDS+=($MW)
 wait_port 9183 || fail "multi-worker start"
 names=$(for i in $(seq 1 12); do echo "$(curl -s http://127.0.0.1:9183/)"; done | sort -u | tr '\n' ' ')
 expect_eq "multi-worker serves requests" "$names" "hello from a hello from b "
+# where SO_REUSEPORT does not balance (macOS), the listener is the master's, inherited by every worker
+if [ "$(uname -s)" = Darwin ] && command -v lsof >/dev/null; then
+    expect_contains "macOS: the master holds the listening socket the workers share" "$(lsof -nP -a -p $MW -iTCP:9183 -sTCP:LISTEN 2>/dev/null)" "LISTEN"
+fi
 kill -TERM $MW; for _ in $(seq 1 50); do kill -0 $MW 2>/dev/null || break; sleep 0.1; done
 if kill -0 $MW 2>/dev/null; then fail "master stops workers"; else ok "master stops workers"; fi
 

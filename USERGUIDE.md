@@ -166,10 +166,12 @@ make
 - HTTP/3: Homebrew's ngtcp2 is built for OpenSSL, not GnuTLS, so the build
   leaves HTTP/3 out unless you build ngtcp2 `--with-gnutls` from source (as
   on Linux, plus `brew install gnutls libnghttp3`).
-- Use `workers 1` (the default). macOS hands every connection on a port to a
-  single process — its `SO_REUSEPORT` does not balance — so more workers
-  add no throughput; limer.sh logs a warning if you ask for them. Zero-downtime
-  `limer upgrade`, reloads, canaries and rollback all work.
+- `workers` share listening sockets the master binds before it forks, because
+  macOS hands every connection on a port to the socket bound last (its
+  `SO_REUSEPORT` does not balance); Linux binds in each worker and lets the
+  kernel spread the connections. A site address added by a reload is served by
+  one worker until the next start. Zero-downtime `limer upgrade`, reloads,
+  canaries and rollback all work.
 - The descriptor limit is `kern.maxfilesperproc` (61,440 by default), so the
   default `max_connections` is about 30,000.
 - Production numbers in this guide are from Linux; a Mac is for development.
@@ -277,7 +279,7 @@ exact match, then wildcard, then the site without a hostname.
 | `header [+|-]Name [value]` or `header { ... }` | Set, add or delete response headers on every response. |
 | `request_header [+|-]Name [value]` | Same for requests sent upstream. |
 | `basic_auth [realm] { user <bcrypt-hash> ... }` | Protect the whole site (`htpasswd -nbB user pass`). |
-| `encode [gzip] [zstd] [br] [{ minimum_length N }]` | Compress eligible responses; server order is the preference. |
+| `encode [gzip] [zstd] [br] [{ minimum_length N }]` | Compress eligible responses; server order is the preference. A response that says `Cache-Control: no-transform` and an event stream (`text/event-stream`) go as they are. |
 | `rate_limit [zone] [rate] [{ key; rate; burst; status; max_keys }]` | Limit requests per key for the whole site (see Rate limiting). |
 | `cache [{ ttl <dur>; stale <dur>; max_object <size> }]` | Cache proxied GET/HEAD responses (see Response caching). |
 | `root <dir>` | Default root for `file_server` in this site. |

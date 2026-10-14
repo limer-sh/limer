@@ -314,11 +314,18 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
     if (cfg->auto_rollback.enabled)
         snapshot_running_binary(cfg->storage);
 #endif
-#ifdef __APPLE__
-    if (nworkers > 1 && !n_old)
-        LOGW("macOS hands every connection on a port to one process (its SO_REUSEPORT does not balance), "
-             "so workers %d serves no more than workers 1", nworkers);
-#endif
+    /* Where the kernel does not balance SO_REUSEPORT across processes, the workers share listening
+     * sockets bound here, before the fork (proxy_prebind; a no-op on Linux). */
+    {
+        char err[512];
+        if (proxy_prebind(cfg, err, sizeof err) < 0) {
+            LOGE("%s", err);
+            config_unref(cfg);
+            free(pids);
+            free(spawned);
+            return 1;
+        }
+    }
     int upgrading = n_old > 0;   /* old workers are being retired once the new ones are up */
     int retire_sent = 0;         /* ...and they have already been told to drain */
 
@@ -458,6 +465,7 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                         config_unref(cfg);
                     }
                     cfg = test;
+                    proxy_prebind_prune(cfg);
                     acme_manager_start(cfg);
                 }
             }
