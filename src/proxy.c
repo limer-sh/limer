@@ -5075,7 +5075,7 @@ int proxy_run(config_t *cfg, int worker_id)
 {
     char err[512];
     g_worker_id = worker_id;
-    g_master_pid = worker_id > 0 ? (int)getppid() : 0;
+    g_master_pid = (int)getppid();   /* workers always run under the master supervisor */
     g_cfg = cfg;
     g_now = now_mono();
     srand((unsigned)(getpid() ^ (unsigned)(g_now * 1000)));
