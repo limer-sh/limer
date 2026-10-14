@@ -367,6 +367,12 @@
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M4 4h16v6H4zM4 14h16v6H4z"/><path d="M8 7h.01M8 17h.01"/></svg></div>
         <h3>Ops you can see</h3><p>Prometheus metrics, JSON upstream status, runtime drain and weight overrides that survive reloads, multi-process workers with SO_REUSEPORT.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.5 8-8 10-4.5-2-8-5-8-10V6z"/></svg></div>
+        <h3>DoS mitigation</h3><p>Cap concurrent connections and the new-connection rate per source IP at accept time, and auto-ban repeat offenders. <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">trusted_proxies</code> keys it on the real client behind a CDN.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.9 10.9 0 0 1 12 5c6 0 10 7 10 7a18 18 0 0 1-3 3.6M6.6 6.6A18 18 0 0 0 2 12s4 7 10 7a10.9 10.9 0 0 0 3.9-.7"/></svg></div>
+        <h3>Low profile</h3><p>limer doesn&rsquo;t announce itself: no <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">Server</code> header by default, neutral cookie names, proxied responses untouched. Set <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">server_header nginx</code> to masquerade.</p></div>
     </div>
   </div>
 </section>
