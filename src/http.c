@@ -343,6 +343,8 @@ int http_parse_response_head(http_resp_t *r, const char *data, size_t len, size_
     if (!isdigit((unsigned char)st[0]) || !isdigit((unsigned char)st[1]) || !isdigit((unsigned char)st[2]))
         return -1;
     r->status = (st[0] - '0') * 100 + (st[1] - '0') * 10 + (st[2] - '0');
+    if (r->status < 100)   /* 0xx is not a valid status; reject so no downstream logic sees status < 100 */
+        return -1;
     if (st[3] == ' ')
         r->reason = (char *)st + 4;
     else if (st[3] == 0)
@@ -468,14 +470,20 @@ int http_chunk_scan(chunk_state_t *cs, const char *in, size_t len, size_t *consu
                 cs->st = CH_DONE;
             } else {
                 cs->st = CH_TRAILER_LINE;
-                if (cs->trailers)
+                if (cs->trailers) {
+                    if (buf_readable(cs->trailers) >= HTTP_MAX_HEAD)
+                        return -1;   /* bound the trailer section an upstream can make us buffer */
                     buf_append(cs->trailers, in + i, 1);
+                }
             }
             i++;
             break;
         case CH_TRAILER_LINE:
-            if (cs->trailers)
+            if (cs->trailers) {
+                if (buf_readable(cs->trailers) >= HTTP_MAX_HEAD)
+                    return -1;   /* bound the trailer section an upstream can make us buffer */
                 buf_append(cs->trailers, in + i, 1);
+            }
             if (c == '\n')
                 cs->st = CH_TRAILER;
             i++;

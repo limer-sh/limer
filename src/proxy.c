@@ -564,6 +564,25 @@ static SSL *upstream_ssl_new(pool_t *p, upstream_t *u, int fd)
 /* Placeholders                                                        */
 /* ------------------------------------------------------------------ */
 
+/* Append a value that came from the request body or an URL/JSON-decoded field,
+ * with CR, LF and NUL removed. Such a value can later be spliced into an
+ * upstream header, the request target, a redirect Location or a local response,
+ * and a decoded newline there would inject a header or split the message. */
+static void append_no_crlf(buf_t *out, const char *data, size_t len)
+{
+    size_t start = 0;
+    for (size_t i = 0; i < len; i++) {
+        char ch = data[i];
+        if (ch == '\r' || ch == '\n' || ch == 0) {
+            if (i > start)
+                buf_append(out, data + start, i - start);
+            start = i + 1;
+        }
+    }
+    if (len > start)
+        buf_append(out, data + start, len - start);
+}
+
 static void expand_placeholders(const char *v, conn_t *c, buf_t *out)
 {
     const char *p = v;
@@ -638,7 +657,7 @@ static void expand_placeholders(const char *v, conn_t *c, buf_t *out)
             buf_init(&v);
             c->ctx.req = &c->req;
             if (key_extract(&ks, &c->ctx, &v))
-                buf_append(out, buf_rptr(&v), buf_readable(&v));
+                append_no_crlf(out, buf_rptr(&v), buf_readable(&v));
             buf_free(&v);
         } else {
             buf_append(out, p, n + 2);
@@ -1370,6 +1389,8 @@ static void conn_send_error(conn_t *c, int status, const char *msg, int close)
     int n = snprintf(body, sizeof body, "%d %s\n%s%s", status, http_status_reason(status), msg ? msg : "", msg ? "\n" : "");
     if (n < 0)
         n = 0;
+    else if (n >= (int)sizeof body)
+        n = (int)sizeof body - 1;   /* snprintf returns the intended length; never read past the buffer */
     conn_write_simple_response(c, status, "text/plain; charset=utf-8", body, (size_t)n, NULL, 0, NULL);
     c->state = CS_LOCAL;
     conn_next_request(c);

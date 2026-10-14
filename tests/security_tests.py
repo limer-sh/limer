@@ -61,6 +61,13 @@ CONFIG = f"""
         to 127.0.0.1:{BACKEND_A} 127.0.0.1:{BACKEND_B}
         lb_policy hash json customer.id
     }}
+    route placeholder {{
+        match path /echo
+        match header X-Inject-Test yes
+        reverse_proxy 127.0.0.1:{BACKEND_A} {{
+            header_up X-Tenant {{json.tenant}}
+        }}
+    }}
     reverse_proxy 127.0.0.1:{BACKEND_A} 127.0.0.1:{BACKEND_B} {{
         lb_retries 1
         max_fails 0
@@ -434,6 +441,15 @@ def t_header_hygiene():
           status_of(r) == 302 and b"\r\nSet-Cookie" not in head and b"%0d%0a" in head, head)
     r = raw(b"GET /old/x\r\nSet-Cookie: evil=1 HTTP/1.1\r\nHost: x\r\n\r\n")
     check("literal CRLF in the request line is rejected", status_of(r) == 400, r[:80])
+    # decoded body/query/form/cookie placeholders used in a header must not carry CRLF to the upstream
+    body = b'{"tenant":"a\\r\\nX-Injected: PWNED\\r\\nX-Smuggle: yes"}'
+    st, h = echo_headers(b"POST /echo HTTP/1.1\r\nHost: x\r\nX-Inject-Test: yes\r\nContent-Type: application/json\r\n"
+                         b"Content-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
+    hdrs = h["headers"] if h else {}
+    check("CRLF in a {json.X} placeholder cannot inject an upstream header",
+          "X-Injected" not in hdrs and "X-Smuggle" not in hdrs, hdrs)
+    check("the placeholder value is still delivered without its CRLF",
+          hdrs.get("X-Tenant", "").startswith("a") and "\n" not in hdrs.get("X-Tenant", ""), hdrs.get("X-Tenant"))
     alive("header hygiene")
 
 
