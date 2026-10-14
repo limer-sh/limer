@@ -504,6 +504,7 @@ typedef struct config {
     char   **resolvers;       /* DNS servers for upstream lookups (ip[:port]); empty = system */
     int      nresolvers;
     size_t   cache_capacity;  /* total response cache size per worker (0 = default) */
+    char    *server_header;   /* value for the Server header on local responses; NULL = omit */
     int      refs;
 } config_t;
 

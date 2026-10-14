@@ -1156,6 +1156,14 @@ static const char *content_type_for(const char *body)
     return "text/plain; charset=utf-8";
 }
 
+/* Add the Server header only when the operator configured one. limer omits it
+ * by default so a response does not announce the software serving it. */
+static void conn_add_server(hlist_t *h, conn_t *c)
+{
+    if (c->cfg && c->cfg->server_header)
+        hlist_add(h, "Server", c->cfg->server_header);
+}
+
 static void conn_write_simple_response(conn_t *c, int status, const char *ctype, const char *body, size_t blen,
                                        hdr_op_t *ops, int nops, const char *extra_hdr)
 {
@@ -1180,7 +1188,7 @@ static void conn_write_simple_response(conn_t *c, int status, const char *ctype,
     snprintf(tmp, sizeof tmp, "%zu", blen);
     hlist_add(&h, "Content-Length", tmp);
     hlist_add(&h, "Connection", keep ? "keep-alive" : "close");
-    hlist_add(&h, "Server", "limer");
+    conn_add_server(&h, c);
     if (c->srv && c->srv->n_hdr_down)
         hlist_apply_ops(&h, c->srv->hdr_down, c->srv->n_hdr_down, c);
     if (ops)
@@ -2755,7 +2763,7 @@ static void conn_serve_cached(conn_t *c, cache_entry_t *e, double now, int x_cac
     snprintf(agebuf, sizeof agebuf, "%.0f", cache_entry_age(e, now));
     hlist_add(&h, "Age", agebuf);
     hlist_add(&h, "X-Cache", x_cache_stale ? "STALE" : "HIT");
-    hlist_add(&h, "Server", "limer");
+    conn_add_server(&h, c);
     if (c->srv->n_hdr_down)
         hlist_apply_ops(&h, c->srv->hdr_down, c->srv->n_hdr_down, c);
 
@@ -4353,6 +4361,7 @@ static void conn_serve_files(conn_t *c, route_t *r)
     char tmp[128];
     hlist_add(&h, "Content-Type", ctype);
     hlist_add(&h, "Accept-Ranges", "bytes");
+    conn_add_server(&h, c);
     hlist_add(&h, "ETag", etag);
     hlist_add(&h, "Last-Modified", lastmod);
     const char *encname = status == 200 ? conn_pick_encoding(c, ctype, (int64_t)length, 200, NULL) : NULL;
