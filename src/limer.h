@@ -406,6 +406,16 @@ void       ipguard_strike(ipguard_t *g, const ipguard_cfg_t *cfg, const char *ip
 void       ipguard_stats(const ipguard_t *g, uint64_t *admitted, uint64_t *ref_conn,
                          uint64_t *ref_rate, uint64_t *ref_ban, uint64_t *bans, int *tracked);
 
+/* scale-up hook: run a command when load spikes, e.g. to add backends */
+typedef struct scale_cfg {
+    int    enabled;
+    double requests;      /* per-worker requests/sec that counts as a spike; 0 = off */
+    int    connections;   /* active-connection count that counts as a spike; 0 = off */
+    double sustain;       /* load must stay above the threshold this long (s); default 0 */
+    double cooldown;      /* minimum seconds between hook runs; default 60 */
+    char  *exec;          /* command run via `sh -c` when triggered */
+} scale_cfg_t;
+
 typedef struct cache_cfg {
     double ttl;           /* default freshness when the response has none (0 = only cache if it says so) */
     double swr;           /* stale-while-revalidate window */
@@ -533,6 +543,7 @@ typedef struct config {
     int      ntrusted_proxies;
     size_t   cache_capacity;  /* total response cache size per worker (0 = default) */
     ipguard_cfg_t ipguard;    /* per-source-IP admission control */
+    scale_cfg_t scale_up;     /* run a hook when load spikes */
     char    *server_header;   /* value for the Server header on local responses; NULL = omit */
     int      refs;
 } config_t;

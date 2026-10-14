@@ -722,6 +722,7 @@ static void config_free(config_t *c)
         free(c->trusted_proxies[i]);
     free(c->trusted_proxies);
     free(c->server_header);
+    free(c->scale_up.exec);
     free(c);
 }
 
@@ -2723,6 +2724,44 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
             }
             if (g->ban_window <= 0)
                 g->ban_window = 10.0;
+        } else if (strcaseeq(k, "scale_up") || strcaseeq(k, "scale_hook")) {
+            scale_cfg_t *s = &cfg->scale_up;
+            s->enabled = 1;
+            s->cooldown = 60.0;
+            for (int j = 0; j < c->nkids; j++) {
+                node_t *o = c->kids[j];
+                const char *n = o->args[0];
+                int rc = 0;
+                if (strcaseeq(n, "requests") || strcaseeq(n, "rate")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0 && parse_rate(o->args[1], &s->requests) < 0) {
+                        snprintf(err, errlen, "line %d: invalid requests rate '%s' (use e.g. 1000r/s)", o->line, o->args[1]);
+                        rc = -1;
+                    }
+                } else if (strcaseeq(n, "connections") || strcaseeq(n, "conns")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
+                        rc = arg_int(o, 1, &s->connections, 1, 100000000, err, errlen);
+                } else if (strcaseeq(n, "sustain") || strcaseeq(n, "for")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
+                        rc = arg_duration(o, 1, &s->sustain, err, errlen);
+                } else if (strcaseeq(n, "cooldown")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
+                        rc = arg_duration(o, 1, &s->cooldown, err, errlen);
+                } else if (strcaseeq(n, "exec") || strcaseeq(n, "command")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0) {
+                        free(s->exec);
+                        s->exec = xstrdup(o->args[1]);
+                    }
+                } else {
+                    snprintf(err, errlen, "line %d: unknown scale_up option '%s'", o->line, n);
+                    rc = -1;
+                }
+                if (rc < 0)
+                    return -1;
+            }
+            if (!s->exec)
+                FAIL("line %d: scale_up needs an `exec <command>`", c->line);
+            if (s->requests <= 0 && s->connections <= 0)
+                FAIL("line %d: scale_up needs a `requests` or `connections` threshold", c->line);
         } else if (strcaseeq(k, "server_header") || strcaseeq(k, "server_tokens")) {
             if (want_args(c, 1, 1, err, errlen) < 0)
                 return -1;

@@ -4983,6 +4983,76 @@ static void begin_shutdown(void)
     }
 }
 
+/* scale-up hook state (worker 0 only) */
+static double   g_scale_sample_t;    /* last time we sampled the request rate */
+static uint64_t g_scale_sample_req;  /* requests count at that sample */
+static double   g_scale_above_since; /* when load first crossed the threshold (0 = below) */
+static double   g_scale_last_fire;   /* last time the hook ran */
+
+/* Run the configured scale-up command, detached, with context in the
+ * environment. Double-forks so the grandchild is reaped by init. */
+static void scale_fire(const char *reason, double rate, int conns)
+{
+    const char *cmd = g_cfg->scale_up.exec;
+    pid_t p = fork();
+    if (p < 0) {
+        LOGE("scale_up: fork failed: %s", strerror(errno));
+        return;
+    }
+    if (p == 0) {
+        if (fork() > 0)
+            _exit(0);               /* intermediate parent exits; grandchild reparents to init */
+        char rbuf[32], cbuf[32];
+        snprintf(rbuf, sizeof rbuf, "%.0f", rate);
+        snprintf(cbuf, sizeof cbuf, "%d", conns);
+        setenv("LIMER_SCALE_REASON", reason, 1);
+        setenv("LIMER_SCALE_RATE", rbuf, 1);
+        setenv("LIMER_SCALE_CONNS", cbuf, 1);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    waitpid(p, NULL, 0);            /* reap the intermediate child (exits at once) */
+}
+
+/* Watch the request rate and connection count; run the hook when load spikes. */
+static void scale_check(void)
+{
+    const scale_cfg_t *sc = &g_cfg->scale_up;
+    if (!sc->enabled || g_worker_id != 0)
+        return;
+    if (g_scale_sample_t == 0) {
+        g_scale_sample_t = g_now;
+        g_scale_sample_req = g_stats.requests;
+        return;
+    }
+    double dt = g_now - g_scale_sample_t;
+    if (dt < 0.5)
+        return;
+    double rate = (double)(g_stats.requests - g_scale_sample_req) / dt;
+    g_scale_sample_t = g_now;
+    g_scale_sample_req = g_stats.requests;
+
+    const char *reason = NULL;
+    if (sc->requests > 0 && rate > sc->requests)
+        reason = "requests";
+    else if (sc->connections > 0 && g_stats.active_conns > sc->connections)
+        reason = "connections";
+
+    if (!reason) {
+        g_scale_above_since = 0;
+        return;
+    }
+    if (g_scale_above_since == 0)
+        g_scale_above_since = g_now;
+    if (g_now - g_scale_above_since < sc->sustain)
+        return;
+    if (g_scale_last_fire > 0 && g_now - g_scale_last_fire < sc->cooldown)
+        return;
+    g_scale_last_fire = g_now;
+    LOGW("scale_up: load spike (%s: %.0f req/s, %d connections), running hook", reason, rate, g_stats.active_conns);
+    scale_fire(reason, rate, g_stats.active_conns);
+}
+
 static void tick(void)
 {
     g_now = now_mono();
@@ -4999,6 +5069,9 @@ static void tick(void)
     }
     if (g_shutdown_flag && !g_shutting_down)
         begin_shutdown();
+
+    if (!g_shutting_down)
+        scale_check();
 
     /* client timeouts */
     conn_t *c = g_conns;
