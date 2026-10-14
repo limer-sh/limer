@@ -102,6 +102,14 @@
   }
   .content{position:relative;z-index:1}
 
+  /* ---- interactive web: three depth layers, each blurred by the script to
+     its distance from the focal plane; calmer behind the text column ---- */
+  .bg-web{position:fixed;inset:0;z-index:0;pointer-events:none;
+    -webkit-mask-image:linear-gradient(90deg,#000 0,rgba(0,0,0,.5) 30%,rgba(0,0,0,.5) 70%,#000 100%);
+            mask-image:linear-gradient(90deg,#000 0,rgba(0,0,0,.5) 30%,rgba(0,0,0,.5) 70%,#000 100%)}
+  .bg-web canvas{position:absolute;inset:0;width:100%;height:100%;will-change:filter}
+  @media(max-width:760px){.bg-web{-webkit-mask-image:none;mask-image:none;opacity:.6}}
+
   /* ---- nav ---- */
   nav{position:sticky;top:0;z-index:20;backdrop-filter:blur(10px);
     background:rgba(11,13,9,.72);border-bottom:1px solid var(--line-soft)}
@@ -239,6 +247,7 @@
 </head>
 <body>
 <div class="bg-glow"></div>
+<div class="bg-web" aria-hidden="true"><canvas></canvas><canvas></canvas><canvas></canvas></div>
 <div class="content">
 
 <nav>
@@ -575,6 +584,237 @@ curl -X POST localhost:8080/echo \
   // reveal on scroll
   var io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}})},{threshold:.12});
   document.querySelectorAll('.fade').forEach(function(el){io.observe(el)});
+
+  // background web: nodes in three depth layers (far, mid, near) with a moving
+  // focal plane; each layer is blurred by its distance from focus, like a lens
+  (function(){
+    var root=document.querySelector('.bg-web');
+    if(!root) return;
+    var cv=[].slice.call(root.querySelectorAll('canvas'));
+    var cx=cv.map(function(c){return c.getContext&&c.getContext('2d')});
+    if(!cx[0]) return;
+    var reduce=window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches;
+    var coarse=window.matchMedia&&matchMedia('(pointer: coarse)').matches;
+
+    var F=520;                                        // focal length: depth F draws at scale 1
+    var BANDS=[[700,1250],[430,700],[250,430]];       // depth range per canvas: far, mid, near
+    var SHARE=[.46,.36,.18];
+    var CENTER=BANDS.map(function(b){return (b[0]+b[1])/2});
+    var APERTURE=3200, MAXBLUR=5.5;                     // blur px per diopter of defocus, and its cap
+    var LINK=150, HUB=200, PULL=220;                  // link reach, pointer hub reach, pointer pull reach (px)
+    var WIDTH=[.55,.85,1.25];
+    var TINTS=[[163,230,53],[163,230,53],[163,230,53],[163,230,53],[199,242,122],[199,242,122],[127,208,255]];
+
+    var W=0,H=0,DPR=1,nodes=[],adj=[],edges=[],packets=[],hub=[];
+    var cam={x:0,y:0},focusD=1/330,blur=[-1,-1,-1],sharpest=2;
+    var mouse={x:0,y:0,on:false,last:-1e9},t=0,nextAmbient=1,slow=0;
+
+    function rnd(a,b){return a+Math.random()*(b-a)}
+    function bandOf(z){return z>=BANDS[0][0]?0:z>=BANDS[1][0]?1:2}
+    function rgba(c,a){return 'rgba('+c[0]+','+c[1]+','+c[2]+','+a.toFixed(3)+')'}
+
+    function mk(b){
+      var z=rnd(BANDS[b][0],BANDS[b][1]),k=z/F;
+      return {b:b,z:z,x:rnd(-1,1)*(W/2+150)*k,y:rnd(-1,1)*(H/2+150)*k,
+        vx:rnd(-1,1)*11*k,vy:rnd(-1,1)*8*k,vz:rnd(-1,1)*6,r:b===2?rnd(1.3,2.8):rnd(.9,2.2),
+        c:TINTS[(Math.random()*TINTS.length)|0],ox:0,oy:0,flash:0,s:1,sx:0,sy:0};
+    }
+    function populate(){
+      var n=Math.max(40,Math.min(160,Math.round(W*H/8500)));
+      if(coarse) n=Math.round(n*.6);
+      nodes=[];packets=[];
+      for(var b=0;b<3;b++) for(var i=0;i<Math.round(n*SHARE[b]);i++) nodes.push(mk(b));
+    }
+    function size(){
+      var w=innerWidth,h=innerHeight,regen=!nodes.length||Math.abs(w-W)>W*.2;
+      W=w;H=h;DPR=Math.min(window.devicePixelRatio||1,coarse?1:1.5);
+      cv.forEach(function(c,i){c.width=Math.round(W*DPR);c.height=Math.round(H*DPR);cx[i].setTransform(DPR,0,0,DPR,0,0)});
+      if(regen) populate();
+    }
+
+    function step(dt){
+      t+=dt;
+      var idle=!mouse.on||t-mouse.last>3,e,i,j,n;
+      // parallax: the camera follows the pointer (near layers move most), or drifts when idle
+      var tx=idle?Math.sin(t*.13)*26:(mouse.x/W-.5)*60;
+      var ty=idle?Math.cos(t*.11)*16:(mouse.y/H-.5)*40;
+      e=Math.min(1,dt*2.5);cam.x+=(tx-cam.x)*e;cam.y+=(ty-cam.y)*e;
+
+      var hz=0,best=110*110;
+      for(i=0;i<nodes.length;i++){
+        n=nodes[i];
+        n.x+=n.vx*dt;n.y+=n.vy*dt;n.z+=n.vz*dt;
+        var B=BANDS[n.b];
+        if(n.z<B[0]){n.z=B[0];n.vz=Math.abs(n.vz)}else if(n.z>B[1]){n.z=B[1];n.vz=-Math.abs(n.vz)}
+        var k=n.z/F,hw=(W/2+150)*k,hh=(H/2+150)*k;
+        if(n.x-cam.x>hw)n.x-=2*hw;else if(n.x-cam.x<-hw)n.x+=2*hw;
+        if(n.y-cam.y>hh)n.y-=2*hh;else if(n.y-cam.y<-hh)n.y+=2*hh;
+        var s=F/n.z,bx=W/2+(n.x-cam.x)*s,by=H/2+(n.y-cam.y)*s,px=0,py=0;
+        if(!idle){
+          // the pointer draws nearby nodes in, more the closer they are
+          var dx=mouse.x-bx,dy=mouse.y-by,d=Math.sqrt(dx*dx+dy*dy);
+          if(d<PULL&&d>1){var f=1-d/PULL;f=Math.min(f*f*28*Math.min(1.4,s),d*.6);px=dx/d*f;py=dy/d*f}
+        }
+        e=Math.min(1,dt*5);n.ox+=(px-n.ox)*e;n.oy+=(py-n.oy)*e;
+        n.s=s;n.sx=bx+n.ox;n.sy=by+n.oy;
+        n.flash=Math.max(0,n.flash-dt*1.6);
+        if(!idle){var mx=n.sx-mouse.x,my=n.sy-mouse.y,m2=mx*mx+my*my;if(m2<best){best=m2;hz=n.z}}
+      }
+
+      // focus: rack to the node under the pointer; otherwise near at the top of
+      // the page and far toward the bottom, breathing slowly
+      var target;
+      if(hz) target=1/hz;
+      else{
+        var sp=scrollY/Math.max(1,document.documentElement.scrollHeight-H);
+        sp=Math.max(0,Math.min(1,sp));sp=sp*sp*(3-2*sp);
+        target=1/330+(1/1050-1/330)*sp+Math.sin(t*.23)*.00035;
+      }
+      focusD+=(target-focusD)*Math.min(1,dt*(hz?3:1.4));
+      var least=1e9;
+      for(var b=0;b<3;b++){
+        var bl=Math.min(MAXBLUR,Math.abs(1/CENTER[b]-focusD)*APERTURE);
+        if(bl<least){least=bl;sharpest=b}
+        if(Math.abs(bl-blur[b])>.04){
+          blur[b]=bl;
+          cv[b].style.filter='blur('+bl.toFixed(2)+'px)';
+          cv[b].style.opacity=(1-bl/MAXBLUR*.3).toFixed(3);
+        }
+      }
+
+      // links between neighbours in the same or adjacent layers, alpha by length
+      edges.length=0;
+      for(i=0;i<nodes.length;i++){if(adj[i])adj[i].length=0;else adj[i]=[]}
+      adj.length=nodes.length;
+      for(i=0;i<nodes.length;i++){
+        var a=nodes[i];
+        for(j=i+1;j<nodes.length;j++){
+          var c=nodes[j];
+          if(a.b-c.b>1||c.b-a.b>1) continue;
+          var L=LINK*(a.s+c.s)/2,ex=a.sx-c.sx,ey=a.sy-c.sy;
+          if(ex>L||ex<-L||ey>L||ey<-L) continue;
+          var d2=ex*ex+ey*ey;
+          if(d2>L*L) continue;
+          var q=Math.ceil((1-Math.sqrt(d2)/L)*6);
+          if(q<1) continue;
+          edges.push(i,j,bandOf((a.z+c.z)/2),q);
+          adj[i].push(j);adj[j].push(i);
+        }
+      }
+
+      // the pointer is a hub: it links to its nearest nodes
+      hub.length=0;
+      if(!idle){
+        for(i=0;i<nodes.length;i++){
+          n=nodes[i];var hx=n.sx-mouse.x,hy=n.sy-mouse.y,h2=hx*hx+hy*hy;
+          if(h2<HUB*HUB) hub.push([h2,i]);
+        }
+        hub.sort(function(p,q){return p[0]-q[0]});
+        hub.length=Math.min(hub.length,6);
+      }
+
+      // packets travel along links; a few spread onwards when they arrive
+      for(i=packets.length-1;i>=0;i--){
+        var p=packets[i];p.t+=dt*p.v;
+        if(p.t>=1){nodes[p.b].flash=1;if(p.hop>0)spread(p.b,p.a,p.hop-1);packets.splice(i,1)}
+      }
+      if(t>nextAmbient&&edges.length){
+        var pick=-1;
+        for(var tries=0;tries<10&&pick<0;tries++){
+          var r=((Math.random()*edges.length/4)|0)*4;
+          if(edges[r+2]===sharpest||tries===9) pick=r;
+        }
+        launch(edges[pick],edges[pick+1],1);
+        nextAmbient=t+rnd(.35,.9);
+      }
+    }
+
+    function launch(a,b,hop){
+      if(packets.length<90) packets.push({a:a,b:b,t:0,v:rnd(1.6,2.4),hop:hop});
+    }
+    function spread(i,from,hop){
+      var nb=(adj[i]||[]).filter(function(k){return k!==from});
+      for(var m=0;m<3&&nb.length;m++) launch(i,nb.splice((Math.random()*nb.length)|0,1)[0],hop);
+    }
+    function pulse(x,y){
+      var best=240*240,bi=-1;
+      for(var i=0;i<nodes.length;i++){
+        var dx=nodes[i].sx-x,dy=nodes[i].sy-y,d2=dx*dx+dy*dy;
+        if(d2<best){best=d2;bi=i}
+      }
+      if(bi>=0){nodes[bi].flash=1;spread(bi,-1,3)}
+    }
+
+    function draw(){
+      var b,i,c,n;
+      for(b=0;b<3;b++) cx[b].clearRect(0,0,W,H);
+      // links, batched per layer and alpha step
+      for(b=0;b<3;b++){
+        c=cx[b];c.lineWidth=WIDTH[b];
+        for(var q=1;q<=6;q++){
+          var any=false;c.beginPath();
+          for(i=0;i<edges.length;i+=4){
+            if(edges[i+2]!==b||edges[i+3]!==q) continue;
+            var A=nodes[edges[i]],Z=nodes[edges[i+1]];
+            c.moveTo(A.sx,A.sy);c.lineTo(Z.sx,Z.sy);any=true;
+          }
+          if(any){c.strokeStyle='rgba(163,230,53,'+(q/6*.5).toFixed(3)+')';c.stroke()}
+        }
+      }
+      // pointer hub links, each drawn in its node's layer so it shares that layer's focus
+      for(i=0;i<hub.length;i++){
+        n=nodes[hub[i][1]];c=cx[n.b];
+        c.strokeStyle='rgba(199,242,122,'+((1-Math.sqrt(hub[i][0])/HUB)*.85).toFixed(3)+')';
+        c.lineWidth=WIDTH[n.b]+.4;c.beginPath();c.moveTo(mouse.x,mouse.y);c.lineTo(n.sx,n.sy);c.stroke();
+        n.flash=Math.max(n.flash,.35);
+      }
+      // nodes
+      for(i=0;i<nodes.length;i++){
+        n=nodes[i];
+        if(n.sx<-30||n.sx>W+30||n.sy<-30||n.sy>H+30) continue;
+        c=cx[n.b];
+        var r=n.r*n.s*(1+n.flash*.8);
+        if(n.flash>.02){c.fillStyle=rgba(n.c,.1+n.flash*.22);c.beginPath();c.arc(n.sx,n.sy,r*3.4,0,6.2832);c.fill()}
+        c.fillStyle=rgba(n.c,Math.min(1,.55+.35*Math.min(1,n.s)+n.flash*.4));
+        c.beginPath();c.arc(n.sx,n.sy,r,0,6.2832);c.fill();
+      }
+      // packets
+      for(i=0;i<packets.length;i++){
+        var p=packets[i],P=nodes[p.a],Q=nodes[p.b];
+        var x=P.sx+(Q.sx-P.sx)*p.t,y=P.sy+(Q.sy-P.sy)*p.t,s=(P.s+Q.s)/2;
+        c=cx[bandOf((P.z+Q.z)/2)];
+        c.fillStyle='rgba(199,242,122,.14)';c.beginPath();c.arc(x,y,4.5*s,0,6.2832);c.fill();
+        c.fillStyle='rgba(225,250,180,.95)';c.beginPath();c.arc(x,y,1.4*s,0,6.2832);c.fill();
+      }
+      if(hub.length){
+        c=cx[sharpest];c.fillStyle='rgba(199,242,122,.75)';
+        c.beginPath();c.arc(mouse.x,mouse.y,2.2,0,6.2832);c.fill();
+      }
+    }
+
+    size();
+    var rt=0;
+    addEventListener('resize',function(){clearTimeout(rt);rt=setTimeout(function(){size();if(reduce){step(.016);draw()}},150)});
+    if(reduce){step(.016);draw();return}   // a still frame, no animation
+
+    addEventListener('pointermove',function(e){mouse.x=e.clientX;mouse.y=e.clientY;mouse.on=true;mouse.last=t},{passive:true});
+    addEventListener('pointerdown',function(e){mouse.x=e.clientX;mouse.y=e.clientY;mouse.on=true;mouse.last=t;pulse(e.clientX,e.clientY)},{passive:true});
+    document.addEventListener('mouseout',function(e){if(!e.relatedTarget)mouse.on=false});
+    addEventListener('blur',function(){mouse.on=false});
+
+    var last=0;
+    function frame(ts){
+      requestAnimationFrame(frame);
+      var dt=last?Math.min(.05,(ts-last)/1000):.016;last=ts;
+      // if frames stay slow, thin out the far layer
+      slow=slow*.98+(dt>.026?.02:0);
+      if(slow>.6&&nodes.length>50){
+        nodes=nodes.filter(function(n,i){return n.b!==0||i%4});packets=[];slow=0;
+      }
+      step(dt);draw();
+    }
+    requestAnimationFrame(frame);
+  })();
 </script>
 </body>
 </html>
