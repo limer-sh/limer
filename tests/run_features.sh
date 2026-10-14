@@ -685,12 +685,12 @@ https://localhost:9801 {
     }
     reverse_proxy 127.0.0.1:9701
 }
-:9803 {
+127.0.0.1:9807 {
     reverse_proxy 127.0.0.1:9705
 }
 CFG
 $BIN run -c "$TMP/stream.conf" >/dev/null 2>"$TMP/stream.log" & SP=$!; PIDS+=($SP)
-wait_port 9798; wait_port 9801; wait_port 9803
+wait_port 9798; wait_port 9801; wait_port 9807
 head -c 20000000 /dev/urandom > "$TMP/upload.bin"
 SUM=$(sha256sum "$TMP/upload.bin" | cut -d' ' -f1)
 r=$(curl -s --data-binary @"$TMP/upload.bin" -H 'Content-Type: application/octet-stream' http://127.0.0.1:9798/upload)
@@ -723,8 +723,8 @@ expect_eq "proxy healthy after early response" "$(H http://127.0.0.1:9798/get)" 
 # the upstream answers before the body has all been sent, and keeps the connection: with bytes still to
 # send, that connection must not be pooled (the upstream would take the next request for the rest of the body)
 head -c 900000 /dev/zero > "$TMP/body900k"
-expect_eq "early keep-alive answer while the body is still being sent" "$(H --data-binary @"$TMP/body900k" http://127.0.0.1:9803/early-keepalive)" "413"
-expect_eq "the next request is not swallowed by that connection" "$(H --max-time 3 http://127.0.0.1:9803/get)" "200"
+expect_eq "early keep-alive answer while the body is still being sent" "$(H --data-binary @"$TMP/body900k" http://127.0.0.1:9807/early-keepalive)" "413"
+expect_eq "the next request is not swallowed by that connection" "$(H --max-time 3 http://127.0.0.1:9807/get)" "200"
 # HTTP/2 clients stream too, with and without content-length
 r=$(curl -sk --http2 --data-binary @"$TMP/upload.bin" https://localhost:9801/upload)
 expect_contains "h2 upload streamed to an http/1.1 upstream" "$r" "$SUM"
