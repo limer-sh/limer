@@ -3288,7 +3288,11 @@ static void conn_process(conn_t *c)
                 if (c->dead)
                     return;
             }
-            if (conn_can_stream_body(c)) {
+            /* A body that already arrived with the head (a small POST) goes the
+             * buffered way, so head and body leave in one write. */
+            int body_here = !c->req.chunked && c->req.content_length >= 0 &&
+                            (int64_t)buf_readable(&c->rbuf) >= c->req.content_length;
+            if (!body_here && conn_can_stream_body(c)) {
                 /* hand the request over now; the body follows as it is read */
                 c->body_stream = 1;
                 conn_dispatch(c);
