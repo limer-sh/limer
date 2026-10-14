@@ -2810,6 +2810,21 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
                 FAIL("line %d: scale_up needs an `exec <command>`", c->line);
             if (s->requests <= 0 && s->connections <= 0)
                 FAIL("line %d: scale_up needs a `requests` or `connections` threshold", c->line);
+        } else if (strcaseeq(k, "http3")) {
+            if (want_args(c, 0, 1, err, errlen) < 0)
+                return -1;
+            const char *v = c->nargs > 1 ? c->args[1] : "on";
+            if (strcaseeq(v, "on"))
+                cfg->http3 = 1;
+            else if (strcaseeq(v, "off"))
+                cfg->http3 = 0;
+            else
+                FAIL("line %d: http3 accepts on or off", c->line);
+#ifndef LIMER_H3
+            if (cfg->http3)
+                LOGW("line %d: http3 is ignored: this build has no HTTP/3 support (needs ngtcp2, nghttp3 and GnuTLS)", c->line);
+            cfg->http3 = 0;
+#endif
         } else if (strcaseeq(k, "server_header") || strcaseeq(k, "server_tokens")) {
             if (want_args(c, 1, 1, err, errlen) < 0)
                 return -1;

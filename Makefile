@@ -33,6 +33,17 @@ LDLIBS += $(shell pkg-config --libs libnghttp2 2>/dev/null)
 endif
 endif
 
+# HTTP/3 needs ngtcp2 and nghttp3 with the GnuTLS crypto backend (auto-detected;
+# requires TLS). Disable with `make H3=0`.
+H3_PKGS := libngtcp2 libngtcp2_crypto_gnutls libnghttp3 gnutls
+H3 ?= $(shell pkg-config --exists $(H3_PKGS) 2>/dev/null && echo 1 || echo 0)
+ifeq ($(H3),1)
+ifeq ($(TLS),1)
+override CFLAGS += -DLIMER_H3 $(shell pkg-config --cflags $(H3_PKGS) 2>/dev/null)
+LDLIBS += $(shell pkg-config --libs $(H3_PKGS) 2>/dev/null)
+endif
+endif
+
 # `make SAN=1` builds everything with AddressSanitizer + UBSan.
 ifeq ($(SAN),1)
 override CFLAGS  += -fsanitize=address,undefined -fno-omit-frame-pointer -O1
@@ -97,13 +108,17 @@ rollback: $(BIN)
 binrollback: $(BIN)
 	python3 tests/binrollback_test.py
 
+# Needs the aioquic Python package (skips without it).
+h3: $(BIN)
+	python3 tests/h3_test.py
+
 # Needs `pebble` (PEBBLE=/path), optionally `pebble-challtestsrv` (CHALLTESTSRV=/path) for dns-01,
 # and `127.0.0.1 limer.test www.limer.test alpn.limer.test dns.limer.test` in /etc/hosts; skips otherwise.
 acme: $(BIN)
 	./tests/run_acme.sh
 
 # Everything: unit tests, parser fuzzing, integration, feature, ACME, security and DoS-guard suites.
-check: unit fuzz integration features acme security ddos scale drain rollback binrollback
+check: unit fuzz integration features acme security ddos scale drain rollback binrollback h3
 
 # The same suites with sanitizers enabled (slower; rebuilds everything).
 check-asan:
@@ -118,4 +133,4 @@ install: $(BIN)
 clean:
 	rm -rf build $(BIN) tests/tmp
 
-.PHONY: all unit fuzz integration features acme security ddos scale drain rollback binrollback check check-asan install clean
+.PHONY: all unit fuzz integration features acme security ddos scale drain rollback binrollback h3 check check-asan install clean

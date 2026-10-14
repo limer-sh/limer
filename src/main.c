@@ -793,13 +793,34 @@ int main(int argc, char **argv)
         return 0;
     }
     if (strcmp(cmd, "version") == 0) {
-#if defined(LIMER_TLS) && defined(LIMER_H2)
-        printf("limer.sh %s (tls, http/2)\n", LIMER_VERSION);
-#elif defined(LIMER_TLS)
-        printf("limer.sh %s (tls)\n", LIMER_VERSION);
-#else
-        printf("limer.sh %s\n", LIMER_VERSION);
+        const char *features = ""
+#ifdef LIMER_TLS
+            " tls"
 #endif
+#ifdef LIMER_H2
+            " http/2"
+#endif
+#ifdef LIMER_H3
+            " http/3"
+#endif
+            ;
+        if (*features) {
+            /* " tls http/2" -> "(tls, http/2)" */
+            char list[64];
+            size_t o = 0;
+            for (const char *p = features + 1; *p && o < sizeof list - 3; p++) {
+                if (*p == ' ') {
+                    list[o++] = ',';
+                    list[o++] = ' ';
+                } else {
+                    list[o++] = *p;
+                }
+            }
+            list[o] = 0;
+            printf("limer.sh %s (%s)\n", LIMER_VERSION, list);
+        } else {
+            printf("limer.sh %s\n", LIMER_VERSION);
+        }
         return 0;
     }
 

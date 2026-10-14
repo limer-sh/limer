@@ -277,6 +277,11 @@ typedef struct conn {
     char h2_method[24];
     char h2_path[4096];
     char h2_authority[264];
+    /* HTTP/3 stream (virtual conn): request assembly and response state reuse the h2_* fields */
+    struct h3conn *h3c;
+    int64_t h3_stream_id;
+    struct h3chunk *h3_out, *h3_out_tail;   /* response bytes handed to nghttp3, freed once acknowledged */
+    int h3_has_body;
     char lb_why[128];
     int in_process;
     int dead;
@@ -363,6 +368,17 @@ static void h2_session_close(conn_t *c);
 static void h2_session_recv(conn_t *c);
 static void h2_session_send(conn_t *c);
 static int  h2_session_start(conn_t *c);
+#endif
+#ifdef LIMER_H3
+static void h3_stream_flush(conn_t *st);
+static void h3_stream_close(conn_t *st);
+static void h3_stream_consumed(conn_t *st, size_t n);
+static void h3_apply(void);
+static void h3_shutdown(void);
+static void h3_after_batch(void);
+static int  h3_poll_timeout(int def_ms);
+static void h3_teardown(void);
+static int  g_h3_live;
 #endif
 static void conn_flush(conn_t *c);
 static void conn_try_upstream(conn_t *c);
@@ -876,7 +892,7 @@ static void conn_reset_request(conn_t *c)
 static void conn_update_mask(conn_t *c)
 {
     uint32_t m = 0;
-    if (c->h2_parent || c->cache_sink)
+    if (c->h2_parent || c->h3c || c->cache_sink)
         return; /* no socket of their own */
 #ifdef LIMER_TLS
     if (c->tls_handshaking) {
@@ -937,7 +953,7 @@ static void conn_log_access(conn_t *c)
         buf_puts(&b, ",\"uri\":");
         log_json_escape(&b, c->req.uri);
         buf_printf(&b, ",\"proto\":\"%s\",\"tls\":%s,\"status\":%d,\"bytes\":%llu,\"duration_ms\":%.3f,\"route\":",
-                   c->h2_parent ? "HTTP/2.0" : c->req.minor ? "HTTP/1.1" : "HTTP/1.0",
+                   c->h3c ? "HTTP/3" : c->h2_parent ? "HTTP/2.0" : c->req.minor ? "HTTP/1.1" : "HTTP/1.0",
                    c->ctx.tls ? "true" : "false", c->resp_status, (unsigned long long)c->resp_bytes, ms);
         log_json_escape(&b, c->route ? c->route->name : "");
         buf_puts(&b, ",\"upstream\":");
@@ -955,7 +971,7 @@ static void conn_log_access(conn_t *c)
     } else {
         buf_printf(&b, "%s %s \"%s %s %s\" %d %llu %.1fms route=%s upstream=%s%s%s",
                    c->peer_str, host ? host : "-", c->req.method, c->req.uri,
-                   c->h2_parent ? "HTTP/2.0" : c->req.minor ? "HTTP/1.1" : "HTTP/1.0", c->resp_status,
+                   c->h3c ? "HTTP/3" : c->h2_parent ? "HTTP/2.0" : c->req.minor ? "HTTP/1.1" : "HTTP/1.0", c->resp_status,
                    (unsigned long long)c->resp_bytes, ms,
                    c->route ? c->route->name : "-",
                    up[0] ? up : "-",
@@ -1026,6 +1042,10 @@ static void conn_close(conn_t *c)
 #ifdef LIMER_H2
         h2_stream_close(c);
 #endif
+    } else if (c->h3c) {
+#ifdef LIMER_H3
+        h3_stream_close(c);
+#endif
     } else {
         g_stats.active_conns--;
     }
@@ -1070,6 +1090,12 @@ static void conn_flush(conn_t *c)
 #ifdef LIMER_H2
     if (c->h2_parent) {
         h2_stream_flush(c);
+        return;
+    }
+#endif
+#ifdef LIMER_H3
+    if (c->h3c) {
+        h3_stream_flush(c);
         return;
     }
 #endif
@@ -1190,6 +1216,23 @@ static void conn_add_server(hlist_t *h, conn_t *c)
         hlist_add(h, "Server", c->cfg->server_header);
 }
 
+/* Over TCP TLS (HTTP/1.1 and HTTP/2), tell clients HTTP/3 is on the same port. */
+static void conn_add_altsvc(hlist_t *h, conn_t *c)
+{
+#ifdef LIMER_H3
+    if (!g_h3_live || !(c->ssl || c->h2_parent))
+        return;
+    const char *colon = strrchr(c->listen_addr, ':');
+    int port = colon ? atoi(colon + 1) : 443;
+    char v[48];
+    snprintf(v, sizeof v, "h3=\":%d\"; ma=86400", port);
+    hlist_add(h, "Alt-Svc", v);
+#else
+    (void)h;
+    (void)c;
+#endif
+}
+
 static void conn_write_simple_response(conn_t *c, int status, const char *ctype, const char *body, size_t blen,
                                        hdr_op_t *ops, int nops, const char *extra_hdr)
 {
@@ -1215,6 +1258,7 @@ static void conn_write_simple_response(conn_t *c, int status, const char *ctype,
     hlist_add(&h, "Content-Length", tmp);
     hlist_add(&h, "Connection", keep ? "keep-alive" : "close");
     conn_add_server(&h, c);
+    conn_add_altsvc(&h, c);
     if (c->srv && c->srv->n_hdr_down)
         hlist_apply_ops(&h, c->srv->hdr_down, c->srv->n_hdr_down, c);
     if (ops)
@@ -1254,6 +1298,16 @@ static void conn_next_request(conn_t *c)
                 __atomic_fetch_add(&g_shared_stats[slot + 1], 1, __ATOMIC_RELAXED);
         }
     }
+#ifdef LIMER_H3
+    if (c->h3c) {
+        /* likewise for an HTTP/3 stream */
+        c->h2_eof = 1;
+        c->state = CS_LOCAL;
+        c->deadline = 0;
+        h3_stream_flush(c);
+        return;
+    }
+#endif
 #ifdef LIMER_H2
     if (c->h2_parent) {
         /* a stream serves exactly one request: hand the end of the body to HTTP/2 */
@@ -1903,6 +1957,7 @@ static void build_client_response_head(conn_t *c, uconn_t *uc)
     }
     if (c->cache_cfg && !tunnel && !c->cache_sink)
         hlist_add(&h, "X-Cache", c->revalidating ? "REVALIDATED" : "MISS");
+    conn_add_altsvc(&h, c);
     if (c->srv->n_hdr_down)
         hlist_apply_ops(&h, c->srv->hdr_down, c->srv->n_hdr_down, c);
     hlist_apply_ops(&h, p->hdr_down, p->n_hdr_down, c);
@@ -2497,7 +2552,7 @@ static void conn_ctx_init(conn_t *c)
     compute_client_ip(c);
     snprintf(c->ctx.peer_ip, sizeof c->ctx.peer_ip, "%s", c->client_ip);
 #ifdef LIMER_TLS
-    c->ctx.tls = c->ssl != NULL || c->h2_parent != NULL;
+    c->ctx.tls = c->ssl != NULL || c->h2_parent != NULL || c->h3c != NULL;
     c->ctx.client_cert = c->h2_parent ? &c->h2_parent->tls_client : c->ssl ? &c->tls_client : NULL;
 #else
     c->ctx.tls = 0;
@@ -2624,6 +2679,10 @@ static void conn_pump_body(conn_t *c)
 #ifdef LIMER_H2
         if (c->h2_parent)
             h2_stream_consumed(c, forwarded);
+#endif
+#ifdef LIMER_H3
+        if (c->h3c)
+            h3_stream_consumed(c, forwarded);
 #endif
     }
     if (done) {
@@ -2863,6 +2922,7 @@ static void conn_serve_cached(conn_t *c, cache_entry_t *e, double now, int x_cac
     hlist_add(&h, "Age", agebuf);
     hlist_add(&h, "X-Cache", x_cache_stale ? "STALE" : "HIT");
     conn_add_server(&h, c);
+    conn_add_altsvc(&h, c);
     if (c->srv->n_hdr_down)
         hlist_apply_ops(&h, c->srv->hdr_down, c->srv->n_hdr_down, c);
 
@@ -3269,7 +3329,7 @@ static void conn_process(conn_t *c)
                     return;
                 }
 #ifdef LIMER_TLS
-                if ((c->ssl || c->h2_parent) && srv->tls_mode == TLS_NONE)
+                if ((c->ssl || c->h2_parent || c->h3c) && srv->tls_mode == TLS_NONE)
                     srv = c->srv; /* never jump from a TLS site to a plain one */
 #endif
                 c->srv = srv;
@@ -4498,6 +4558,7 @@ static void conn_serve_files(conn_t *c, route_t *r)
     hlist_add(&h, "Content-Type", ctype);
     hlist_add(&h, "Accept-Ranges", "bytes");
     conn_add_server(&h, c);
+    conn_add_altsvc(&h, c);
     hlist_add(&h, "ETag", etag);
     hlist_add(&h, "Last-Modified", lastmod);
     const char *encname = status == 200 ? conn_pick_encoding(c, ctype, (int64_t)length, 200, NULL) : NULL;
@@ -4552,6 +4613,9 @@ static void conn_serve_files(conn_t *c, route_t *r)
 #ifdef LIMER_H2
 #include "h2.inc"
 #include "h2u.inc"
+#endif
+#ifdef LIMER_H3
+#include "h3.inc"
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -5047,6 +5111,9 @@ static void do_reload(void)
         }
     config_t *old = g_cfg;
     g_cfg = cfg;
+#ifdef LIMER_H3
+    h3_apply();   /* new or removed HTTPS binds, renewed certificates */
+#endif
     /* The master publishes a canary share before asking for the reload: keep
      * the known-good config for most new connections until it decides. */
     int pct = (int)sh_get(SH_CANARY);
@@ -5075,6 +5142,9 @@ static void begin_shutdown(void)
     g_shutting_down = 1;
     g_shutdown_deadline = g_now + g_cfg->grace;
     LOGI("shutting down: waiting up to %.0fs for %d connection(s)", g_cfg->grace, g_stats.active_conns);
+#ifdef LIMER_H3
+    h3_shutdown();
+#endif
     while (g_listeners) {
         listener_t *l = g_listeners;
         g_listeners = l->next;
@@ -5325,6 +5395,9 @@ int proxy_run(config_t *cfg, int worker_id)
         LOGE("%s", err);
         return 1;
     }
+#ifdef LIMER_H3
+    h3_apply();
+#endif
 
     /* the certificate manager is started by the master, not by a worker */
 
@@ -5359,7 +5432,11 @@ int proxy_run(config_t *cfg, int worker_id)
                 LOGW("grace period over, dropping %d connection(s)", g_stats.active_conns);
             break;
         }
-        int n = epoll_wait(g_epfd, evs, 256, TICK_MS);
+        int timeout = TICK_MS;
+#ifdef LIMER_H3
+        timeout = h3_poll_timeout(timeout);
+#endif
+        int n = epoll_wait(g_epfd, evs, 256, timeout);
         if (n < 0) {
             if (errno == EINTR) {
                 tick();
@@ -5376,10 +5453,16 @@ int proxy_run(config_t *cfg, int worker_id)
                 continue; /* closed earlier in this batch */
             e->cb(e, evs[i].events);
         }
+#ifdef LIMER_H3
+        h3_after_batch();
+#endif
         reap_graveyard();
     }
 
     /* teardown */
+#ifdef LIMER_H3
+    h3_teardown();
+#endif
     while (g_conns)
         conn_close(g_conns);
     while (g_uconns)

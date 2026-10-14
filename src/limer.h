@@ -555,6 +555,7 @@ typedef struct config {
     scale_cfg_t scale_up;     /* run a hook when load spikes */
     rollback_cfg_t auto_rollback; /* revert reloads that cause 5xx */
     char    *server_header;   /* value for the Server header on local responses; NULL = omit */
+    int      http3;           /* also serve HTTPS sites over HTTP/3 (QUIC, UDP on the same port) */
     int      refs;
 } config_t;
 
