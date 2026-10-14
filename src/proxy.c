@@ -5258,7 +5258,9 @@ static void tick(void)
 #ifdef LIMER_H2
     h2u_tick();
 #endif
-    reap_graveyard();
+    /* No reap_graveyard() here: tick() runs as the timer event's handler in the
+     * middle of an epoll batch, and later events in that batch may still point
+     * at objects retired earlier in it. The main loop reaps after each batch. */
 }
 
 static void timer_cb(ev_t *e, uint32_t events)
@@ -5361,6 +5363,7 @@ int proxy_run(config_t *cfg, int worker_id)
         if (n < 0) {
             if (errno == EINTR) {
                 tick();
+                reap_graveyard();   /* outside any event batch, so freeing is safe */
                 continue;
             }
             LOGE("epoll_wait: %s", strerror(errno));
