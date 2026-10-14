@@ -75,6 +75,11 @@ HTTPS with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
 - **Rate limiting**: token buckets per site or per route, keyed by any
   placeholder (`{remote_ip}`, `{header.X-Api-Key}`, `{json.tenant}`...),
   with `Retry-After` on rejection.
+- **DoS mitigation**: `ip_guard` caps concurrent connections and the
+  new-connection rate per source IP at accept time, and auto-bans sources
+  that repeatedly trip the limits or a rate limit; `trusted_proxies` makes
+  all of this (and `remote_ip`, `X-Real-IP`) key on the real client behind a
+  CDN or load balancer.
 - **Sites like Caddy's**: `example.com`, `www.example.com:8080`,
   `https://api.example.com`, `:8080`, `localhost`, wildcards. Sites sharing a
   port share one listener and are told apart by Host and SNI.
@@ -175,6 +180,8 @@ replaced from the environment.
     auto_https on             # off | disable_redirects
     resolvers 10.0.0.2 10.0.0.3   # DNS servers for upstream lookups (default: system)
     cache_capacity 64m        # total response-cache size per worker
+    trusted_proxies 10.0.0.0/8    # believe X-Forwarded-For from these hops (see below)
+    ip_guard { }              # per-source-IP DoS mitigation (see below)
 }
 
 # snippets can be imported into any block, with {args.N} substitution
@@ -374,6 +381,62 @@ requests get `status` (`429`) with `Retry-After`, and zones are capped at
 `max_keys` (`100000`) buckets with least-recently-used eviction. Counts are
 per worker. `/metrics` exposes allowed and limited totals per zone.
 
+### DoS mitigation (connection guard)
+
+`ip_guard` turns away abusive sources at the edge, before any HTTP parsing,
+to blunt application-layer (L7) floods. It is not volumetric DDoS protection:
+a single host cannot absorb a flood that saturates its uplink — put
+network-layer scrubbing (a CDN, your provider) in front for that.
+
+```
+{
+    trusted_proxies 10.0.0.0/8   # see below; set this when behind a proxy
+    ip_guard {
+        max_conns_per_ip 100     # cap concurrent connections per source IP
+        conn_rate 50r/s          # new connections per second per source IP
+        conn_burst 100           # bucket for conn_rate (default: the rate)
+        ban_threshold 10         # strikes within the window that trigger a ban
+        ban_window 10s           # how long strikes are counted over (default 10s)
+        ban_duration 5m          # how long a banned address stays out
+        max_keys 1000000         # addresses tracked before LRU eviction
+    }
+}
+```
+
+The guard works in two layers:
+
+- **At accept, keyed on the TCP peer**: `max_conns_per_ip` caps concurrent
+  connections and `conn_rate` limits new ones (a token bucket of `conn_burst`).
+  A connection over either limit is dropped before it costs anything, and the
+  source earns a *strike*.
+- **After the request head, keyed on the effective client IP**: a banned
+  client is turned away (`403`, or the connection is refused at accept when
+  the client is the direct peer), and a request rejected by a `rate_limit`
+  zone earns a strike too. An address that collects `ban_threshold` strikes
+  within `ban_window` is banned for `ban_duration` — a fail2ban-style
+  escalation that caps repeat offenders without banning on a single spike.
+
+Any subset works: set only `max_conns_per_ip`, only `conn_rate`, or only the
+`ban_*` knobs. Counts and bans are per worker (like `rate_limit`). The admin
+listener is never guarded. `/metrics` exposes
+`limer_ipguard_{admitted,refused,bans,tracked}`.
+
+#### trusted_proxies and the client IP
+
+By default limer treats the immediate TCP peer as the client. Behind a CDN or
+another load balancer that is wrong: every connection's peer is the proxy, so
+per-IP limits and bans would land on the proxy itself. List the proxy
+addresses (IPs or CIDRs) in `trusted_proxies` and limer derives the real
+client from `X-Forwarded-For` — the right-most address that is not itself a
+trusted proxy. That effective client IP then drives the `remote_ip` matcher,
+the `{remote_ip}` placeholder, `rate_limit` keys, the `X-Real-IP` sent
+upstream, and the guard's bans. With `trusted_proxies` unset (the default),
+nothing changes: the client IP is always the peer. Because the client IP is
+only known once the head is read, the connection-level caps (`max_conns_per_ip`,
+`conn_rate`) always key on the direct peer; behind a trusted proxy they guard
+the proxy connection, and you rely on `rate_limit` plus bans for per-client
+limits.
+
 ### Streaming request bodies
 
 A proxied request's body is streamed to the upstream as it arrives, with
@@ -558,7 +621,7 @@ and `SIGTERM`, and runs the certificate manager.
 
 ## Testing
 
-`make check` runs six suites; `make check-asan` runs them on a build
+`make check` runs seven suites; `make check-asan` runs them on a build
 instrumented with AddressSanitizer and UndefinedBehaviorSanitizer. The
 GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 
@@ -570,6 +633,7 @@ GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 | `make features` | `tests/run_features.sh`: virtual hosts, SNI, redirects, handlers, basic auth, logging, static files, compression, TLS to upstreams, HTTP/2, rate limiting, sticky sessions, the runtime admin API, gRPC over h2c/h2 upstreams and bidirectional streaming (needs `grpcio` and `grpcio-tools`; skipped otherwise), streaming request bodies, dynamic upstreams (a small test DNS server), mutual TLS, traffic splitting and mirroring, response caching, and reload. |
 | `make acme` | `tests/run_acme.sh`: certificate issuance over http-01, tls-alpn-01 and dns-01 (wildcard), storage and renewal against Pebble and pebble-challtestsrv (skips when they are not installed). |
 | `make security` | `tests/security_tests.py`: the black-box security suite described below. |
+| `make ddos` | `tests/ddos_test.py`: the per-IP connection guard — concurrent-connection caps, the new-connection rate limit, automatic ban escalation, and `trusted_proxies` client-IP keying. |
 
 ## Security
 

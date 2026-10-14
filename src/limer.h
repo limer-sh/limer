@@ -380,6 +380,32 @@ typedef struct rate_limit_cfg {
     ratelimit_t *rl;    /* runtime table */
 } rate_limit_cfg_t;
 
+/* per-source-IP admission control (ipguard.c): L7 DoS mitigation at accept() */
+typedef struct ipguard_cfg {
+    int    enabled;
+    int    max_conns_per_ip;   /* cap concurrent connections per IP; 0 = off */
+    double conn_rate;          /* new connections/sec per IP; 0 = off */
+    double conn_burst;         /* bucket size; default = conn_rate */
+    int    ban_threshold;      /* strikes within the window that trigger a ban; 0 = banning off */
+    double ban_window;         /* seconds the strikes are counted over (default 10s) */
+    double ban_duration;       /* seconds an address stays banned; 0 = banning off */
+    int    max_keys;           /* table cap (default 1,000,000) */
+} ipguard_cfg_t;
+
+typedef struct ipguard ipguard_t;
+enum { IPGUARD_OK = 0, IPGUARD_BANNED, IPGUARD_CONN_LIMIT, IPGUARD_RATE };
+ipguard_t *ipguard_new(int max_keys);
+void       ipguard_free(ipguard_t *g);
+/* Decide a freshly-accepted connection from `ip`. Returns IPGUARD_OK (and
+ * counts a live connection) or one of the refusal reasons above. */
+int        ipguard_admit(ipguard_t *g, const ipguard_cfg_t *cfg, const char *ip, double now);
+void       ipguard_release(ipguard_t *g, const char *ip);   /* a tracked connection closed */
+/* Layer 2 (post-header, keyed on the effective client IP): enforce and build bans. */
+int        ipguard_is_banned(ipguard_t *g, const char *ip, double now);
+void       ipguard_strike(ipguard_t *g, const ipguard_cfg_t *cfg, const char *ip, double now);
+void       ipguard_stats(const ipguard_t *g, uint64_t *admitted, uint64_t *ref_conn,
+                         uint64_t *ref_rate, uint64_t *ref_ban, uint64_t *bans, int *tracked);
+
 typedef struct cache_cfg {
     double ttl;           /* default freshness when the response has none (0 = only cache if it says so) */
     double swr;           /* stale-while-revalidate window */
@@ -503,7 +529,10 @@ typedef struct config {
     double   acme_dns_propagation; /* wait after "present" */
     char   **resolvers;       /* DNS servers for upstream lookups (ip[:port]); empty = system */
     int      nresolvers;
+    char   **trusted_proxies; /* CIDRs/IPs whose X-Forwarded-For is trusted for the client IP */
+    int      ntrusted_proxies;
     size_t   cache_capacity;  /* total response cache size per worker (0 = default) */
+    ipguard_cfg_t ipguard;    /* per-source-IP admission control */
     int      refs;
 } config_t;
 
