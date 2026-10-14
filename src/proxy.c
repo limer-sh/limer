@@ -4796,9 +4796,76 @@ static void admin_handle(conn_t *c)
                 buf_puts(&b, "}\n");
             }
         }
+    } else if (strcmp(path, "/drain") == 0 || strcmp(path, "/undrain") == 0) {
+        /* Self-service drain: a backend signals, during graceful shutdown, that
+         * limer should stop sending it new requests. The upstream(s) to touch
+         * are those at the caller's own source IP, so a caller can only ever
+         * drain itself. Optional ?port=N narrows it to one listening port. */
+        int drained = path[1] == 'd' ? 1 : 0;
+        if (strcmp(c->req.method, "POST") != 0) {
+            status = 405;
+            buf_puts(&b, "{\"error\":\"use POST\"}\n");
+        } else {
+            int want_port = 0;
+            const char *pp = c->req.query ? strstr(c->req.query, "port=") : NULL;
+            if (pp)
+                want_port = atoi(pp + 5);
+            char matched[64][300];
+            int nm = 0;
+            for (int i = 0; i < g_cfg->nservers; i++) {
+                server_t *s = g_cfg->servers[i];
+                for (int r = 0; r < s->nroutes; r++) {
+                    pool_t *p = s->routes[r]->pool;
+                    if (!p)
+                        continue;
+                    for (int k = 0; k < p->nups; k++) {
+                        upstream_t *u = p->ups[k];
+                        if (!u->resolved)
+                            continue;
+                        char uip[64];
+                        sockaddr_to_str((struct sockaddr *)&u->addr, uip, sizeof uip, 0);
+                        if (strcmp(uip, c->peer_ip) != 0)
+                            continue;
+                        if (want_port && u->port != want_port)
+                            continue;
+                        int seen = 0;
+                        for (int m = 0; m < nm; m++)
+                            if (strcmp(matched[m], u->hostport) == 0)
+                                seen = 1;
+                        if (!seen && nm < 64)
+                            snprintf(matched[nm++], sizeof matched[0], "%s", u->hostport);
+                    }
+                }
+            }
+            if (nm == 0) {
+                status = 404;
+                buf_printf(&b, "{\"error\":\"no upstream matches your address %s\"}\n", c->peer_ip);
+            } else {
+                char err[256] = "";
+                int failed = 0;
+                for (int m = 0; m < nm; m++) {
+                    admin_apply_upstream(matched[m], drained, -1);
+                    if (overrides_set(g_cfg, matched[m], drained, -1, err, sizeof err) < 0) {
+                        failed = 1;
+                        break;
+                    }
+                }
+                if (failed) {
+                    status = 500;
+                    buf_printf(&b, "{\"error\":\"%s\"}\n", err);
+                } else {
+                    admin_request_reload();
+                    buf_printf(&b, "{\"status\":\"ok\",\"address\":\"%s\",\"drained\":%s,\"upstreams\":[",
+                               c->peer_ip, drained ? "true" : "false");
+                    for (int m = 0; m < nm; m++)
+                        buf_printf(&b, "%s\"%s\"", m ? "," : "", matched[m]);
+                    buf_puts(&b, "]}\n");
+                }
+            }
+        }
     } else {
         status = 404;
-        buf_puts(&b, "{\"error\":\"not found\",\"endpoints\":[\"/health\",\"/upstreams\",\"/metrics\",\"/config\",\"/overrides\",\"/reload (POST)\",\"/upstreams/<host:port>/drain|undrain|weight/<n> (POST)\"]}\n");
+        buf_puts(&b, "{\"error\":\"not found\",\"endpoints\":[\"/health\",\"/upstreams\",\"/metrics\",\"/config\",\"/overrides\",\"/reload (POST)\",\"/drain|/undrain (POST, self)\",\"/upstreams/<host:port>/drain|undrain|weight/<n> (POST)\"]}\n");
     }
     c->route = NULL;
     conn_write_simple_response(c, status, ctype, b.data ? b.data : "", b.len, NULL, 0, NULL);
