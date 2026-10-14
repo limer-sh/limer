@@ -1,5 +1,5 @@
 /*
- * limer.h - shared declarations for Limer, an HTTP load balancer with
+ * limer.h - shared declarations for limer.sh, an HTTP load balancer with
  * payload-based request distribution.
  */
 #ifndef LIMER_H

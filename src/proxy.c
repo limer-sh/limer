@@ -5145,7 +5145,7 @@ int proxy_run(config_t *cfg, int worker_id)
     g_resolver_ev.cb = resolver_cb;
     ev_add(&g_resolver_ev, EPOLLIN);
 
-    LOGI("limer %s worker %d ready (%d server block%s)", LIMER_VERSION, worker_id, cfg->nservers, cfg->nservers == 1 ? "" : "s");
+    LOGI("limer.sh %s worker %d ready (%d server block%s)", LIMER_VERSION, worker_id, cfg->nservers, cfg->nservers == 1 ? "" : "s");
 
     struct epoll_event evs[256];
     for (;;) {

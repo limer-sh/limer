@@ -400,7 +400,7 @@ int tls_init_internal(server_t *s, char *err, size_t errlen)
     X509_set_pubkey(x, pkey);
     X509_NAME *name = X509_get_subject_name(x);
     const char *cn = s->nhosts ? s->hosts[0] : "localhost";
-    X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC, (const unsigned char *)"Limer Local", -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC, (const unsigned char *)"Local Authority", -1, -1, 0);
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)cn, -1, -1, 0);
     X509_set_issuer_name(x, name);
     /* subjectAltName from the hosts (DNS or IP); wildcards are kept as-is */

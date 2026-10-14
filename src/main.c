@@ -19,7 +19,7 @@ static const char *default_config_paths[] = { "Limerfile", "/etc/limer/Limerfile
 
 static void usage(FILE *out)
 {
-    fputs("Limer " LIMER_VERSION " - HTTP load balancer with payload-based distribution\n"
+    fputs("limer.sh " LIMER_VERSION " - HTTP load balancer with payload-based distribution\n"
           "\n"
           "Usage:\n"
           "  limer run      [-c FILE] [-w N]   Run the load balancer (foreground)\n"
@@ -134,7 +134,7 @@ static int run_master(config_t *cfg, const char *cfg_path, int nworkers)
     sigaction(SIGCHLD, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    LOGI("limer %s master starting %d workers", LIMER_VERSION, nworkers);
+    LOGI("limer.sh %s master starting %d workers", LIMER_VERSION, nworkers);
     for (int i = 0; i < nworkers; i++) {
         pids[i] = spawn_worker(cfg_path, i + 1);
         spawned[i] = now_mono();
@@ -333,11 +333,11 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "version") == 0) {
 #if defined(LIMER_TLS) && defined(LIMER_H2)
-        printf("limer %s (tls, http/2)\n", LIMER_VERSION);
+        printf("limer.sh %s (tls, http/2)\n", LIMER_VERSION);
 #elif defined(LIMER_TLS)
-        printf("limer %s (tls)\n", LIMER_VERSION);
+        printf("limer.sh %s (tls)\n", LIMER_VERSION);
 #else
-        printf("limer %s\n", LIMER_VERSION);
+        printf("limer.sh %s\n", LIMER_VERSION);
 #endif
         return 0;
     }
