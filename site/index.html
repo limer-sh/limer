@@ -171,7 +171,7 @@
   section{padding:58px 0}
   .sec-head{max-width:720px;margin-bottom:40px}
   .kicker{font-family:var(--mono);font-size:12.5px;color:var(--lime-dim);letter-spacing:.04em;text-transform:uppercase;margin-bottom:12px}
-  h2{font-size:clamp(1.7rem,3.6vw,2.4rem);letter-spacing:-.02em;margin:0 0 14px;font-weight:700}
+  h2{font-size:clamp(1.7rem,3.6vw,2.4rem);letter-spacing:-.02em;margin:0 0 14px;font-weight:700;line-height:1.2}
   .sec-head p{color:var(--muted);font-size:1.05rem;margin:0}
   .divider{height:1px;background:linear-gradient(90deg,transparent,var(--line),transparent)}
 
@@ -217,6 +217,16 @@
   .perf-lead{color:var(--muted);margin:0 0 18px;max-width:720px}
   td .lat{display:block;color:var(--faint);font-size:12px;font-weight:400;margin-top:2px}
 
+  /* ---- security ---- */
+  .nolist{list-style:none;padding:0;margin:20px 0 0;display:grid;gap:14px}
+  .nolist li{position:relative;padding-left:20px;color:var(--muted);font-size:15px;line-height:1.6}
+  .nolist li::before{content:"";position:absolute;left:0;top:.62em;width:7px;height:7px;border-radius:2px;background:var(--lime-dim)}
+  .nolist b{color:var(--fg);font-weight:600}
+  .noplug{margin-top:64px;align-items:start}
+  .noplug .codecard{margin-top:0}
+  .noplug h3{font-size:1.45rem;letter-spacing:-.015em;margin:0 0 12px;line-height:1.25}
+  .tradeoff{margin-top:18px;color:var(--faint);font-size:14.5px}
+
   /* ---- quickstart ---- */
   .steps{display:grid;grid-template-columns:1fr 1fr;gap:28px;align-items:start}
   @media(max-width:820px){.steps{grid-template-columns:1fr}}
@@ -257,6 +267,7 @@
       <a class="nav-hide" href="#routing">Routing</a>
       <a class="nav-hide" href="#features">Features</a>
       <a class="nav-hide" href="#usecases">Use cases</a>
+      <a class="nav-hide" href="#security">Security</a>
       <a class="nav-hide" href="#performance">Performance</a>
       <a class="nav-hide" href="#start">Quickstart</a>
       <a class="gh" href="https://github.com/limer-sh/limer">GitHub ↗</a>
@@ -391,7 +402,7 @@
         <h3>Low profile</h3><p>limer doesn&rsquo;t announce itself: no <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">Server</code> header by default, neutral cookie names, proxied responses untouched. Set <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">server_header nginx</code> to masquerade.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><path d="M14 7h7v7"/></svg></div>
-        <h3>Autoscaling hooks</h3><p><code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">scale_up</code> runs your command when traffic spikes; a backend shutting down calls <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">POST /drain</code> and stops getting new requests. Crashed workers restart on their own.</p></div>
+        <h3>Autoscaling hooks</h3><p><code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">scale_up</code> runs your command when traffic spikes; a backend shutting down calls <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">POST /drain</code> and stops getting new requests &mdash; both behind a secret, with bans for floods. Crashed workers restart on their own.</p></div>
     </div>
   </div>
 </section>
@@ -457,6 +468,72 @@ encode gzip zstd br</code>
       </div>
     </div>
     <p class="perf-note">Full, runnable examples in <a href="https://github.com/limer-sh/limer/blob/main/USECASE.md" style="color:var(--lime-soft)">USECASE.md</a>.</p>
+  </div>
+</section>
+
+<div class="wrap"><div class="divider"></div></div>
+
+<!-- SECURITY -->
+<section id="security">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="kicker">Security</div>
+      <h2>Strict at the edge. Nothing loaded at runtime.</h2>
+      <p>limer.sh sits in front of your application, so it treats every client and every upstream as hostile &mdash; and keeps the code that does it small enough to read.</p>
+    </div>
+    <div class="grid">
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6z"/></svg></div>
+        <h3>No request smuggling</h3><p>Conflicting <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">Content-Length</code> and <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">Transfer-Encoding</code>, odd codings, obsolete line folding or a space before a colon get a 400 and a closed connection. Bodies are always re-framed upstream.</p></div>
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M4 18a8 8 0 1 1 16 0M12 18l4-6"/></svg></div>
+        <h3>Everything is bounded</h3><p>64 KiB heads, 128 headers, <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">max_body</code>, slow-client and idle timeouts, per-worker connection caps, HTTP/2 stream limits, bounded JSON nesting. Nothing grows without a limit.</p></div>
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M3 12h5M16 12h5M8 7h8v10H8z"/></svg></div>
+        <h3>Hostile upstreams</h3><p>Bogus status lines, conflicting framing, NUL bytes or an unsolicited 101 from a backend become a clean 502 &mdash; never a poisoned keep-alive connection.</p></div>
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3"/></svg></div>
+        <h3>A locked admin API</h3><p>A bearer secret on every endpoint but <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">/health</code>, compared in constant time. Webhooks like <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">POST /drain</code> and <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">/scale_up</code> are rate limited, and callers that guess secrets or flood them get banned.</p></div>
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M4 5h6l2 2h8v12H4z"/></svg></div>
+        <h3>Files stay in their root</h3><p>Paths are percent-decoded and normalised before use, <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">..</code> can never leave <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">root</code>, and dotfiles are hidden. Header values can never carry CR or LF.</p></div>
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M9 12l2 2 4-4"/><path d="M4 5h16v14H4z"/></svg></div>
+        <h3>Tested like an attacker</h3><p>A 99-check black-box suite attacks a live instance &mdash; smuggling, malformed input, a scripted hostile upstream, wire-level fuzzing. Parsers are fuzzed on every CI build; clean under ASan, UBSan and Valgrind.</p></div>
+    </div>
+
+    <div class="split noplug">
+      <div class="prose">
+        <div class="kicker">By design</div>
+        <h3>Why there are no third-party plugins</h3>
+        <p style="color:var(--muted);margin:0">Plugin ecosystems make a server easy to extend &mdash; and make its security the sum of everyone&rsquo;s code. limer.sh deliberately has none.</p>
+        <ul class="nolist">
+          <li><b>A plugin runs inside the proxy.</b> C has no sandbox for in-process code: one module&rsquo;s buffer overflow is the server&rsquo;s overflow, with every request, cookie and TLS private key in the same memory.</li>
+          <li><b>Every plugin is a supply chain.</b> Another author, another release stream, another chance of a compromised update &mdash; in the one component that sees all of your traffic.</li>
+          <li><b>Nothing loads at runtime.</b> No module loader, no <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">dlopen</code>, no embedded scripting: a config file cannot pull in code. What you audit is what runs &mdash; one binary, about 18,600 lines of C, from one repository.</li>
+          <li><b>Everything is tested together.</b> The fuzzers and the security suite cover every feature in the build. A plugin matrix is a set of combinations nobody tests.</li>
+        </ul>
+        <p class="tradeoff">The trade-off is real: you can&rsquo;t bolt a feature on. Ask for it in an issue &mdash; or keep it out of process, where a bug stays in its own address space.</p>
+      </div>
+      <div class="codecard">
+        <div class="bar"><span class="d"></span><span class="d"></span><span class="d"></span><span class="name">extend it out of process</span></div>
+<pre><code><span class="c-op">{</span>
+    <span class="c-cm"># hooks run as their own processes</span>
+    <span class="c-dir">acme_dns_script</span> <span class="c-str">/etc/limer/dns-hook.sh</span>
+    <span class="c-dir">scale_up</span> <span class="c-op">{</span>
+        <span class="c-dir">requests</span> <span class="c-num">1000r/s</span>
+        <span class="c-dir">exec</span> <span class="c-str">"/etc/limer/scale-up.sh"</span>
+    <span class="c-op">}</span>
+    <span class="c-cm"># webhooks need the secret</span>
+    <span class="c-dir">admin</span> <span class="c-num">10.0.0.1:2019</span> <span class="c-op">{</span>
+        <span class="c-dir">secret</span> <span class="c-str">{$LIMER_ADMIN_SECRET}</span>
+    <span class="c-op">}</span>
+<span class="c-op">}</span>
+
+<span class="c-site">example.com</span> <span class="c-op">{</span>
+    <span class="c-cm"># your own service is the plugin</span>
+    <span class="c-dir">route</span> auth <span class="c-op">{</span>
+        <span class="c-dir">match</span> <span class="c-kw">path</span> <span class="c-str">/login/*</span>
+        <span class="c-dir">reverse_proxy</span> <span class="c-num">127.0.0.1:7000</span>
+    <span class="c-op">}</span>
+    <span class="c-dir">reverse_proxy</span> <span class="c-num">10.0.0.5:8080</span>
+<span class="c-op">}</span></code></pre>
+      </div>
+    </div>
   </div>
 </section>
 
