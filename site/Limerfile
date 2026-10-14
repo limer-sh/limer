@@ -3,6 +3,7 @@
     storage /var/lib/limer
     pidfile /run/limer.pid
     log_level info
+    http3
     auto_rollback {
         canary 5%
         window 30s
