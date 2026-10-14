@@ -863,6 +863,32 @@ Caddy was run with `auto_https off` and `admin off`, GOMAXPROCS pinned to
 the core count, and HTTP/1.1 clients only (wrk does not speak HTTP/2).
 This compares only the HTTP/1.1 reverse-proxy data path.
 
+### Compared with nginx and HAProxy
+
+`bench/compare.sh` runs limer, nginx and HAProxy side by side on the same box:
+the same two `bench/backend.c` backends, one worker process (or thread) per
+proxy, keep-alive to the backends, no access logging, wrk with two threads,
+each scenario repeated in rotating order with the best run kept. It uses only
+loopback test ports and never starts the nginx or HAProxy system services, so
+it is safe on a machine that serves something else.
+
+On a 1-vCPU VM (Linux 6.8; nginx 1.24, HAProxy 2.8.16; best of 3, 10 s runs):
+
+| Scenario | limer | nginx | HAProxy |
+|---|---|---|---|
+| GET, keep-alive, 100 connections | 25,555 req/s, p99 5.9 ms | 25,174 req/s, p99 5.4 ms | 24,557 req/s, p99 5.7 ms |
+| GET, keep-alive, 1000 connections | 19,023 req/s, p99 86 ms | 18,033 req/s, p99 84 ms | 18,056 req/s, p99 62 ms |
+| POST 120 B JSON, 100 connections | 24,451 req/s | 24,113 req/s | 24,521 req/s |
+| GET, new connection per request | 10,035 req/s | 9,991 req/s | 10,427 req/s |
+
+The three are level: limer is a few percent ahead on keep-alive GETs, HAProxy
+has the best tail latency at 1000 connections and the fastest fresh-connection
+path, and none of the gaps exceeds about 5% in throughput. On one core the load
+generator and the backends compete with the proxy for the CPU, so this
+measures relative efficiency, not the ceiling; repeat it on a multi-core
+machine with `workers` / `worker_processes` / `nbthread` raised to compare
+scaling.
+
 ### Connection capacity
 
 Each client connection costs one file descriptor and about 3 KB of memory
