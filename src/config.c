@@ -2724,6 +2724,42 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
             }
             if (g->ban_window <= 0)
                 g->ban_window = 10.0;
+        } else if (strcaseeq(k, "auto_rollback") || strcaseeq(k, "reload_rollback")) {
+            rollback_cfg_t *rb = &cfg->auto_rollback;
+            rb->enabled = 1;
+            rb->error_rate = 0.5;
+            rb->window = 15.0;
+            rb->min_requests = 20;
+            for (int j = 0; j < c->nkids; j++) {
+                node_t *o = c->kids[j];
+                const char *n = o->args[0];
+                int rc = 0;
+                if (strcaseeq(n, "error_rate") || strcaseeq(n, "errors")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0) {
+                        char *end;
+                        double v = strtod(o->args[1], &end);
+                        if (*end == '%')
+                            v /= 100.0;
+                        if (end == o->args[1] || v <= 0 || v > 1) {
+                            snprintf(err, errlen, "line %d: error_rate must be a share like 30%% or 0.3", o->line);
+                            rc = -1;
+                        } else {
+                            rb->error_rate = v;
+                        }
+                    }
+                } else if (strcaseeq(n, "window") || strcaseeq(n, "probation")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
+                        rc = arg_duration(o, 1, &rb->window, err, errlen);
+                } else if (strcaseeq(n, "min_requests")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
+                        rc = arg_int(o, 1, &rb->min_requests, 1, 100000000, err, errlen);
+                } else {
+                    snprintf(err, errlen, "line %d: unknown auto_rollback option '%s'", o->line, n);
+                    rc = -1;
+                }
+                if (rc < 0)
+                    return -1;
+            }
         } else if (strcaseeq(k, "scale_up") || strcaseeq(k, "scale_hook")) {
             scale_cfg_t *s = &cfg->scale_up;
             s->enabled = 1;

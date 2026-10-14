@@ -406,6 +406,14 @@ void       ipguard_strike(ipguard_t *g, const ipguard_cfg_t *cfg, const char *ip
 void       ipguard_stats(const ipguard_t *g, uint64_t *admitted, uint64_t *ref_conn,
                          uint64_t *ref_rate, uint64_t *ref_ban, uint64_t *bans, int *tracked);
 
+/* revert a reload whose new config makes responses fail */
+typedef struct rollback_cfg {
+    int    enabled;
+    double error_rate;    /* 5xx share during probation that triggers a revert (0..1); default 0.5 */
+    double window;        /* probation after a reload (s); default 15 */
+    int    min_requests;  /* responses needed before judging; default 20 */
+} rollback_cfg_t;
+
 /* scale-up hook: run a command when load spikes, e.g. to add backends */
 typedef struct scale_cfg {
     int    enabled;
@@ -544,6 +552,7 @@ typedef struct config {
     size_t   cache_capacity;  /* total response cache size per worker (0 = default) */
     ipguard_cfg_t ipguard;    /* per-source-IP admission control */
     scale_cfg_t scale_up;     /* run a hook when load spikes */
+    rollback_cfg_t auto_rollback; /* revert reloads that cause 5xx */
     char    *server_header;   /* value for the Server header on local responses; NULL = omit */
     int      refs;
 } config_t;
@@ -639,6 +648,8 @@ void upstream_report_success(pool_t *p, upstream_t *u);
 int  proxy_run(config_t *cfg, int worker_id);  /* blocks until shutdown */
 void proxy_request_reload(void);
 void proxy_request_shutdown(void);
+/* counters shared with the master across fork: [0] responses, [1] 5xx responses */
+void proxy_set_shared_stats(uint64_t *counters);
 
 /* ------------------------------------------------------------------ */
 /* TLS                                                                 */

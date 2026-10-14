@@ -53,6 +53,7 @@ typedef struct ev {
 static int g_epfd = -1;
 static config_t *g_cfg;
 static ipguard_t *g_ipguard;    /* per-source-IP admission control (DoS mitigation) */
+static uint64_t *g_shared_stats; /* master-visible counters: [0] responses, [1] 5xx */
 static int g_worker_id;
 static double g_now;
 static volatile sig_atomic_t g_reload_flag;
@@ -1224,8 +1225,14 @@ static void conn_next_request(conn_t *c)
     c->requests++;
     if (c->body_stream && !c->body_done)
         c->close_after_write = 1; /* the rest of the request body is still in flight */
-    if (c->resp_status >= 100 && c->resp_status < 600)
+    if (c->resp_status >= 100 && c->resp_status < 600) {
         g_stats.resp_class[c->resp_status / 100]++;
+        if (g_shared_stats && !c->srv->is_admin) {
+            __atomic_fetch_add(&g_shared_stats[0], 1, __ATOMIC_RELAXED);
+            if (c->resp_status >= 500)
+                __atomic_fetch_add(&g_shared_stats[1], 1, __ATOMIC_RELAXED);
+        }
+    }
 #ifdef LIMER_H2
     if (c->h2_parent) {
         /* a stream serves exactly one request: hand the end of the body to HTTP/2 */
@@ -5208,6 +5215,7 @@ static void timer_cb(ev_t *e, uint32_t events)
 static void on_sighup(int sig)  { (void)sig; g_reload_flag = 1; }
 static void on_sigterm(int sig) { (void)sig; g_shutdown_flag = 1; }
 
+void proxy_set_shared_stats(uint64_t *counters) { g_shared_stats = counters; }
 void proxy_request_reload(void)   { g_reload_flag = 1; }
 void proxy_request_shutdown(void) { g_shutdown_flag = 1; }
 

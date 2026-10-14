@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -85,6 +86,11 @@ static pid_t read_pidfile(const char *path)
 static volatile sig_atomic_t m_got_hup, m_got_term, m_got_chld, m_got_usr2, m_got_alarm;
 static char **g_argv;   /* this process's argv, for re-exec on a graceful upgrade */
 
+static uint64_t sh_load(uint64_t *s, int i)
+{
+    return s ? __atomic_load_n(&s[i], __ATOMIC_RELAXED) : 0;
+}
+
 static void master_sig(int sig)
 {
     switch (sig) {
@@ -153,7 +159,24 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
             old_pids[n_old++] = (pid_t)atoi(p);
     }
     unsetenv("LIMER_UPGRADE_WORKERS");
-    int upgrading = n_old > 0;
+    int upgrading = n_old > 0;   /* old workers are being retired once the new ones are up */
+    int retire_sent = 0;         /* ...and they have already been told to drain */
+
+    /* Response counters shared with the workers (inherited across fork), so the
+     * master can judge a reload by the 5xx share that follows it. */
+    uint64_t *shared = mmap(NULL, 2 * sizeof(uint64_t), PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED)
+        shared = NULL;
+    proxy_set_shared_stats(shared);
+    config_t *prev_cfg = NULL;              /* last-known-good config while a reload is on probation */
+    int probation = 0;
+    double probation_until = 0;
+    uint64_t prob_req0 = 0, prob_err0 = 0;  /* counters when the probation began */
+    uint64_t good_req0 = 0, good_err0 = 0;  /* counters when the running config was committed */
+    double baseline = 0;                    /* 5xx share of the known-good config */
+    rollback_cfg_t rb;
+    memset(&rb, 0, sizeof rb);
 
     if (!upgrading)
         write_pidfile(pidfile);  /* a fresh start owns the pidfile; an upgrade keeps the same pid, so it is still valid */
@@ -211,7 +234,27 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                         if (pids[i] > 0)
                             kill(pids[i], SIGHUP);
                     acme_manager_stop();
-                    config_unref(cfg);
+                    /* The protection in force is the known-good config's, so a new
+                     * config cannot switch off its own rollback. */
+                    config_t *good = probation ? prev_cfg : cfg;
+                    rb = good->auto_rollback.enabled ? good->auto_rollback : test->auto_rollback;
+                    if (rb.enabled && shared) {
+                        if (probation) {
+                            config_unref(cfg);   /* replace the config on probation; prev_cfg stays known-good */
+                        } else {
+                            prev_cfg = cfg;      /* hold on to the known-good config */
+                            uint64_t r = sh_load(shared, 0) - good_req0, e = sh_load(shared, 1) - good_err0;
+                            baseline = r ? (double)e / (double)r : 0;
+                        }
+                        probation = 1;
+                        probation_until = now_mono() + rb.window;
+                        prob_req0 = sh_load(shared, 0);
+                        prob_err0 = sh_load(shared, 1);
+                        alarm(1);
+                        LOGI("reload: new configuration on probation for %.0fs", rb.window);
+                    } else {
+                        config_unref(cfg);
+                    }
                     cfg = test;
                     acme_manager_start(cfg);
                 }
@@ -257,21 +300,71 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
         }
         if (m_got_alarm) {
             m_got_alarm = 0;
-            if (upgrading) {
+            int rearm = 0;
+            if (upgrading && !retire_sent) {
                 int ready = 1;
                 for (int i = 0; i < nworkers; i++)
                     if (pids[i] <= 0)
                         ready = 0;
                 if (ready) {
-                    LOGI("upgrade: new workers ready, draining %d old worker%s", n_old, n_old == 1 ? "" : "s");
+                    LOGI("master: new workers ready, draining the previous ones");
                     for (int i = 0; i < n_old; i++)
                         if (old_pids[i] > 0)
                             kill(old_pids[i], SIGTERM);
+                    retire_sent = 1;
                 } else {
-                    LOGW("upgrade: new workers not up yet, retrying");
-                    alarm(1);
+                    LOGW("master: new workers not up yet, retrying");
+                    rearm = 1;
                 }
             }
+            if (probation && !stopping) {
+                uint64_t r = sh_load(shared, 0) - prob_req0, e = sh_load(shared, 1) - prob_err0;
+                double share = r ? (double)e / (double)r : 0;
+                if (r >= (uint64_t)rb.min_requests && share >= rb.error_rate && share > baseline) {
+                    LOGW("auto-rollback: %.0f%% of %llu responses were 5xx after the reload (%.0f%% before); "
+                         "reverting to the previous configuration - fix %s and reload",
+                         share * 100, (unsigned long long)r, baseline * 100, cfg_path);
+                    config_t *bad = cfg;
+                    cfg = prev_cfg;
+                    prev_cfg = NULL;
+                    probation = 0;
+                    /* replace the workers: fresh ones from the known-good config,
+                     * the current ones drain once those are up */
+                    int alive_old = 0;
+                    for (int i = 0; i < n_old; i++)
+                        if (old_pids[i] > 0)
+                            alive_old = 1;
+                    if (!alive_old)
+                        n_old = 0;
+                    for (int i = 0; i < nworkers; i++)
+                        if (pids[i] > 0 && n_old < 256)
+                            old_pids[n_old++] = pids[i];
+                    for (int i = 0; i < nworkers; i++) {
+                        pids[i] = spawn_worker(cfg, i);
+                        spawned[i] = now_mono();
+                    }
+                    upgrading = 1;
+                    retire_sent = 0;
+                    rearm = 1;
+                    acme_manager_stop();
+                    acme_manager_start(cfg);
+                    config_unref(bad);
+                    good_req0 = sh_load(shared, 0);
+                    good_err0 = sh_load(shared, 1);
+                } else if (now_mono() >= probation_until) {
+                    LOGI("reload: new configuration committed (%.0f%% 5xx over %llu responses)",
+                         share * 100, (unsigned long long)r);
+                    config_unref(prev_cfg);
+                    prev_cfg = NULL;
+                    probation = 0;
+                    good_req0 = sh_load(shared, 0);
+                    good_err0 = sh_load(shared, 1);
+                } else {
+                    rearm = 1;
+                }
+            }
+            if (rearm)
+                alarm(1);
         }
         if (m_got_chld) {
             m_got_chld = 0;
@@ -288,7 +381,8 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                         if (old_pids[i] > 0) still = 1;
                     if (!still && upgrading) {
                         upgrading = 0;
-                        LOGI("upgrade: complete, previous workers drained");
+                        retire_sent = 0;
+                        LOGI("master: previous workers drained");
                     }
                     continue;
                 }
@@ -345,6 +439,10 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
     }
     LOGI("master: all workers stopped");
     config_unref(cfg);
+    if (prev_cfg)
+        config_unref(prev_cfg);
+    if (shared)
+        munmap(shared, 2 * sizeof(uint64_t));
     free(pids);
     free(spawned);
     if (pidfile && read_pidfile(pidfile) == getpid())

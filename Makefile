@@ -90,13 +90,16 @@ scale: $(BIN)
 drain: $(BIN)
 	python3 tests/drain_test.py
 
+rollback: $(BIN)
+	python3 tests/rollback_test.py
+
 # Needs `pebble` (PEBBLE=/path), optionally `pebble-challtestsrv` (CHALLTESTSRV=/path) for dns-01,
 # and `127.0.0.1 limer.test www.limer.test alpn.limer.test dns.limer.test` in /etc/hosts; skips otherwise.
 acme: $(BIN)
 	./tests/run_acme.sh
 
 # Everything: unit tests, parser fuzzing, integration, feature, ACME, security and DoS-guard suites.
-check: unit fuzz integration features acme security ddos scale drain
+check: unit fuzz integration features acme security ddos scale drain rollback
 
 # The same suites with sanitizers enabled (slower; rebuilds everything).
 check-asan:
@@ -111,4 +114,4 @@ install: $(BIN)
 clean:
 	rm -rf build $(BIN) tests/tmp
 
-.PHONY: all unit fuzz integration features acme security ddos scale drain check check-asan install clean
+.PHONY: all unit fuzz integration features acme security ddos scale drain rollback check check-asan install clean
