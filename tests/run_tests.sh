@@ -2,6 +2,13 @@
 # Integration tests for Limer. Requires python3 and curl.
 set -u
 cd "$(dirname "$0")/.."
+# macOS: these scripts use GNU coreutils and sed (brew install coreutils gnu-sed)
+if [ "$(uname -s)" = Darwin ]; then
+    for d in /opt/homebrew/opt/coreutils/libexec/gnubin /opt/homebrew/opt/gnu-sed/libexec/gnubin \
+             /usr/local/opt/coreutils/libexec/gnubin /usr/local/opt/gnu-sed/libexec/gnubin; do
+        [ -d "$d" ] && PATH="$d:$PATH"
+    done
+fi
 BIN=./limer
 TMP=tests/tmp
 rm -rf "$TMP"; mkdir -p "$TMP"
@@ -43,6 +50,11 @@ echo "# building"
 make -s || { echo "build failed"; exit 1; }
 
 echo "# starting backends"
+for p in 9101 9102 9103 9111 9112 9121 9131 9180; do
+    if (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null; then
+        echo "port $p is already in use by another program; free it and re-run"; exit 1
+    fi
+done
 start_backend 9101 a
 start_backend 9102 b
 start_backend 9103 c
@@ -355,7 +367,12 @@ r=$(curl -s -o /dev/null -w '%{http_code}' --http1.0 $B/ping)
 expect_eq "HTTP/1.0 request" "$r" "200"
 
 echo "# errors, timeouts, retries, health"
-expect_eq "malformed request gets 400" "$(printf 'GARBAGE\r\n\r\n' | timeout 3 nc -q1 127.0.0.1 9180 2>/dev/null | head -1 | tr -d '\r' || printf 'BLAH\r\n\r\n' | timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9180; cat >&3; head -1 <&3' | tr -d '\r')" "HTTP/1.1 400 Bad Request"
+r=$(timeout 3 python3 -c '
+import socket
+s = socket.create_connection(("127.0.0.1", 9180))
+s.sendall(b"GARBAGE\r\n\r\n")
+print(s.makefile("rb").readline().decode().strip())' 2>/dev/null)
+expect_eq "malformed request gets 400" "$r" "HTTP/1.1 400 Bad Request"
 expect_eq "no route -> 404" "$(H http://127.0.0.1:9184/other)" "404"
 expect_eq "route-only server matches" "$(curl -s http://127.0.0.1:9184/only)" "only"
 expect_eq "unreachable upstreams -> 502" "$(H $B/dead)" "502"

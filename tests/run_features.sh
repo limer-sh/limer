@@ -4,6 +4,13 @@
 # env substitution and imports, static files and compression.
 set -u
 cd "$(dirname "$0")/.."
+# macOS: these scripts use GNU coreutils and sed (brew install coreutils gnu-sed)
+if [ "$(uname -s)" = Darwin ]; then
+    for d in /opt/homebrew/opt/coreutils/libexec/gnubin /opt/homebrew/opt/gnu-sed/libexec/gnubin \
+             /usr/local/opt/coreutils/libexec/gnubin /usr/local/opt/gnu-sed/libexec/gnubin; do
+        [ -d "$d" ] && PATH="$d:$PATH"
+    done
+fi
 export no_proxy='*' NO_PROXY='*'   # never send test traffic through an outbound proxy
 unset https_proxy HTTPS_PROXY http_proxy HTTP_PROXY grpc_proxy
 BIN=./limer
@@ -25,8 +32,9 @@ python3 tests/backend.py 9701 a & PIDS+=($!)
 python3 tests/backend.py 9702 b & PIDS+=($!)
 wait_port 9701; wait_port 9702
 
-# bcrypt hash for "secret" (cost 5 to keep tests fast)
-HASH=$(perl -e 'print crypt("secret", q{$2b$05$abcdefghijklmnopqrstuu})')
+# bcrypt hash for "secret" (cost 5 to keep tests fast); a constant, because
+# perl's crypt() is the system one, which has no bcrypt on macOS
+HASH='$2b$05$abcdefghijklmnopqrstuuOQiyCxlgf/oeuTqixKmWdcYUh4Hjl0a'
 printf 'hello from index\n' > "$TMP/site/index.html"
 printf 'sub page\n' > "$TMP/site/sub/page.txt"
 head -c 20000 /dev/zero | tr '\0' 'x' > "$TMP/site/big.txt"
@@ -709,7 +717,9 @@ expect_eq "proxy healthy after early response" "$(H http://127.0.0.1:9798/get)" 
 r=$(curl -sk --http2 --data-binary @"$TMP/upload.bin" https://localhost:9801/upload)
 expect_contains "h2 upload streamed to an http/1.1 upstream" "$r" "$SUM"
 expect_contains "h2 upload keeps its Content-Length" "$r" "\"content_length\": \"20000000\""
-r=$(curl -sk --http2 -H 'Transfer-Encoding: chunked' --data-binary @"$TMP/upload.bin" https://localhost:9801/upload)
+# from stdin, so curl sends no length; forcing Transfer-Encoding over HTTP/2 makes
+# some curl builds (macOS 8.7) chunk-encode the body inside the DATA frames
+r=$(curl -sk --http2 -X POST -T - https://localhost:9801/upload < "$TMP/upload.bin")
 expect_contains "h2 upload without content-length is chunked upstream" "$r" "\"chunked\": true"
 expect_contains "h2 chunked upload intact" "$r" "$SUM"
 # many concurrent uploads
@@ -973,6 +983,12 @@ cat > "$TMP/zone.json" <<ZONE
 ZONE
 python3 tests/dns_server.py 5354 "$TMP/zone.json" & DNSP=$!; PIDS+=($DNSP)
 python3 tests/backend.py 9701 c --bind 127.0.0.2 & PIDS+=($!)
+# Linux answers on all of 127.0.0.0/8; macOS only on 127.0.0.1 unless aliased
+ALIAS2=1
+python3 -c 'import socket; socket.socket().bind(("127.0.0.2", 0))' 2>/dev/null || ALIAS2=0
+on_alias2() { # name, then the check to run when 127.0.0.2 is usable
+    if [ $ALIAS2 = 1 ]; then "${@:2}"; else echo "  skip - $1 (needs 127.0.0.2: sudo ifconfig lo0 alias 127.0.0.2 up)"; fi
+}
 sleep 0.3
 cat > "$TMP/dyn.conf" <<CFG
 {
@@ -1011,7 +1027,7 @@ ups() { curl -s http://127.0.0.1:9791/upstreams | python3 "$TMP/ups.py" "$1"; }
 expect_eq "dynamic a resolves to both addresses" "$(ups 0)" "127.0.0.1:9701/1 127.0.0.2:9701/1"
 r=$(for i in 1 2 3 4; do curl -s http://127.0.0.1:9802/; done)
 expect_contains "requests reach the first address" "$r" "hello from a"
-expect_contains "requests reach the second address" "$r" "hello from c"
+on_alias2 "requests reach the second address" expect_contains "requests reach the second address" "$r" "hello from c"
 expect_eq "dynamic srv gives targets, ports and weights" "$(ups 1)" "127.0.0.1:9701/1 127.0.0.1:9702/3"
 r=$(for i in $(seq 1 8); do curl -s http://127.0.0.1:9803/; echo; done | sort | uniq -c | tr -s ' ' | tr '\n' ';')
 expect_contains "srv weights steer traffic 1:3" "$r" "2 hello from a;"
@@ -1028,7 +1044,7 @@ ZONE
 sleep 2.5
 expect_eq "address change applied on refresh" "$(ups 0)" "127.0.0.1:9701/1 127.0.0.3:9701/1"
 expect_eq "srv member removed and weight updated" "$(ups 1)" "127.0.0.1:9702/5"
-expect_eq "static name follows its new address" "$(curl -s http://127.0.0.1:9804/)" "hello from c"
+on_alias2 "static name follows its new address" expect_eq "static name follows its new address" "$(curl -s http://127.0.0.1:9804/)" "hello from c"
 r=$(for i in 1 2 3; do curl -s http://127.0.0.1:9803/; echo; done | sort -u)
 expect_eq "removed srv member gets no traffic" "$r" "hello from b"
 # runtime overrides apply to dynamic members too, and survive the next refresh
@@ -1038,7 +1054,8 @@ expect_eq "weight override sticks across refreshes" "$(ups 1)" "127.0.0.1:9702/9
 curl -s -X DELETE http://127.0.0.1:9791/overrides >/dev/null
 # a failing lookup keeps the last known set
 kill $DNSP; wait $DNSP 2>/dev/null
-sleep 2.5
+# glibc fails a query to a closed port at once; macOS's resolver takes ~13 s to give up
+for _ in $(seq 1 100); do grep -q "keeping 2 upstreams" $TMP/dyn.log && break; sleep 0.25; done
 expect_eq "lookup failure keeps the pool" "$(ups 0)" "127.0.0.1:9701/1 127.0.0.3:9701/1"
 expect_contains "lookup failure is logged" "$(cat $TMP/dyn.log)" "keeping 2 upstreams"
 python3 tests/dns_server.py 5354 "$TMP/zone.json" & DNSP=$!; PIDS+=($DNSP)
@@ -1046,7 +1063,7 @@ sleep 1
 # reload keeps the resolved members (no gap) and the schedule
 kill -HUP $DYP; sleep 0.5
 expect_eq "reload keeps dynamic members" "$(ups 0)" "127.0.0.1:9701/1 127.0.0.3:9701/1"
-expect_eq "reload keeps the re-resolved static address" "$(curl -s http://127.0.0.1:9804/)" "hello from c"
+on_alias2 "reload keeps the re-resolved static address" expect_eq "reload keeps the re-resolved static address" "$(curl -s http://127.0.0.1:9804/)" "hello from c"
 expect_eq "no errors logged" "$(grep -c " error " $TMP/dyn.log)" "0"
 kill -TERM $DYP; wait $DYP 2>/dev/null
 

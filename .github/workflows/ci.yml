@@ -52,3 +52,25 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
+  macos:
+    name: macOS (kqueue) build and suites
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install pkgconf openssl@3 nghttp2 zstd brotli libxcrypt coreutils gnu-sed
+      - name: Loopback aliases for the per-caller tests
+        run: for i in 2 3 5; do sudo ifconfig lo0 alias 127.0.0.$i up; done
+      - name: Build
+        run: make && ./limer version
+      - name: Unit tests
+        run: make unit
+      - name: Parser fuzzing
+        run: make fuzz FUZZ_ITERS=200000
+      - name: Integration tests
+        run: make integration
+      - name: Feature tests
+        run: make features
+      - name: Security, DoS guard, rollback and admin tests
+        run: make security ddos scale drain rollback binrollback status admin

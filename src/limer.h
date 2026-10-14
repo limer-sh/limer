@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <regex.h>
+#include "compat.h"
 
 #ifdef LIMER_TLS
 #include <openssl/ssl.h>
@@ -577,6 +578,7 @@ typedef struct config {
 
 config_t *config_load(const char *path, char *err, size_t errlen);
 extern int config_lenient_resolve;   /* reloads: an unresolvable named upstream keeps its old address */
+extern int config_no_dns;            /* tests: never look names up; a named upstream stays unresolved */
 /* runtime overrides (<storage>/overrides.conf): "hostport drained=<0|1> weight=<n>" per line */
 int  overrides_apply(config_t *cfg);
 int  overrides_apply_upstream(const config_t *cfg, upstream_t *u);

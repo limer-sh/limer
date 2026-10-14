@@ -125,7 +125,7 @@ HTTPS with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
   final answer into a redirect when no upstream had it.
 - Dependencies: libc; OpenSSL for TLS/ACME, nghttp2 for HTTP/2, ngtcp2 +
   nghttp3 + GnuTLS for HTTP/3, zlib/zstd/brotli for compression, all
-  optional and auto-detected. Linux (epoll).
+  optional and auto-detected. Linux (epoll) and macOS (kqueue).
 
 ## Building
 
@@ -147,6 +147,32 @@ and GnuTLS 3.7 or later; where the distribution's packages are too old,
 build ngtcp2 and nghttp3 from source with `./configure --with-gnutls` and
 make sure `pkg-config` finds them. `limer version` lists `http/3` when it is
 compiled in.
+
+### macOS
+
+limer.sh builds and runs on macOS (Apple silicon and Intel), so you can run
+the same Limerfile on a MacBook that you deploy to a Linux server. The event
+loop uses kqueue there instead of epoll.
+
+```
+brew install pkgconf openssl@3 nghttp2 zstd brotli libxcrypt
+make
+./limer run -c Limerfile
+```
+
+- The Makefile finds Homebrew's keg-only OpenSSL and libxcrypt by itself.
+  libxcrypt is required: it provides bcrypt for `basic_auth`, which the
+  system `crypt()` lacks.
+- HTTP/3: Homebrew's ngtcp2 is built for OpenSSL, not GnuTLS, so the build
+  leaves HTTP/3 out unless you build ngtcp2 `--with-gnutls` from source (as
+  on Linux, plus `brew install gnutls libnghttp3`).
+- Use `workers 1` (the default). macOS hands every connection on a port to a
+  single process — its `SO_REUSEPORT` does not balance — so more workers
+  add no throughput; limer.sh logs a warning if you ask for them. Zero-downtime
+  `limer upgrade`, reloads, canaries and rollback all work.
+- The descriptor limit is `kern.maxfilesperproc` (61,440 by default), so the
+  default `max_connections` is about 30,000.
+- Production numbers in this guide are from Linux; a Mac is for development.
 
 ## Running
 
@@ -898,6 +924,11 @@ Some things to keep in mind:
 
 ## Testing
 
+On macOS the shell suites need GNU coreutils and sed (`brew install
+coreutils gnu-sed`; the scripts find them), and the checks that need more
+loopback addresses than `127.0.0.1` are skipped with a note unless you add
+them (`sudo ifconfig lo0 alias 127.0.0.2 up`, likewise `.3` and `.5`).
+
 `make check` runs fourteen suites; `make check-asan` runs them on a build
 instrumented with AddressSanitizer and UndefinedBehaviorSanitizer. The
 GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
@@ -1101,7 +1132,9 @@ plugin ecosystem.
 src/limer.h    shared types
 src/main.c     CLI, master/worker supervision
 src/config.c   Limerfile tokenizer, imports/snippets, block parser, validation
-src/proxy.c    epoll loop, client/upstream state machines, files, health checks, admin API, reload
+src/proxy.c    event loop, client/upstream state machines, files, health checks, admin API, reload
+src/epoll_kqueue.h  the epoll calls the event loop uses, on kqueue (macOS)
+src/compat.h   socket flags, accept4, memrchr on macOS
 src/h2.inc     HTTP/2 sessions and streams (nghttp2), included by proxy.c
 src/h3.inc     HTTP/3 over QUIC (ngtcp2, nghttp3, GnuTLS), included by proxy.c
 src/acme.c     ACME client and certificate manager

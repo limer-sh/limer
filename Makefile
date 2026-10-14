@@ -4,43 +4,61 @@ CFLAGS  ?= -O2 -g
 override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -pthread
 LDFLAGS ?=
 override LDFLAGS += -pthread
-LDLIBS  += -lm -lcrypt -lresolv
+LDLIBS  += -lm -lresolv
+
+UNAME_S := $(shell uname -s)
+PKG_CONFIG ?= pkg-config
+ifeq ($(UNAME_S),Darwin)
+# macOS: Homebrew keeps OpenSSL and libxcrypt off the default search path
+# ("keg-only"), so point pkg-config at them. bcrypt for basic_auth comes from
+# libxcrypt (`brew install libxcrypt`); the system crypt() has no bcrypt.
+BREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo /opt/homebrew)
+PKG_CONFIG := PKG_CONFIG_PATH="$(PKG_CONFIG_PATH):$(BREW_PREFIX)/opt/openssl@3/lib/pkgconfig:$(BREW_PREFIX)/opt/libxcrypt/lib/pkgconfig:$(BREW_PREFIX)/lib/pkgconfig" pkg-config
+override CFLAGS += -D__APPLE_USE_RFC_3542 $(shell $(PKG_CONFIG) --cflags libxcrypt 2>/dev/null)
+ifeq ($(shell $(PKG_CONFIG) --exists libxcrypt 2>/dev/null && echo 1),1)
+LDLIBS += $(shell $(PKG_CONFIG) --libs libxcrypt)
+else
+$(error libxcrypt is needed for bcrypt on macOS: brew install libxcrypt)
+endif
+else
+LDLIBS += -lcrypt
+endif
 
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
 
 # TLS support is enabled automatically when OpenSSL is available.
 # Force it with `make TLS=1` or disable it with `make TLS=0`.
-TLS ?= $(shell pkg-config --exists openssl 2>/dev/null && echo 1 || echo 0)
+TLS ?= $(shell $(PKG_CONFIG) --exists openssl 2>/dev/null && echo 1 || echo 0)
 ifeq ($(TLS),1)
-override CFLAGS += -DLIMER_TLS $(shell pkg-config --cflags openssl 2>/dev/null)
-LDLIBS += $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
+override CFLAGS += -DLIMER_TLS $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
+LDLIBS += $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null || echo -lssl -lcrypto)
 endif
 
 # Response compression needs zlib, libzstd and libbrotli (auto-detected).
-ENCODE ?= $(shell pkg-config --exists zlib libzstd libbrotlienc 2>/dev/null && echo 1 || echo 0)
+ENCODE ?= $(shell $(PKG_CONFIG) --exists zlib libzstd libbrotlienc 2>/dev/null && echo 1 || echo 0)
 ifeq ($(ENCODE),1)
-override CFLAGS += -DLIMER_ENCODE $(shell pkg-config --cflags zlib libzstd libbrotlienc 2>/dev/null)
-LDLIBS += $(shell pkg-config --libs zlib libzstd libbrotlienc 2>/dev/null)
+override CFLAGS += -DLIMER_ENCODE $(shell $(PKG_CONFIG) --cflags zlib libzstd libbrotlienc 2>/dev/null)
+LDLIBS += $(shell $(PKG_CONFIG) --libs zlib libzstd libbrotlienc 2>/dev/null)
 endif
 
 # HTTP/2 needs libnghttp2 (auto-detected; requires TLS for ALPN).
-H2 ?= $(shell pkg-config --exists libnghttp2 2>/dev/null && echo 1 || echo 0)
+H2 ?= $(shell $(PKG_CONFIG) --exists libnghttp2 2>/dev/null && echo 1 || echo 0)
 ifeq ($(H2),1)
 ifeq ($(TLS),1)
-override CFLAGS += -DLIMER_H2 $(shell pkg-config --cflags libnghttp2 2>/dev/null)
-LDLIBS += $(shell pkg-config --libs libnghttp2 2>/dev/null)
+override CFLAGS += -DLIMER_H2 $(shell $(PKG_CONFIG) --cflags libnghttp2 2>/dev/null)
+LDLIBS += $(shell $(PKG_CONFIG) --libs libnghttp2 2>/dev/null)
 endif
 endif
 
 # HTTP/3 needs ngtcp2 and nghttp3 with the GnuTLS crypto backend (auto-detected;
 # requires TLS). Disable with `make H3=0`.
 H3_PKGS := libngtcp2 libngtcp2_crypto_gnutls libnghttp3 gnutls
-H3 ?= $(shell pkg-config --exists $(H3_PKGS) 2>/dev/null && echo 1 || echo 0)
+H3 ?= $(shell $(PKG_CONFIG) --exists $(H3_PKGS) 2>/dev/null && echo 1 || echo 0)
 ifeq ($(H3),1)
 ifeq ($(TLS),1)
-override CFLAGS += -DLIMER_H3 $(shell pkg-config --cflags $(H3_PKGS) 2>/dev/null)
-LDLIBS += $(shell pkg-config --libs $(H3_PKGS) 2>/dev/null)
+override CFLAGS += -DLIMER_H3 $(shell $(PKG_CONFIG) --cflags $(H3_PKGS) 2>/dev/null)
+LDLIBS += $(shell $(PKG_CONFIG) --libs $(H3_PKGS) 2>/dev/null)
 endif
 endif
 

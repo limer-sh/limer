@@ -140,16 +140,39 @@ static int replace_file(const char *dst, const char *src_path, const char *data,
     return rc;
 }
 
-/* Copy the running executable to <dir>/limer.previous so an upgrade can be
- * undone. /proc/self/exe still reads the running image even after the file on
- * disk has been replaced by the new version. */
+/* Where the running image can be read from. On Linux /proc/self/exe still
+ * reads it even after the file on disk has been replaced by a new version;
+ * macOS has no such file, so the master copies its executable at startup
+ * (snapshot_running_binary) while the file on disk is still the running one. */
+#ifdef __linux__
+static const char *g_self_image = "/proc/self/exe";
+#else
+static const char *g_self_image;
+static char g_self_copy[1100];
+
+static void snapshot_running_binary(const char *dir)
+{
+    char exe[1024];
+    if (!dir || limer_exe_path(exe, sizeof exe) < 0)
+        return;
+    mkdir_p(dir);
+    snprintf(g_self_copy, sizeof g_self_copy, "%s/limer.running", dir);
+    if (replace_file(g_self_copy, exe, NULL, 0, 0755, NULL) == 0)
+        g_self_image = g_self_copy;
+    else
+        LOGW("cannot copy the running binary to %s: %s; an upgrade will not be rolled back automatically",
+             g_self_copy, strerror(errno));
+}
+#endif
+
+/* Copy the running executable to <dir>/limer.previous so an upgrade can be undone. */
 static int save_running_binary(const char *dir, char *out, size_t outlen)
 {
-    if (!dir)
+    if (!dir || !g_self_image)
         return -1;
     mkdir_p(dir);
     snprintf(out, outlen, "%s/limer.previous", dir);
-    return replace_file(out, "/proc/self/exe", NULL, 0, 0755, NULL);
+    return replace_file(out, g_self_image, NULL, 0, 0755, NULL);
 }
 
 /* Keep a rejected file for inspection as <path>.rejected-<timestamp> and put
@@ -204,9 +227,7 @@ static void bin_rollback(const char *why, const char *prev_bin, const pid_t *pid
      * new one as .rejected-<time>), so a restart does not run it again. */
     const char *target = prev_bin;
     char self[1024];
-    ssize_t sn = readlink("/proc/self/exe", self, sizeof self - 1);
-    if (sn > 0) {
-        self[sn] = 0;
+    if (limer_exe_path(self, sizeof self) == 0) {
         if (!strstr(self, " (deleted)") && strcmp(self, prev_bin) != 0 &&
             quarantine(self, prev_bin, NULL, "upgrade rollback") == 0)
             target = self;
@@ -289,6 +310,15 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
             old_pids[n_old++] = (pid_t)atoi(p);
     }
     unsetenv("LIMER_UPGRADE_WORKERS");
+#ifndef __linux__
+    if (cfg->auto_rollback.enabled)
+        snapshot_running_binary(cfg->storage);
+#endif
+#ifdef __APPLE__
+    if (nworkers > 1 && !n_old)
+        LOGW("macOS hands every connection on a port to one process (its SO_REUSEPORT does not balance), "
+             "so workers %d serves no more than workers 1", nworkers);
+#endif
     int upgrading = n_old > 0;   /* old workers are being retired once the new ones are up */
     int retire_sent = 0;         /* ...and they have already been told to drain */
 

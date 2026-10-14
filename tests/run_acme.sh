@@ -5,6 +5,13 @@
 # in /etc/hosts).
 set -u
 cd "$(dirname "$0")/.."
+# macOS: these scripts use GNU coreutils and sed (brew install coreutils gnu-sed)
+if [ "$(uname -s)" = Darwin ]; then
+    for d in /opt/homebrew/opt/coreutils/libexec/gnubin /opt/homebrew/opt/gnu-sed/libexec/gnubin \
+             /usr/local/opt/coreutils/libexec/gnubin /usr/local/opt/gnu-sed/libexec/gnubin; do
+        [ -d "$d" ] && PATH="$d:$PATH"
+    done
+fi
 export no_proxy='*' NO_PROXY='*'
 PEBBLE=${PEBBLE:-$(command -v pebble || true)}
 CHALLTESTSRV=${CHALLTESTSRV:-$(command -v pebble-challtestsrv || true)}

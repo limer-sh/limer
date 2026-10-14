@@ -64,7 +64,7 @@ redirects plain HTTP to HTTPS.
 
 ```sh
 git clone https://github.com/limer-sh/limer
-cd limer && make            # optional libs (OpenSSL, nghttp2, zstd, brotli) auto-detected
+cd limer && make            # Linux or macOS; optional libs (OpenSSL, nghttp2, zstd, brotli) auto-detected
 sudo make install           # installs to /usr/local/bin
 
 limer run -c Limerfile      # run in the foreground
@@ -72,6 +72,10 @@ limer validate -c Limerfile # parse, resolve upstreams, load certificates
 limer reload                # zero-downtime reload
 limer upgrade               # swap in a newly installed binary, no downtime
 ```
+
+On a Mac, install the libraries first with
+`brew install pkgconf openssl@3 nghttp2 zstd brotli libxcrypt` (see
+[macOS](USERGUIDE.md#macos) for the differences).
 
 Try payload routing locally with the bundled test backend:
 

@@ -80,6 +80,17 @@ def call(method, path, src="127.0.0.1", secret=None, port=ADMIN):
     return r.status, {k.lower(): v for k, v in r.getheaders()}, body
 
 
+def can_bind(ip):
+    """Linux answers on all of 127.0.0.0/8; macOS only on 127.0.0.1 unless aliases are added."""
+    try:
+        s = socket.socket()
+        s.bind((ip, 0))
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
 def hook_lines(want, timeout=5):
     end = time.time() + timeout
     while time.time() < end:
@@ -118,6 +129,30 @@ def config_tests():
           out.strip()[-160:])
     rc, out = validate("{\n    admin 127.0.0.1:9959\n}\n:9958 {\n    respond ok\n}\n")
     check(rc == 0 and "has no secret" not in out, "a loopback admin API without a secret is not warned about")
+
+
+def caller_tests():
+    """Bans and their expiry, with callers told apart by source address."""
+    print("bans for wrong secrets")
+    for i in range(3):
+        s, _, _ = call("GET", "/upstreams", src="127.0.0.2", secret=f"guess-{i}-0123456789abcdef")
+    check(s == 401, "three wrong guesses are each refused", f"{s}")
+    s, h, b = call("GET", "/upstreams", src="127.0.0.2", secret=SECRET)
+    check(s == 403 and int(h.get("retry-after", "0")) >= 1, "then the guesser is banned, even with the right secret",
+          f"{s} {h.get('retry-after')} {b}")
+    s, _, _ = call("GET", "/upstreams", secret=SECRET)
+    check(s == 200, "other callers are unaffected", f"{s}")
+
+    print("bans for floods")
+    codes = [call("POST", "/drain", src="127.0.0.3", secret=SECRET)[0] for _ in range(6)]
+    check(codes[0] != 429 and codes[1] != 429, "calls within the burst go through", f"{codes}")
+    check(codes[2:5] == [429, 429, 429], "calls beyond the rate get 429", f"{codes}")
+    check(codes[5] == 403, "repeated floods earn a ban", f"{codes}")
+
+    print("ban expiry")
+    time.sleep(3.3)
+    s, _, _ = call("GET", "/upstreams", src="127.0.0.2", secret=SECRET)
+    check(s == 200, "the ban lifts after its duration", f"{s}")
 
 
 def shared_cooldown_test():
@@ -227,29 +262,15 @@ def main():
               "a second call inside the cooldown is refused with Retry-After", f"{s} {h.get('retry-after')} {b}")
         time.sleep(0.5)
         check(len(hook_lines(2, timeout=0.5)) == 1, "...and the hook did not run again")
-        s, _, _ = call("GET", "/scale_up", src="127.0.0.5", secret=SECRET)
-        check(s == 405, "GET /scale_up: 405", f"{s}")
-
-        print("bans for wrong secrets")
-        for i in range(3):
-            s, _, _ = call("GET", "/upstreams", src="127.0.0.2", secret=f"guess-{i}-0123456789abcdef")
-        check(s == 401, "three wrong guesses are each refused", f"{s}")
-        s, h, b = call("GET", "/upstreams", src="127.0.0.2", secret=SECRET)
-        check(s == 403 and int(h.get("retry-after", "0")) >= 1, "then the guesser is banned, even with the right secret",
-              f"{s} {h.get('retry-after')} {b}")
-        s, _, _ = call("GET", "/upstreams", secret=SECRET)
-        check(s == 200, "other callers are unaffected", f"{s}")
-
-        print("bans for floods")
-        codes = [call("POST", "/drain", src="127.0.0.3", secret=SECRET)[0] for _ in range(6)]
-        check(codes[0] != 429 and codes[1] != 429, "calls within the burst go through", f"{codes}")
-        check(codes[2:5] == [429, 429, 429], "calls beyond the rate get 429", f"{codes}")
-        check(codes[5] == 403, "repeated floods earn a ban", f"{codes}")
-
-        print("ban expiry")
-        time.sleep(3.3)
-        s, _, _ = call("GET", "/upstreams", src="127.0.0.2", secret=SECRET)
-        check(s == 200, "the ban lifts after its duration", f"{s}")
+        aliases = all(can_bind(f"127.0.0.{i}") for i in (2, 3, 5))
+        if not aliases:
+            print("  skip - the per-caller checks need 127.0.0.2, .3 and .5 on the loopback")
+            print("         (macOS: sudo ifconfig lo0 alias 127.0.0.2 up; likewise .3 and .5)")
+            time.sleep(3.5)   # what caller_tests() would take: refills this caller's webhook bucket
+        else:
+            s, _, _ = call("GET", "/scale_up", src="127.0.0.5", secret=SECRET)
+            check(s == 405, "GET /scale_up: 405", f"{s}")
+            caller_tests()
 
         print("self-drain with the secret")
         s, _, b = call("POST", "/drain", secret=SECRET)
@@ -259,7 +280,8 @@ def main():
         check(s == 200 and isinstance(b, dict) and b.get("drained") is False, "POST /undrain restores it", f"{s} {b}")
 
         text = open(os.path.join(TMP, "limer.log")).read()
-        check("banned 127.0.0.2" in text and "banned 127.0.0.3" in text, "bans are logged")
+        if aliases:
+            check("banned 127.0.0.2" in text and "banned 127.0.0.3" in text, "bans are logged")
         check("AddressSanitizer" not in text and "runtime error" not in text, "no sanitizer reports")
     finally:
         p.terminate()

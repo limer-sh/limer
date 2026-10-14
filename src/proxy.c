@@ -17,12 +17,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#ifdef __linux__
 #include <sys/epoll.h>
+#include <sys/timerfd.h>
+#else
+#include "epoll_kqueue.h"   /* the same calls on kqueue */
+#endif
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
-#include <sys/timerfd.h>
 #include <sys/un.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <ctype.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -5573,8 +5580,12 @@ static void tick(void)
 
 static void timer_cb(ev_t *e, uint32_t events)
 {
+#ifdef __linux__
     uint64_t exp;
     (void)!read(e->fd, &exp, sizeof exp);
+#else
+    timerfd_drain(e->fd);
+#endif
     tick();
 }
 
@@ -5605,7 +5616,17 @@ int proxy_run(config_t *cfg, int worker_id)
      * needs two descriptors, so derive a default connection cap from it. */
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+#ifdef __APPLE__
+        /* macOS reports no hard limit, but a process gets at most kern.maxfilesperproc */
+        int perproc = 0;
+        size_t sz = sizeof perproc;
+        if (sysctlbyname("kern.maxfilesperproc", &perproc, &sz, NULL, 0) == 0 && perproc > 0 &&
+            (rl.rlim_max == RLIM_INFINITY || rl.rlim_max > (rlim_t)perproc))
+            rl.rlim_max = (rlim_t)perproc;
+        if (rl.rlim_cur != rl.rlim_max) {
+#else
         if (rl.rlim_cur < rl.rlim_max) {
+#endif
             rl.rlim_cur = rl.rlim_max;
             if (setrlimit(RLIMIT_NOFILE, &rl) < 0)
                 getrlimit(RLIMIT_NOFILE, &rl);

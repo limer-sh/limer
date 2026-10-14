@@ -749,6 +749,7 @@ void config_unref(config_t *c)
 
 static const config_t *g_loading_cfg; /* set while config_parse_in runs */
 int config_lenient_resolve;
+int config_no_dns;
 
 static int resolve_failed(upstream_t *u, int line, const char *detail, char *err, size_t errlen)
 {
@@ -776,6 +777,11 @@ void resolve_job_init(resolve_job_t *job, const config_t *cfg, int kind, const c
 
 static int resolve_upstream(upstream_t *u, int line, char *err, size_t errlen)
 {
+    if (config_no_dns && !is_ip_literal(u->host)) {
+        u->resolved = 0;
+        u->addrlen = 0;
+        return 0;
+    }
     if (g_loading_cfg && g_loading_cfg->nresolvers && !is_ip_literal(u->host)) {
         /* named upstreams go through the configured resolvers */
         resolve_job_t *job = xcalloc(1, sizeof *job);

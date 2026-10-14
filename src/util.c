@@ -14,6 +14,32 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <limits.h>
+#endif
+
+int limer_exe_path(char *buf, size_t len)
+{
+#ifdef __APPLE__
+    char raw[PATH_MAX];
+    uint32_t n = sizeof raw;
+    if (_NSGetExecutablePath(raw, &n) != 0)
+        return -1;
+    char real[PATH_MAX];
+    if (!realpath(raw, real) || strlen(real) >= len)
+        return -1;
+    memcpy(buf, real, strlen(real) + 1);
+    return 0;
+#else
+    ssize_t n = readlink("/proc/self/exe", buf, len - 1);
+    if (n <= 0)
+        return -1;
+    buf[n] = 0;
+    return 0;
+#endif
+}
+
 double now_mono(void)
 {
     struct timespec ts;

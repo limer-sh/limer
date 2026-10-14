@@ -291,9 +291,13 @@ static h3sock_t *h3_sock_open(const char *addr, char *err, size_t errlen)
              * at once, and each dropped datagram costs a QUIC loss-recovery
              * timeout. The FORCE variants pass net.core.[rw]mem_max as root. */
             int buf = H3_SOCKBUF;
+#ifdef SO_RCVBUFFORCE
             if (setsockopt(s, SOL_SOCKET, SO_RCVBUFFORCE, &buf, sizeof buf) < 0)
+#endif
                 setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buf, sizeof buf);
+#ifdef SO_SNDBUFFORCE
             if (setsockopt(s, SOL_SOCKET, SO_SNDBUFFORCE, &buf, sizeof buf) < 0)
+#endif
                 setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
             if (bind(s, ai->ai_addr, ai->ai_addrlen) < 0) {
                 last_errno = errno;

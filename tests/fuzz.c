@@ -261,6 +261,7 @@ int main(int argc, char **argv)
     if (!rng_state)
         rng_state = 1;
     uint64_t seed = rng_state;
+    config_no_dns = 1;   /* mutated host names must not wait on DNS (seconds each on macOS) */
     log_level = LOG_ERROR;
     static char buf[1 << 16];
     for (long i = 0; i < iters; i++) {
