@@ -412,7 +412,7 @@ typedef struct rollback_cfg {
     double error_rate;    /* 5xx share during probation that triggers a revert (0..1); default 0.5 */
     double window;        /* probation after a reload (s); default 15 */
     int    min_requests;  /* responses needed before judging; default 20 */
-    int    canary;        /* % of new connections that use the new config during probation; default 10, 100 = all */
+    int    canary;        /* % of new connections that use the new config during probation; default 5, 100 = all */
 } rollback_cfg_t;
 
 /* scale-up hook: run a command when load spikes, e.g. to add backends */

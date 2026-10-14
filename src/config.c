@@ -2730,7 +2730,7 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
             rb->error_rate = 0.5;
             rb->window = 15.0;
             rb->min_requests = 20;
-            rb->canary = 10;
+            rb->canary = 5;
             for (int j = 0; j < c->nkids; j++) {
                 node_t *o = c->kids[j];
                 const char *n = o->args[0];
