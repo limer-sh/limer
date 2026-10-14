@@ -96,7 +96,12 @@ static void master_sig(int sig)
     }
 }
 
-static pid_t spawn_worker(const char *cfg_path, int id)
+/* Spawn a worker from the master's in-memory (last-known-good) config, inherited
+ * across fork. A respawn after a crash therefore never re-reads a config file
+ * that may have been edited to something broken in the meantime; the worker
+ * still reloads from disk on its own SIGHUP (via cfg->path) when the master,
+ * having validated the new config, tells it to. */
+static pid_t spawn_worker(config_t *cfg, int id)
 {
     pid_t pid = fork();
     if (pid < 0) {
@@ -104,21 +109,17 @@ static pid_t spawn_worker(const char *cfg_path, int id)
         return -1;
     }
     if (pid == 0) {
-        /* worker: reset master signal handlers, load config, run */
+        /* worker: reset master signal handlers, run the inherited config */
         signal(SIGHUP, SIG_DFL);
         signal(SIGTERM, SIG_DFL);
         signal(SIGINT, SIG_DFL);
         signal(SIGCHLD, SIG_DFL);
+        signal(SIGUSR2, SIG_DFL);
+        signal(SIGALRM, SIG_DFL);
         sigset_t none;
         sigemptyset(&none);
         sigprocmask(SIG_SETMASK, &none, NULL);
-        char err[512];
-        config_t *cfg = config_load(cfg_path, err, sizeof err);
-        if (!cfg) {
-            LOGE("worker %d: %s", id, err);
-            _exit(2);
-        }
-        int rc = proxy_run(cfg, id);
+        int rc = proxy_run(cfg, id);  /* takes ownership of this process's copy */
         _exit(rc);
     }
     return pid;
@@ -160,7 +161,7 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
     LOGI("limer.sh %s master starting %d worker%s%s", LIMER_VERSION, nworkers,
          nworkers == 1 ? "" : "s", upgrading ? " (upgrade)" : "");
     for (int i = 0; i < nworkers; i++) {
-        pids[i] = spawn_worker(cfg_path, i);
+        pids[i] = spawn_worker(cfg, i);
         spawned[i] = now_mono();
     }
     acme_manager_start(cfg);
@@ -325,7 +326,7 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                     } else {
                         crashes = 0;
                     }
-                    pids[i] = spawn_worker(cfg_path, i);
+                    pids[i] = spawn_worker(cfg, i);
                     spawned[i] = now_mono();
                 }
             }
