@@ -3,6 +3,10 @@
     storage /var/lib/limer
     pidfile /run/limer.pid
     log_level info
+    auto_rollback {
+        canary 5%
+        window 30s
+    }
 }
 
 limer.sh {

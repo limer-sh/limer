@@ -45,6 +45,14 @@ with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
   (wildcards included); `tls internal` for local dev.
 - **HTTP/2 and gRPC** both sides, trailers intact, including bidirectional
   streaming.
+- **Safe deploys** — `limer upgrade` swaps the binary with no downtime and the
+  same pid; with `auto_rollback`, new configs and binaries run as a 5% canary
+  and are reverted automatically if they cause 5xx, and the bad file is moved
+  aside so a restart can't bring it back. Crashed workers restart from the
+  last-known-good config.
+- **DoS mitigation and autoscaling hooks** — per-IP connection caps and
+  auto-bans, a `scale_up` command on load spikes, and `POST /drain` for
+  backends shutting down.
 - **About 3–5× Caddy** on the HTTP/1.1 reverse-proxy path (see
   [benchmarks](USERGUIDE.md#performance)).
 
@@ -58,6 +66,7 @@ sudo make install           # installs to /usr/local/bin
 limer run -c Limerfile      # run in the foreground
 limer validate -c Limerfile # parse, resolve upstreams, load certificates
 limer reload                # zero-downtime reload
+limer upgrade               # swap in a newly installed binary, no downtime
 ```
 
 Try payload routing locally with the bundled test backend:

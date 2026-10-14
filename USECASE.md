@@ -11,6 +11,8 @@ runnable `Limerfile`. See [USERGUIDE.md](USERGUIDE.md) for every directive.
 - [Canary releases and traffic mirroring](#canary-and-mirroring)
 - [Drop-in nginx / Caddy replacement](#drop-in-edge)
 - [Multi-tenant fan-out with failover](#multi-tenant-failover)
+- [Safe rollouts — canary configs and binaries](#safe-rollouts)
+- [Elastic backends — scale up on spikes, drain on shutdown](#elastic-backends)
 
 ---
 
@@ -215,3 +217,85 @@ eu.example.com {
 `first` always prefers the earliest healthy upstream, so the standby takes over
 on failure and hands back when the primary recovers. Pools can also be built
 from DNS with `dynamic a` / `dynamic srv` and re-resolved on an interval.
+
+---
+
+## Safe rollouts
+
+**Problem.** A config change or a new build can take a site down: a typo in an
+upstream address, a backend you forgot to start, a regression in the binary.
+You want changes to meet real traffic gradually and undo themselves if they
+break, without anyone watching dashboards — and without a reboot later
+resurrecting the broken version.
+
+**limer.sh.** `auto_rollback` makes every reload and every `limer upgrade` a
+canary.
+
+```
+{
+    pidfile /run/limer.pid
+    auto_rollback {
+        canary 5%          # new config gets 5% of new connections while on probation
+        window 30s
+        error_rate 20%
+    }
+}
+
+app.example.com {
+    reverse_proxy app-1:8080 app-2:8080
+}
+```
+
+```sh
+# config change
+vi /etc/limer/Limerfile && limer reload
+
+# new build
+make && sudo make install && limer upgrade
+```
+
+If the new config's 5xx share passes 20% (and is worse than the previous
+config's over the same window), limer reverts to the previous config, keeps
+the bad file as `Limerfile.rejected-<time>` and writes the good one back. A
+bad binary is reverted the same way, under the same pid, and kept as
+`limer.rejected-<time>`. Nothing is dropped in either direction.
+
+---
+
+## Elastic backends
+
+**Problem.** Traffic spikes faster than your autoscaler notices, and when it
+scales back in, instances get killed mid-request.
+
+**limer.sh.** `scale_up` calls out the moment a spike is sustained, and
+`POST /drain` lets an instance leave the pool cleanly.
+
+```
+{
+    admin 10.0.0.1:2019            # reachable from the backends
+    scale_up {
+        requests 2000r/s
+        sustain 15s
+        cooldown 120s
+        exec "aws autoscaling set-desired-capacity --auto-scaling-group-name app --desired-capacity 6"
+    }
+}
+
+app.example.com {
+    reverse_proxy {
+        dynamic a app.internal 8080   # new instances join through DNS
+        refresh 10s
+    }
+}
+```
+
+And in the app's shutdown handler:
+
+```sh
+curl -fsS -X POST http://10.0.0.1:2019/drain   # stop getting new requests
+# ...finish in-flight work, then exit
+```
+
+`/drain` matches the caller's own address, so an instance can only take itself
+out of rotation. New instances appear through the `dynamic a` lookup on the
+next refresh.

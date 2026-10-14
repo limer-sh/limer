@@ -106,6 +106,15 @@ HTTPS with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
   `workers` with `SO_REUSEPORT`, pidfile, access logs, admin API with JSON
   upstream status, Prometheus metrics (upstreams, rate-limit zones, cache),
   and runtime drain / weight overrides that survive reloads.
+- **Safe deploys**: a master process supervises the workers and restarts a
+  crashed one from the last-known-good config; `limer upgrade` swaps the
+  binary with no downtime and the same pid; with `auto_rollback`, new
+  configs and binaries run as a canary and are reverted automatically if
+  they cause 5xx — and the rejected file is moved aside so a restart cannot
+  bring it back.
+- **Autoscaling hooks**: `scale_up` runs a command when the request rate or
+  connection count spikes; a backend shutting down calls `POST /drain` to
+  stop receiving new requests.
 - **HTTP/1.1 done properly**: pipelining, chunked bodies both ways,
   `Expect: 100-continue`, HEAD/204/304 framing, close-delimited responses,
   request-smuggling guards, bounded buffering with backpressure.
@@ -134,6 +143,7 @@ limer run                     # uses ./Limerfile or /etc/limer/Limerfile
 limer run -c path/Limerfile   # explicit config
 limer validate -c Limerfile   # parse, resolve upstreams, load certificates
 limer reload                  # SIGHUP the running instance (needs `pidfile`)
+limer upgrade                 # swap in a new binary with no downtime (SIGUSR2)
 limer stop                    # graceful SIGTERM
 limer version
 ```
@@ -183,6 +193,8 @@ replaced from the environment.
     trusted_proxies 10.0.0.0/8    # believe X-Forwarded-For from these hops (see below)
     ip_guard { }              # per-source-IP DoS mitigation (see below)
     server_header off         # Server header on limer's own responses; off = omit (default)
+    auto_rollback { }         # canary new configs/binaries and revert ones that cause 5xx (see below)
+    scale_up { }              # run a command when load spikes (see below)
 }
 
 # snippets can be imported into any block, with {args.N} substitution
@@ -438,6 +450,34 @@ only known once the head is read, the connection-level caps (`max_conns_per_ip`,
 the proxy connection, and you rely on `rate_limit` plus bans for per-client
 limits.
 
+### Scale-up hook
+
+`scale_up` runs a command when load spikes, so an autoscaler, an orchestrator
+or a webhook can add backends before the existing ones are overwhelmed.
+
+```
+{
+    scale_up {
+        requests 1000r/s     # request rate that counts as a spike
+        connections 5000     # and/or open client connections
+        sustain 10s          # must stay above the threshold this long (default 0)
+        cooldown 60s         # minimum time between runs (default 60s)
+        exec "/etc/limer/scale-up.sh"
+    }
+}
+```
+
+The command runs through `sh -c`, detached from the server, with the trigger
+in its environment: `LIMER_SCALE_REASON` (`requests` or `connections`),
+`LIMER_SCALE_RATE` and `LIMER_SCALE_CONNS`. A hook might be as small as
+`curl -X POST https://ops.example.com/scale -d "$LIMER_SCALE_RATE"` or an
+`aws autoscaling set-desired-capacity` call. At least one threshold and an
+`exec` are required. Worker 0 does the measuring, so with `workers N` the
+rate is that worker's share of the traffic (roughly the total divided by `N`).
+
+The other half of scaling is taking a backend out of rotation gracefully: see
+the self-drain endpoints in the [Admin API](#admin-api).
+
 ### Streaming request bodies
 
 A proxied request's body is streamed to the upstream as it arrives, with
@@ -602,6 +642,8 @@ Enable with `admin <addr>` in the global block.
 | `POST /upstreams/<host:port>/drain` | Stop sending new requests to the upstream (in-flight ones finish). |
 | `POST /upstreams/<host:port>/undrain` | Put it back into rotation. |
 | `POST /upstreams/<host:port>/weight/<n>` | Change its weight at runtime. |
+| `POST /drain` | Self-drain: stop sending new requests to the upstream(s) at the caller's own address (`?port=N` narrows it to one port). |
+| `POST /undrain` | Self-undrain: put the caller's upstream(s) back into rotation. |
 | `GET /overrides`, `DELETE /overrides` | List or clear the runtime overrides. |
 
 Drain and weight overrides apply to every pool using that upstream address,
@@ -609,20 +651,114 @@ are persisted to `<storage>/overrides.conf` so they survive reloads and
 restarts, and reach every worker. Remove them with `DELETE /overrides`.
 With `workers > 1`, counters are per worker (each response names its worker).
 
-## Reloading and signals
+`/drain` and `/undrain` are meant for backends shutting down gracefully: on
+`SIGTERM` an app calls `curl -X POST http://<limer-admin>/drain`, finishes the
+requests it already has, and exits; on start it calls `/undrain`. The
+upstream is chosen by the caller's source IP, so a backend can only ever drain
+itself — safe even on a shared management network. The admin listener must be
+reachable from the backends for this (bind `admin` to a management address
+rather than `127.0.0.1`, or run limer beside the app). Without the call, an
+active health check (`health_uri`) that starts failing achieves the same, only
+one `health_interval` later.
 
-| Signal | Effect |
-|---|---|
-| `SIGHUP` | Reload the Limerfile. Listeners are kept or added; sites and pools are swapped atomically; in-flight requests finish on the old config; a config that fails to parse or bind is rejected and logged. |
-| `SIGTERM` / `SIGINT` | Stop accepting, finish in-flight requests within `grace`, exit. |
+## Reloads, upgrades and rollback
 
-With `workers N`, a master process supervises `N` workers that each own all
-listeners via `SO_REUSEPORT`, restarts crashed workers, forwards `SIGHUP`
-and `SIGTERM`, and runs the certificate manager.
+| Signal | Command | Effect |
+|---|---|---|
+| `SIGHUP` | `limer reload` | Reload the Limerfile. Listeners are kept or added; sites and pools are swapped atomically; in-flight requests finish on the old config; a config that fails to parse or bind is rejected and logged. |
+| `SIGUSR2` | `limer upgrade` | Replace the running binary with the one now on disk, with no downtime (see below). |
+| `SIGTERM` / `SIGINT` | `limer stop` | Stop accepting, finish in-flight requests within `grace`, exit. |
+
+`limer run` always starts a master process that supervises `workers` worker
+processes (1 by default). The workers each own all listeners via
+`SO_REUSEPORT` and serve the traffic; the master forwards signals, runs the
+certificate manager and restarts a worker that dies. A restarted worker uses
+the master's last-known-good configuration from memory, not the file on disk,
+so a config that was edited into something broken cannot turn one crash into a
+crash loop.
+
+### Zero-downtime upgrades
+
+Install the new binary over the old one (`make install` writes a new file and
+renames it into place), then run `limer upgrade`:
+
+1. The master runs `<new binary> validate` on the current config in a
+   throwaway process. If that fails — a binary that will not start, or a config
+   it cannot parse — nothing changes and the error is logged.
+2. The master re-executes itself in place: **the pid stays the same**, so
+   systemd, a container runtime or a pidfile-based supervisor keep tracking
+   it. Its workers are not touched and keep serving.
+3. The new image starts its own workers, which bind the same ports next to the
+   old ones (`SO_REUSEPORT`), so no connection is refused at any point.
+4. Once the new workers are up, the old ones drain and exit.
+
+Connection by connection, nothing is dropped: in a test that sent a request
+every few milliseconds through an upgrade, 1,489 of 1,489 succeeded and the
+master pid did not change.
+
+### Automatic rollback
+
+`auto_rollback` judges every reload and upgrade on live traffic, and reverts
+the ones that make responses fail.
+
+```
+{
+    auto_rollback {
+        canary 5%          # share of new connections that get the new config (default 5%)
+        window 15s         # how long a new config or binary is on probation (default 15s)
+        error_rate 30%     # 5xx share that triggers a revert (default 50%)
+        min_requests 20    # don't judge on fewer responses than this (default 20)
+    }
+}
+```
+
+**Configs.** After a reload, the new config is on probation for `window`. It
+runs as a canary: each worker keeps the previous config and gives the new one
+only `canary` percent of new connections (`canary 100%` switches everything at
+once). Workers count the responses of each config separately, and if the new
+one reaches `error_rate` 5xx — and does worse than the previous one over the
+same window — the master reverts: it starts fresh workers from the previous
+config and drains the current ones, without dropping a connection. If the
+window passes cleanly, the new config is committed and takes all traffic. A
+config pointing at a dead backend, for example, is typically caught within a
+second or two, and with the default canary only about one connection in
+twenty sees it.
+
+**Binaries.** With `auto_rollback` on, `limer upgrade` first saves the running
+binary to `<storage>/limer.previous`. The new binary then runs as a canary next
+to the old workers, which keep serving until the probation ends. If the new
+workers' 5xx share reaches `error_rate`, or they crash twice, the master
+re-executes the saved binary in place (same pid again) and drains the new
+workers; otherwise the new binary is committed and the old workers drain.
+
+**Nothing comes back on restart.** Whatever is rolled back is moved aside and
+the known-good version is written back in its place, atomically: the rejected
+Limerfile is kept as `Limerfile.rejected-<time>` and the rejected binary as
+`limer.rejected-<time>`, so a `systemctl restart` or a reboot starts the
+version that was actually working. With `auto_rollback` on, a config that
+fails to parse when the master reloads it (a raw `SIGHUP` or `POST /reload`)
+is quarantined the same way; `limer reload` already refuses such a file before
+signalling. Only the main Limerfile is restored: a change inside an `import`ed
+file is left for you to fix.
+
+Some things to keep in mind:
+
+- The decision needs traffic. With the canary at 5%, a quiet site may finish
+  the window with fewer than `min_requests` canary responses; the new config is
+  then committed on what was seen.
+- Judgement happens once a second, so a broken config serves its canary share
+  for a second or two before it is reverted.
+- The protection in force is the known-good config's: a new config cannot
+  switch its own rollback off. A reload during an upgrade's probation is
+  ignored (try again once the upgrade is committed).
+- During a binary canary the split follows the number of workers (old and new
+  each own the same listeners), not the `canary` percentage.
+- `auto_rollback` cannot help when the master itself crashes in a new binary;
+  the validation step is the guard against that.
 
 ## Testing
 
-`make check` runs seven suites; `make check-asan` runs them on a build
+`make check` runs eleven suites; `make check-asan` runs them on a build
 instrumented with AddressSanitizer and UndefinedBehaviorSanitizer. The
 GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 
@@ -635,6 +771,10 @@ GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 | `make acme` | `tests/run_acme.sh`: certificate issuance over http-01, tls-alpn-01 and dns-01 (wildcard), storage and renewal against Pebble and pebble-challtestsrv (skips when they are not installed). |
 | `make security` | `tests/security_tests.py`: the black-box security suite described below. |
 | `make ddos` | `tests/ddos_test.py`: the per-IP connection guard — concurrent-connection caps, the new-connection rate limit, automatic ban escalation, and `trusted_proxies` client-IP keying. |
+| `make scale` | `tests/scale_test.py`: the `scale_up` hook fires on a request spike with its context, and the cooldown holds it to one run. |
+| `make drain` | `tests/drain_test.py`: a backend drains and undrains itself through `POST /drain` / `/undrain`. |
+| `make rollback` | `tests/rollback_test.py`: under continuous traffic, a healthy reload is committed after its canary probation, a reload to a dead backend is reverted with only the canary share affected, and the rejected (and an invalid) Limerfile is quarantined while the good one is restored. |
+| `make binrollback` | `tests/binrollback_test.py`: builds a deliberately broken limer, then upgrades under traffic — a good binary is committed, the broken one is rolled back with the same pid, and the previous binary is restored at its install path. |
 
 ## Security
 

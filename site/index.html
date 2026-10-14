@@ -364,7 +364,7 @@
         <h3>Static files &amp; compression</h3><p><code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">file_server</code> with ranges, try_files and directory browsing. gzip, zstd and brotli, streamed and negotiated.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M21 2v6h-6M3 22v-6h6"/><path d="M21 8A9 9 0 0 0 6 5M3 16a9 9 0 0 0 15 3"/></svg></div>
-        <h3>Zero-downtime reloads</h3><p>Hot reload on SIGHUP or the admin API. A bad config is rejected and the old one keeps running. In-flight requests finish cleanly.</p></div>
+        <h3>Safe deploys</h3><p>Reloads and <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">limer upgrade</code> with no downtime and the same pid. New configs and binaries run as a 5% canary and roll back on their own if they cause 5xx &mdash; the bad file is moved aside so a restart can&rsquo;t bring it back.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M12 6v6l4 2"/></svg></div>
         <h3>Dynamic upstreams</h3><p>Pools from DNS A/AAAA or SRV records, re-resolved on an interval. Mutual TLS, traffic mirroring and canary splitting built in.</p></div>
@@ -377,6 +377,9 @@
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.9 10.9 0 0 1 12 5c6 0 10 7 10 7a18 18 0 0 1-3 3.6M6.6 6.6A18 18 0 0 0 2 12s4 7 10 7a10.9 10.9 0 0 0 3.9-.7"/></svg></div>
         <h3>Low profile</h3><p>limer doesn&rsquo;t announce itself: no <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">Server</code> header by default, neutral cookie names, proxied responses untouched. Set <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">server_header nginx</code> to masquerade.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><path d="M14 7h7v7"/></svg></div>
+        <h3>Autoscaling hooks</h3><p><code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">scale_up</code> runs your command when traffic spikes; a backend shutting down calls <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">POST /drain</code> and stops getting new requests. Crashed workers restart on their own.</p></div>
     </div>
   </div>
 </section>
