@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>limer.sh — ultra-fast, payload-aware HTTP server &amp; load balancer</title>
+<meta name="description" content="limer.sh is an ultra-fast HTTP server and load balancer in C that routes and balances on what is inside the request — JSON fields, form fields, headers, cookies, the body. One binary, a readable Limerfile, automatic HTTPS, HTTP/2 and gRPC.">
+<meta name="keywords" content="ultra-fast HTTP server, reverse proxy, load balancer, payload routing, JSON routing, Caddy alternative, automatic HTTPS, HTTP/2, gRPC proxy, rate limiting, C">
+<meta name="author" content="limer.sh">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+<meta name="theme-color" content="#0b0d09">
+<link rel="canonical" href="https://limer.sh/">
+
+<!-- Open Graph -->
+<meta property="og:site_name" content="limer.sh">
+<meta property="og:title" content="limer.sh — the reverse proxy that routes on what's inside the request">
+<meta property="og:description" content="An ultra-fast HTTP server and load balancer that distributes traffic by JSON fields, form fields, headers, cookies or the body. One binary, automatic HTTPS, HTTP/2 and gRPC.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://limer.sh/">
+<meta property="og:image" content="https://limer.sh/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="limer.sh — payload-aware HTTP server and load balancer">
+<meta property="og:locale" content="en_US">
+
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="limer.sh — routes on what's inside the request">
+<meta name="twitter:description" content="An ultra-fast, payload-aware HTTP server and load balancer in C. One binary, automatic HTTPS, HTTP/2 and gRPC.">
+<meta name="twitter:image" content="https://limer.sh/og.png">
+<meta name="twitter:image:alt" content="limer.sh — payload-aware HTTP server and load balancer">
+
+<!-- Structured data -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "name": "limer.sh",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "Linux",
+      "description": "An ultra-fast HTTP server and load balancer written in C with payload-based request distribution: it routes and balances on JSON fields, form fields, body regexes, headers, cookies, the path or the client address. One binary, a readable Limerfile, automatic HTTPS, HTTP/2 and gRPC.",
+      "url": "https://limer.sh/",
+      "image": "https://limer.sh/og.png",
+      "softwareVersion": "0.1.0",
+      "programmingLanguage": "C",
+      "license": "https://opensource.org/licenses/MIT",
+      "codeRepository": "https://github.com/limer-sh/limer",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+    },
+    {
+      "@type": "WebSite",
+      "name": "limer.sh",
+      "url": "https://limer.sh/",
+      "publisher": { "@type": "Organization", "name": "limer.sh", "url": "https://limer.sh/" }
+    }
+  ]
+}
+</script>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230c0f0a'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='20' font-weight='700' fill='%23a3e635' text-anchor='middle'%3EL%3C/text%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#0b0d09;
+    --bg-soft:#11140d;
+    --panel:#13170f;
+    --panel-2:#171c12;
+    --line:#242b1b;
+    --line-soft:#1c2216;
+    --fg:#e8ede1;
+    --muted:#9aa58c;
+    --faint:#6c7760;
+    --lime:#a3e635;
+    --lime-dim:#84cc16;
+    --lime-soft:#c7f27a;
+    --amber:#f5c451;
+    --pink:#f08fb0;
+    --blue:#7fd0ff;
+    --radius:14px;
+    --mono:"SFMono-Regular",ui-monospace,"JetBrains Mono","Menlo",Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--bg);color:var(--fg);
+    font-family:var(--sans);line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+    font-size:16px;
+    overflow-x:hidden;
+  }
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+  ::selection{background:rgba(163,230,53,.28);color:#fff}
+
+  /* ---- background glow ---- */
+  .bg-glow{position:fixed;inset:0;z-index:0;pointer-events:none;
+    background:
+      radial-gradient(620px 380px at 78% -8%,rgba(163,230,53,.10),transparent 60%),
+      radial-gradient(520px 420px at 8% 4%,rgba(127,208,255,.055),transparent 55%);
+  }
+  .content{position:relative;z-index:1}
+
+  /* ---- nav ---- */
+  nav{position:sticky;top:0;z-index:20;backdrop-filter:blur(10px);
+    background:rgba(11,13,9,.72);border-bottom:1px solid var(--line-soft)}
+  .nav-inner{display:flex;align-items:center;gap:20px;height:60px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.01em}
+  .brand .mark{width:26px;height:26px;border-radius:7px;background:linear-gradient(145deg,#1a2112,#0e1209);
+    border:1px solid var(--line);display:grid;place-items:center;font-family:var(--mono);
+    color:var(--lime);font-weight:800;font-size:15px;box-shadow:inset 0 0 12px rgba(163,230,53,.12)}
+  .nav-links{margin-left:auto;display:flex;align-items:center;gap:26px;font-size:14.5px;color:var(--muted)}
+  .nav-links a:hover{color:var(--fg)}
+  .nav-links .gh{color:var(--fg);border:1px solid var(--line);padding:7px 14px;border-radius:9px;
+    background:var(--panel);transition:.15s}
+  .nav-links .gh:hover{border-color:var(--lime-dim);background:var(--panel-2)}
+  @media(max-width:680px){.nav-hide{display:none}}
+
+  /* ---- hero ---- */
+  header.hero{padding:76px 0 40px}
+  .eyebrow{display:inline-flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12.5px;
+    color:var(--lime-soft);background:rgba(163,230,53,.07);border:1px solid rgba(163,230,53,.2);
+    padding:6px 13px;border-radius:999px;margin-bottom:26px}
+  .eyebrow .dot{width:6px;height:6px;border-radius:50%;background:var(--lime);box-shadow:0 0 8px var(--lime)}
+  h1{font-size:clamp(2.5rem,6.2vw,4.4rem);line-height:1.02;letter-spacing:-.03em;margin:0 0 22px;font-weight:800}
+  h1 .accent{background:linear-gradient(180deg,var(--lime-soft),var(--lime-dim));-webkit-background-clip:text;
+    background-clip:text;color:transparent}
+  .lede{font-size:clamp(1.08rem,2.2vw,1.35rem);color:var(--muted);max-width:720px;margin:0 0 20px}
+  .lede b{color:var(--fg);font-weight:600}
+  .cta{display:flex;flex-wrap:wrap;gap:14px;margin-top:34px;align-items:center}
+  .btn{display:inline-flex;align-items:center;gap:9px;font-weight:600;font-size:15px;padding:12px 20px;
+    border-radius:11px;transition:.16s;border:1px solid transparent}
+  .btn-primary{background:var(--lime);color:#0a0d06;box-shadow:0 8px 30px -10px rgba(163,230,53,.6)}
+  .btn-primary:hover{background:var(--lime-soft);transform:translateY(-1px)}
+  .btn-ghost{border-color:var(--line);color:var(--fg);background:var(--panel)}
+  .btn-ghost:hover{border-color:var(--faint);background:var(--panel-2)}
+  .install{display:inline-flex;align-items:center;gap:12px;font-family:var(--mono);font-size:14px;
+    color:var(--muted);background:var(--panel);border:1px solid var(--line);padding:11px 16px;border-radius:11px}
+  .install .pfx{color:var(--lime)}
+  .install button{all:unset;cursor:pointer;color:var(--faint);font-size:12px;padding:3px 8px;border-radius:6px;
+    border:1px solid var(--line);transition:.15s}
+  .install button:hover{color:var(--fg);border-color:var(--faint)}
+
+  /* ---- code card ---- */
+  .codecard{margin-top:44px;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;
+    background:linear-gradient(180deg,var(--panel),#0e120a);box-shadow:0 30px 80px -40px rgba(0,0,0,.9)}
+  .codecard .bar{display:flex;align-items:center;gap:8px;padding:11px 16px;border-bottom:1px solid var(--line-soft);
+    background:rgba(255,255,255,.012)}
+  .codecard .bar .d{width:11px;height:11px;border-radius:50%;background:#2a3220}
+  .codecard .bar .name{margin-left:10px;font-family:var(--mono);font-size:12.5px;color:var(--faint)}
+  pre{margin:0;padding:22px 24px;overflow-x:auto;font-family:var(--mono);font-size:13.5px;line-height:1.72}
+  pre code{white-space:pre}
+  .c-cm{color:var(--faint);font-style:italic}
+  .c-site{color:var(--lime-soft);font-weight:600}
+  .c-dir{color:var(--blue)}
+  .c-kw{color:var(--pink)}
+  .c-str{color:var(--amber)}
+  .c-num{color:var(--lime)}
+  .c-op{color:var(--muted)}
+
+  /* ---- sections ---- */
+  section{padding:58px 0}
+  .sec-head{max-width:720px;margin-bottom:40px}
+  .kicker{font-family:var(--mono);font-size:12.5px;color:var(--lime-dim);letter-spacing:.04em;text-transform:uppercase;margin-bottom:12px}
+  h2{font-size:clamp(1.7rem,3.6vw,2.4rem);letter-spacing:-.02em;margin:0 0 14px;font-weight:700}
+  .sec-head p{color:var(--muted);font-size:1.05rem;margin:0}
+  .divider{height:1px;background:linear-gradient(90deg,transparent,var(--line),transparent)}
+
+  /* ---- differentiator two-col ---- */
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:28px;align-items:center}
+  @media(max-width:820px){.split{grid-template-columns:1fr}}
+  .split .prose h2{margin-bottom:16px}
+  .split .prose p{color:var(--muted)}
+  .matchlist{list-style:none;padding:0;margin:22px 0 0;display:flex;flex-wrap:wrap;gap:8px}
+  .matchlist li{font-family:var(--mono);font-size:12.5px;color:var(--lime-soft);
+    border:1px solid rgba(163,230,53,.18);background:rgba(163,230,53,.05);padding:5px 11px;border-radius:8px}
+
+  /* ---- feature grid ---- */
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  @media(max-width:860px){.grid{grid-template-columns:repeat(2,1fr)}}
+  @media(max-width:560px){.grid{grid-template-columns:1fr}}
+  .card{border:1px solid var(--line);border-radius:var(--radius);padding:22px;background:var(--panel);
+    transition:.18s;position:relative;overflow:hidden}
+  .card:hover{border-color:rgba(163,230,53,.34);background:var(--panel-2);transform:translateY(-2px)}
+  .card .ic{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;margin-bottom:14px;
+    background:rgba(163,230,53,.08);border:1px solid rgba(163,230,53,.18)}
+  .card .ic svg{width:18px;height:18px;stroke:var(--lime);fill:none;stroke-width:1.8}
+  .card h3{margin:0 0 7px;font-size:1.03rem;letter-spacing:-.01em}
+  .card p{margin:0;color:var(--muted);font-size:14px;line-height:1.56}
+
+  /* ---- perf table ---- */
+  .perf-note{color:var(--faint);font-size:13.5px;margin-top:16px;font-family:var(--mono)}
+  .tablewrap{border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;overflow-x:auto}
+  table{border-collapse:collapse;width:100%;font-size:14.5px;min-width:520px}
+  th,td{text-align:left;padding:14px 18px;border-bottom:1px solid var(--line-soft)}
+  thead th{background:rgba(255,255,255,.02);color:var(--muted);font-weight:600;font-size:13px;
+    text-transform:uppercase;letter-spacing:.03em}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:rgba(163,230,53,.025)}
+  td.n{font-family:var(--mono)}
+  .limer-v{color:var(--lime);font-weight:600}
+  .caddy-v{color:var(--muted)}
+  .ratio{font-family:var(--mono);color:var(--lime-soft);font-weight:600}
+
+  /* ---- quickstart ---- */
+  .steps{display:grid;grid-template-columns:1fr 1fr;gap:28px;align-items:start}
+  @media(max-width:820px){.steps{grid-template-columns:1fr}}
+  .steplist{counter-reset:s;list-style:none;padding:0;margin:0}
+  .steplist li{position:relative;padding:0 0 22px 46px;border-left:1px solid var(--line);margin-left:15px}
+  .steplist li:last-child{border-left-color:transparent;padding-bottom:0}
+  .steplist li::before{counter-increment:s;content:counter(s);position:absolute;left:-15px;top:-2px;
+    width:30px;height:30px;border-radius:50%;background:var(--panel);border:1px solid var(--line);
+    display:grid;place-items:center;font-family:var(--mono);font-size:13px;color:var(--lime)}
+  .steplist h4{margin:2px 0 5px;font-size:1rem}
+  .steplist p{margin:0;color:var(--muted);font-size:14px}
+  .steplist code{font-family:var(--mono);font-size:12.5px;background:var(--bg-soft);border:1px solid var(--line-soft);
+    padding:2px 6px;border-radius:5px;color:var(--lime-soft)}
+
+  /* ---- footer ---- */
+  footer{border-top:1px solid var(--line-soft);padding:46px 0 60px;margin-top:40px}
+  .foot-inner{display:flex;flex-wrap:wrap;gap:20px;align-items:center;justify-content:space-between}
+  .foot-inner p{margin:0;color:var(--faint);font-size:13.5px}
+  .foot-links{display:flex;gap:24px;font-size:14px;color:var(--muted)}
+  .foot-links a:hover{color:var(--fg)}
+  .served{font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:8px}
+  .served b{color:var(--lime-dim)}
+
+  .fade{opacity:0;transform:translateY(14px);transition:opacity .6s ease,transform .6s ease}
+  .fade.in{opacity:1;transform:none}
+  @media(prefers-reduced-motion:reduce){.fade{opacity:1;transform:none;transition:none}html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<div class="bg-glow"></div>
+<div class="content">
+
+<nav>
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top"><span class="mark">L</span>limer.sh</a>
+    <div class="nav-links">
+      <a class="nav-hide" href="#routing">Routing</a>
+      <a class="nav-hide" href="#features">Features</a>
+      <a class="nav-hide" href="#performance">Performance</a>
+      <a class="nav-hide" href="#start">Quickstart</a>
+      <a class="gh" href="https://github.com/limer-sh/limer">GitHub ↗</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <span class="eyebrow"><span class="dot"></span>One binary · written in C · Caddy-style config</span>
+    <h1>The reverse proxy that<br>routes on <span class="accent">what&rsquo;s inside</span><br>the request.</h1>
+    <p class="lede">limer.sh is an ultra-fast HTTP server and load balancer that distributes traffic by
+      <b>JSON fields, form fields, body regexes, headers, cookies, the path, or the client address</b> —
+      not just the URL. One binary, a readable <b>Limerfile</b>, automatic HTTPS, HTTP/2 and gRPC.</p>
+
+    <div class="cta">
+      <a class="btn btn-primary" href="#start">Get started →</a>
+      <a class="btn btn-ghost" href="https://github.com/limer-sh/limer">★ Star on GitHub</a>
+      <span class="install">
+        <span><span class="pfx">$</span> git clone &amp;&amp; make</span>
+        <button data-copy="git clone https://github.com/limer-sh/limer &amp;&amp; cd limer &amp;&amp; make">copy</button>
+      </span>
+    </div>
+
+    <div class="codecard fade">
+      <div class="bar"><span class="d"></span><span class="d"></span><span class="d"></span><span class="name">Limerfile</span></div>
+<pre><code><span class="c-site">example.com</span> <span class="c-op">{</span>
+    <span class="c-cm"># Same customer → same upstream, chosen by a field in the JSON body</span>
+    <span class="c-dir">route</span> orders <span class="c-op">{</span>
+        <span class="c-dir">match</span> <span class="c-kw">method</span> POST
+        <span class="c-dir">match</span> <span class="c-kw">json</span> type <span class="c-op">==</span> order refund
+        <span class="c-dir">reverse_proxy</span> <span class="c-num">10.0.1.10:8080</span> <span class="c-num">10.0.1.11:8080</span> <span class="c-op">{</span>
+            <span class="c-dir">lb_policy</span> <span class="c-kw">hash json</span> customer.id
+        <span class="c-op">}</span>
+    <span class="c-op">}</span>
+
+    <span class="c-cm"># Everything else: least-connections with active health checks</span>
+    <span class="c-dir">reverse_proxy</span> <span class="c-num">10.0.0.10:8080</span> <span class="c-num">10.0.0.11:8080</span> <span class="c-num">10.0.0.12:8080</span> <span class="c-op">{</span>
+        <span class="c-dir">lb_policy</span> <span class="c-kw">least_conn</span>
+        <span class="c-dir">health_uri</span> <span class="c-str">/healthz</span>
+    <span class="c-op">}</span>
+<span class="c-op">}</span></code></pre>
+    </div>
+  </div>
+</header>
+
+<div class="wrap"><div class="divider"></div></div>
+
+<!-- ROUTING -->
+<section id="routing">
+  <div class="wrap split">
+    <div class="prose">
+      <div class="kicker">Payload-based distribution</div>
+      <h2>Balance on the request, not just the URL.</h2>
+      <p>Most proxies can only see the method and path. limer.sh looks <b>inside</b> the request and
+        picks a handler or an upstream from its contents. <code style="font-family:var(--mono);font-size:.85em;color:var(--lime-soft)">lb_policy hash json customer.id</code>
+        sends every request for a customer to the same backend with weighted rendezvous hashing — so
+        when an upstream leaves, only <em>its</em> keys get remapped.</p>
+      <p style="margin-top:14px">Match with <span style="color:var(--fg)">== != ~ !~ &gt; &lt; ^= *= exists missing</span>,
+        AND matchers together, OR their values, and negate any of them.</p>
+      <ul class="matchlist">
+        <li>json</li><li>form</li><li>body&nbsp;regex</li><li>header</li><li>cookie</li>
+        <li>query</li><li>path</li><li>host</li><li>method</li><li>remote_ip</li>
+        <li>tls_client</li><li>split&nbsp;%</li>
+      </ul>
+    </div>
+    <div class="codecard">
+      <div class="bar"><span class="d"></span><span class="d"></span><span class="d"></span><span class="name">shard by tenant</span></div>
+<pre><code><span class="c-site">:8080</span> <span class="c-op">{</span>
+    <span class="c-dir">route</span> events <span class="c-op">{</span>
+        <span class="c-dir">match</span> <span class="c-kw">path</span> <span class="c-str">/events/*</span>
+        <span class="c-dir">match</span> <span class="c-kw">json</span> event <span class="c-op">==</span> signup purchase
+        <span class="c-dir">to</span> <span class="c-num">:9001</span> <span class="c-num">:9002</span> <span class="c-num">:9003</span>
+        <span class="c-dir">lb_policy</span> <span class="c-kw">hash json</span> tenant
+    <span class="c-op">}</span>
+
+    <span class="c-cm"># 5% canary — sticky per user</span>
+    <span class="c-dir">route</span> <span class="c-op">{</span>
+        <span class="c-dir">match</span> <span class="c-kw">split</span> <span class="c-num">5</span> cookie session
+        <span class="c-dir">reverse_proxy</span> canary.internal:8080
+    <span class="c-op">}</span>
+
+    <span class="c-dir">reverse_proxy</span> <span class="c-num">:9001</span> <span class="c-num">:9002</span> <span class="c-num">:9003</span>
+<span class="c-op">}</span></code></pre>
+    </div>
+  </div>
+</section>
+
+<div class="wrap"><div class="divider"></div></div>
+
+<!-- FEATURES -->
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="kicker">Everything in one binary</div>
+      <h2>A full edge, nothing to assemble.</h2>
+      <p>limer.sh works like Caddy: automatic certificates, zero-downtime reloads, an admin API —
+        plus the payload routing and balancing that Caddy lacks.</p>
+    </div>
+    <div class="grid">
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg></div>
+        <h3>Payload routing &amp; hashing</h3><p>Route and balance on JSON, form, body, header, cookie, query, path or client IP. Rendezvous hashing keeps keys stable across upstream changes.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+        <h3>Automatic HTTPS</h3><p>Let&rsquo;s Encrypt over http-01, tls-alpn-01 or dns-01 with wildcards. Renews itself. <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">tls internal</code> for local dev.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg></div>
+        <h3>HTTP/2 &amp; gRPC</h3><p>HTTP/2 both sides via <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">h2c://</code>/<code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">h2://</code>, trailers intact. Unary and bidirectional streaming gRPC pass straight through.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 8l9-5 9 5M3 16l9 5 9-5"/></svg></div>
+        <h3>Smart load balancing</h3><p>Round robin, least-conn, random, IP/URI hash, sticky cookies — with weights, active health checks and passive ejection.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg></div>
+        <h3>Caching &amp; rate limits</h3><p>In-memory LRU cache honouring Cache-Control, ETag and stale-while-revalidate. Token-bucket rate limits keyed by any placeholder.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></div>
+        <h3>Static files &amp; compression</h3><p><code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">file_server</code> with ranges, try_files and directory browsing. gzip, zstd and brotli, streamed and negotiated.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M21 2v6h-6M3 22v-6h6"/><path d="M21 8A9 9 0 0 0 6 5M3 16a9 9 0 0 0 15 3"/></svg></div>
+        <h3>Zero-downtime reloads</h3><p>Hot reload on SIGHUP or the admin API. A bad config is rejected and the old one keeps running. In-flight requests finish cleanly.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M12 6v6l4 2"/></svg></div>
+        <h3>Dynamic upstreams</h3><p>Pools from DNS A/AAAA or SRV records, re-resolved on an interval. Mutual TLS, traffic mirroring and canary splitting built in.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M4 4h16v6H4zM4 14h16v6H4z"/><path d="M8 7h.01M8 17h.01"/></svg></div>
+        <h3>Ops you can see</h3><p>Prometheus metrics, JSON upstream status, runtime drain and weight overrides that survive reloads, multi-process workers with SO_REUSEPORT.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.5 8-8 10-4.5-2-8-5-8-10V6z"/></svg></div>
+        <h3>DoS mitigation</h3><p>Cap concurrent connections and the new-connection rate per source IP at accept time, and auto-ban repeat offenders. <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">trusted_proxies</code> keys it on the real client behind a CDN.</p></div>
+
+      <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.9 10.9 0 0 1 12 5c6 0 10 7 10 7a18 18 0 0 1-3 3.6M6.6 6.6A18 18 0 0 0 2 12s4 7 10 7a10.9 10.9 0 0 0 3.9-.7"/></svg></div>
+        <h3>Low profile</h3><p>limer doesn&rsquo;t announce itself: no <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">Server</code> header by default, neutral cookie names, proxied responses untouched. Set <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">server_header nginx</code> to masquerade.</p></div>
+    </div>
+  </div>
+</section>
+
+<div class="wrap"><div class="divider"></div></div>
+
+<!-- PERFORMANCE -->
+<section id="performance">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="kicker">Performance</div>
+      <h2>An epoll data path in C — about 3–5× Caddy.</h2>
+      <p>Same 4-vCPU VM, same two backends, same <code style="font-family:var(--mono);font-size:.85em;color:var(--lime-soft)">round_robin</code> policy and an enlarged keep-alive pool, driven by wrk. HTTP/1.1 reverse-proxy throughput:</p>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Scenario</th><th>Caddy v2.10</th><th>limer.sh</th><th>Ratio</th></tr></thead>
+        <tbody>
+          <tr><td>1 core · GET round robin · 100 conns</td><td class="n caddy-v">9,200 req/s</td><td class="n limer-v">32,000 req/s</td><td class="ratio">3.5×</td></tr>
+          <tr><td>1 core · POST 120 B JSON</td><td class="n caddy-v">8,600 req/s</td><td class="n limer-v">31,000 req/s</td><td class="ratio">3.6×</td></tr>
+          <tr><td>1 core · GET · 1000 conns</td><td class="n caddy-v">7,400 req/s</td><td class="n limer-v">26,000 req/s</td><td class="ratio">3.5×</td></tr>
+          <tr><td>4 cores · GET round robin · 100 conns</td><td class="n caddy-v">23,500 req/s</td><td class="n limer-v">103,000 req/s</td><td class="ratio">4.4×</td></tr>
+          <tr><td>4 cores · POST 120 B JSON</td><td class="n caddy-v">20,500 req/s</td><td class="n limer-v">90,000 req/s</td><td class="ratio">4.4×</td></tr>
+          <tr><td>4 cores · GET · 1000 conns</td><td class="n caddy-v">22,500 req/s</td><td class="n limer-v">115,000 req/s</td><td class="ratio">5.1×</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="perf-note">~5 KB per active connection · one worker can hold ~500,000 connections in ~2.5 GB · reproduce it all with <span style="color:var(--lime-soft)">bench/run.sh</span></p>
+  </div>
+</section>
+
+<div class="wrap"><div class="divider"></div></div>
+
+<!-- QUICKSTART -->
+<section id="start">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="kicker">Quickstart</div>
+      <h2>Running in under a minute.</h2>
+      <p>No runtime, no modules to install — just libc and whatever optional libraries you have. Linux (epoll).</p>
+    </div>
+    <div class="steps">
+      <ol class="steplist">
+        <li><h4>Build it</h4><p>Clone and <code>make</code>. Optional libs (OpenSSL, nghttp2, zstd, brotli) are auto-detected; <code>make install</code> drops it in <code>/usr/local/bin</code>.</p></li>
+        <li><h4>Write a Limerfile</h4><p>One directive per line, blocks in braces — the Caddyfile syntax you already know, with <code>import</code>, snippets and <code>{$ENV}</code>.</p></li>
+        <li><h4>Run &amp; reload</h4><p><code>limer run</code> in the foreground (perfect under systemd). <code>limer reload</code> swaps config with zero downtime; <code>limer validate</code> checks it first.</p></li>
+      </ol>
+      <div class="codecard">
+        <div class="bar"><span class="d"></span><span class="d"></span><span class="d"></span><span class="name">try it locally</span></div>
+<pre><code><span class="c-cm"># build</span>
+git clone https://github.com/limer-sh/limer
+<span class="c-dir">cd</span> limer <span class="c-op">&amp;&amp;</span> make
+
+<span class="c-cm"># spin up three test backends</span>
+python3 tests/backend.py <span class="c-num">9001</span> shard-a <span class="c-op">&amp;</span>
+python3 tests/backend.py <span class="c-num">9002</span> shard-b <span class="c-op">&amp;</span>
+python3 tests/backend.py <span class="c-num">9003</span> shard-c <span class="c-op">&amp;</span>
+
+<span class="c-cm"># route by payload</span>
+./limer run -c examples/payload-routing.Limerfile
+
+curl -X POST localhost:8080/echo \
+     -d <span class="c-str">'{"tenant":"acme","event":"signup"}'</span></code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-inner">
+      <div>
+        <a class="brand" href="#top"><span class="mark">L</span>limer.sh</a>
+        <p style="margin-top:10px">An ultra-fast, payload-aware HTTP server &amp; load balancer in C.</p>
+        <p class="served">Served by <b>limer.sh</b> itself · automatic HTTPS from Let&rsquo;s Encrypt</p>
+      </div>
+      <div class="foot-links">
+        <a href="https://github.com/limer-sh/limer">GitHub</a>
+        <a href="https://github.com/limer-sh/limer/blob/main/USERGUIDE.md#the-limerfile">Docs</a>
+        <a href="https://github.com/limer-sh/limer/blob/main/examples/payload-routing.Limerfile">Examples</a>
+        <a href="https://github.com/limer-sh/limer/blob/main/USERGUIDE.md#performance">Benchmarks</a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+</div><!-- /content -->
+
+<script>
+  // copy-to-clipboard
+  document.querySelectorAll('button[data-copy]').forEach(function(b){
+    b.addEventListener('click',function(){
+      var t=b.getAttribute('data-copy');
+      navigator.clipboard&&navigator.clipboard.writeText(t).then(function(){
+        var o=b.textContent;b.textContent='copied ✓';setTimeout(function(){b.textContent=o},1400);
+      });
+    });
+  });
+  // reveal on scroll
+  var io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}})},{threshold:.12});
+  document.querySelectorAll('.fade').forEach(function(el){io.observe(el)});
+</script>
+</body>
+</html>
