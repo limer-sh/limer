@@ -4886,13 +4886,143 @@ static void admin_request_reload(void)
         proxy_request_reload();
 }
 
+/* Admin API callers: a token bucket for the webhooks and strikes toward a ban,
+ * per source address. Small and per worker; the least recently seen entry is
+ * reused when the table is full. */
+#define ADMIN_PEERS 1024
+typedef struct {
+    char   ip[64];
+    double tokens, refilled;      /* webhook token bucket */
+    int    strikes;               /* wrong secrets and rate-limit hits... */
+    double strikes_since;         /* ...counted since this time */
+    double banned_until;
+    double seen;
+} admin_peer_t;
+static admin_peer_t g_admin_peers[ADMIN_PEERS];
+
+static admin_peer_t *admin_peer(const char *ip)
+{
+    admin_peer_t *free_slot = NULL, *oldest = NULL;
+    for (int i = 0; i < ADMIN_PEERS; i++) {
+        admin_peer_t *p = &g_admin_peers[i];
+        if (p->ip[0] && strcmp(p->ip, ip) == 0) {
+            p->seen = g_now;
+            return p;
+        }
+        if (!p->ip[0]) {
+            if (!free_slot)
+                free_slot = p;
+        } else if (p->banned_until <= g_now && (!oldest || p->seen < oldest->seen)) {
+            oldest = p;
+        }
+    }
+    admin_peer_t *p = free_slot ? free_slot : oldest;
+    if (!p)
+        return NULL;               /* every slot holds an active ban */
+    memset(p, 0, sizeof *p);
+    snprintf(p->ip, sizeof p->ip, "%s", ip);
+    p->tokens = g_cfg->admin.burst;
+    p->refilled = p->seen = g_now;
+    return p;
+}
+
+static void admin_strike(admin_peer_t *p, const char *why)
+{
+    const admin_cfg_t *a = &g_cfg->admin;
+    if (!p || a->max_failures <= 0)
+        return;
+    if (g_now - p->strikes_since > a->ban) {
+        p->strikes = 0;
+        p->strikes_since = g_now;
+    }
+    if (++p->strikes >= a->max_failures) {
+        p->banned_until = g_now + a->ban;
+        p->strikes = 0;
+        LOGW("admin: banned %s for %.0fs after %d %s", p->ip, a->ban, a->max_failures, why);
+    }
+}
+
+/* Constant-time comparison, so response timing does not reveal the secret. */
+static int secret_equal(const char *a, size_t alen, const char *b, size_t blen)
+{
+    unsigned diff = (unsigned)(alen ^ blen);
+    for (size_t i = 0; i < blen; i++)
+        diff |= (unsigned char)(i < alen ? a[i] : 0) ^ (unsigned char)b[i];
+    return diff == 0;
+}
+
+static void admin_refuse(conn_t *c, int status, const char *body, const char *extra)
+{
+    c->route = NULL;
+    conn_write_simple_response(c, status, "application/json", body, strlen(body), NULL, 0, extra);
+    c->state = CS_LOCAL;
+    conn_next_request(c);
+}
+
+/* Secret, ban and webhook rate checks. Returns 1 when the request may proceed;
+ * otherwise a response was written. /health stays open for load balancers. */
+static int admin_guard(conn_t *c, const char *path)
+{
+    const admin_cfg_t *a = &g_cfg->admin;
+    if (strcmp(path, "/") == 0 || strcmp(path, "/health") == 0 || strcmp(path, "/healthz") == 0)
+        return 1;
+    int webhook = strcmp(path, "/drain") == 0 || strcmp(path, "/undrain") == 0 || strcmp(path, "/scale_up") == 0;
+    if (!a->secret && !(webhook && a->rate > 0))
+        return 1;
+    admin_peer_t *p = admin_peer(c->peer_ip);
+    char extra[128];
+    if (!p || p->banned_until > g_now) {
+        snprintf(extra, sizeof extra, "Retry-After: %d\r\n", p ? (int)(p->banned_until - g_now + 0.999) : (int)a->ban);
+        admin_refuse(c, 403, "{\"error\":\"banned\"}\n", extra);
+        return 0;
+    }
+    if (a->secret) {
+        const char *h = http_hdr_get(c->req.hdrs, c->req.nhdr, "Authorization");
+        int ok = 0;
+        if (h && strncasecmp(h, "Bearer ", 7) == 0) {
+            const char *tok = h + 7;
+            while (*tok == ' ')
+                tok++;
+            size_t tl = strlen(tok);
+            while (tl && (tok[tl - 1] == ' ' || tok[tl - 1] == '\t'))
+                tl--;
+            ok = secret_equal(tok, tl, a->secret, strlen(a->secret));
+        }
+        if (!ok) {
+            admin_strike(p, "wrong or missing secrets");
+            admin_refuse(c, 401, "{\"error\":\"unauthorized\"}\n", "WWW-Authenticate: Bearer realm=\"admin\"\r\n");
+            return 0;
+        }
+    }
+    if (webhook && a->rate > 0) {
+        p->tokens += (g_now - p->refilled) * a->rate;
+        if (p->tokens > a->burst)
+            p->tokens = a->burst;
+        p->refilled = g_now;
+        if (p->tokens < 1) {
+            admin_strike(p, "calls over the webhook rate limit");
+            snprintf(extra, sizeof extra, "Retry-After: %d\r\n", (int)((1 - p->tokens) / a->rate + 0.999));
+            admin_refuse(c, 429, "{\"error\":\"too many calls\"}\n", extra);
+            return 0;
+        }
+        p->tokens -= 1;
+    }
+    return 1;
+}
+
+static int  scale_claim(void);
+static void scale_fire(const char *reason, double rate, int conns, const char *caller);
+
 static void admin_handle(conn_t *c)
 {
     const char *path = c->req.path;
+    if (!admin_guard(c, path))
+        return;
     buf_t b;
     buf_init(&b);
     int status = 200;
     const char *ctype = "application/json";
+    char extra[64] = "";
     if (strcmp(path, "/") == 0 || strcmp(path, "/health") == 0 || strcmp(path, "/healthz") == 0) {
         buf_printf(&b, "{\"status\":\"ok\",\"version\":\"%s\",\"worker\":%d}\n", LIMER_VERSION, g_worker_id);
     } else if (strcmp(path, "/upstreams") == 0) {
@@ -5032,12 +5162,34 @@ static void admin_handle(conn_t *c)
                 }
             }
         }
+    } else if (strcmp(path, "/scale_up") == 0) {
+        /* An application asks for more capacity: run the scale_up hook now,
+         * subject to the same cooldown as automatic runs. */
+        if (strcmp(c->req.method, "POST") != 0) {
+            status = 405;
+            buf_puts(&b, "{\"error\":\"use POST\"}\n");
+        } else if (!g_cfg->scale_up.enabled) {
+            status = 404;
+            buf_puts(&b, "{\"error\":\"scale_up is not configured\"}\n");
+        } else if (!scale_claim()) {
+            status = 429;
+            int left = (int)(g_cfg->scale_up.cooldown - (g_now - (double)sh_get(SH_SCALE_LAST) / 1000.0) + 0.999);
+            if (left < 1)
+                left = 1;
+            snprintf(extra, sizeof extra, "Retry-After: %d\r\n", left);
+            buf_printf(&b, "{\"status\":\"cooling down\",\"retry_after\":%d}\n", left);
+        } else {
+            LOGW("scale_up: requested by %s through the admin API, running hook", c->peer_ip);
+            scale_fire("webhook", -1, g_stats.active_conns, c->peer_ip);
+            status = 202;
+            buf_puts(&b, "{\"status\":\"scale_up started\"}\n");
+        }
     } else {
         status = 404;
-        buf_puts(&b, "{\"error\":\"not found\",\"endpoints\":[\"/health\",\"/upstreams\",\"/metrics\",\"/config\",\"/overrides\",\"/reload (POST)\",\"/drain|/undrain (POST, self)\",\"/upstreams/<host:port>/drain|undrain|weight/<n> (POST)\"]}\n");
+        buf_puts(&b, "{\"error\":\"not found\",\"endpoints\":[\"/health\",\"/upstreams\",\"/metrics\",\"/config\",\"/overrides\",\"/reload (POST)\",\"/drain|/undrain (POST, self)\",\"/scale_up (POST)\",\"/upstreams/<host:port>/drain|undrain|weight/<n> (POST)\"]}\n");
     }
     c->route = NULL;
-    conn_write_simple_response(c, status, ctype, b.data ? b.data : "", b.len, NULL, 0, NULL);
+    conn_write_simple_response(c, status, ctype, b.data ? b.data : "", b.len, NULL, 0, extra[0] ? extra : NULL);
     buf_free(&b);
     c->state = CS_LOCAL;
     conn_next_request(c);
@@ -5242,11 +5394,33 @@ static void begin_shutdown(void)
 static double   g_scale_sample_t;    /* last time we sampled the request rate */
 static uint64_t g_scale_sample_req;  /* requests count at that sample */
 static double   g_scale_above_since; /* when load first crossed the threshold (0 = below) */
-static double   g_scale_last_fire;   /* last time the hook ran */
+static double   g_scale_last_fire;   /* last run, when there is no page shared with the master */
+
+/* Claim the next scale_up run. The time of the last run lives in the page
+ * shared by every worker, so automatic and webhook runs share one cooldown. */
+static int scale_claim(void)
+{
+    double cd = g_cfg->scale_up.cooldown;
+    if (!g_shared_stats) {
+        if (g_scale_last_fire > 0 && g_now - g_scale_last_fire < cd)
+            return 0;
+        g_scale_last_fire = g_now;
+        return 1;
+    }
+    uint64_t now_ms = (uint64_t)(g_now * 1000.0);
+    uint64_t last = __atomic_load_n(&g_shared_stats[SH_SCALE_LAST], __ATOMIC_RELAXED);
+    for (;;) {
+        if (last && now_ms < last + (uint64_t)(cd * 1000.0))
+            return 0;
+        if (__atomic_compare_exchange_n(&g_shared_stats[SH_SCALE_LAST], &last, now_ms, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return 1;
+    }
+}
 
 /* Run the configured scale-up command, detached, with context in the
  * environment. Double-forks so the grandchild is reaped by init. */
-static void scale_fire(const char *reason, double rate, int conns)
+static void scale_fire(const char *reason, double rate, int conns, const char *caller)
 {
     const char *cmd = g_cfg->scale_up.exec;
     pid_t p = fork();
@@ -5261,8 +5435,11 @@ static void scale_fire(const char *reason, double rate, int conns)
         snprintf(rbuf, sizeof rbuf, "%.0f", rate);
         snprintf(cbuf, sizeof cbuf, "%d", conns);
         setenv("LIMER_SCALE_REASON", reason, 1);
-        setenv("LIMER_SCALE_RATE", rbuf, 1);
+        if (rate >= 0)
+            setenv("LIMER_SCALE_RATE", rbuf, 1);
         setenv("LIMER_SCALE_CONNS", cbuf, 1);
+        if (caller)
+            setenv("LIMER_SCALE_CALLER", caller, 1);
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
@@ -5301,11 +5478,10 @@ static void scale_check(void)
         g_scale_above_since = g_now;
     if (g_now - g_scale_above_since < sc->sustain)
         return;
-    if (g_scale_last_fire > 0 && g_now - g_scale_last_fire < sc->cooldown)
+    if (!scale_claim())
         return;
-    g_scale_last_fire = g_now;
     LOGW("scale_up: load spike (%s: %.0f req/s, %d connections), running hook", reason, rate, g_stats.active_conns);
-    scale_fire(reason, rate, g_stats.active_conns);
+    scale_fire(reason, rate, g_stats.active_conns, NULL);
 }
 
 static void tick(void)

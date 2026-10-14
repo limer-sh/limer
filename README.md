@@ -54,8 +54,9 @@ redirects plain HTTP to HTTPS.
   aside so a restart can't bring it back. Crashed workers restart from the
   last-known-good config.
 - **DoS mitigation and autoscaling hooks** — per-IP connection caps and
-  auto-bans, a `scale_up` command on load spikes, and `POST /drain` for
-  backends shutting down.
+  auto-bans, a `scale_up` command on load spikes or `POST /scale_up`, and
+  `POST /drain` for backends shutting down — webhooks behind a secret, with
+  bans for wrong secrets and floods.
 - **About 3–5× Caddy** on the HTTP/1.1 reverse-proxy path (see
   [benchmarks](USERGUIDE.md#performance)).
 

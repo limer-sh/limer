@@ -398,6 +398,15 @@ typedef struct ipguard_cfg {
     int    max_keys;           /* table cap (default 1,000,000) */
 } ipguard_cfg_t;
 
+/* admin API protection: admin <addr> { secret; rate; burst; max_failures; ban } */
+typedef struct admin_cfg {
+    char  *secret;        /* required as "Authorization: Bearer <secret>" on every endpoint but /health; NULL = open */
+    double rate;          /* webhook calls (/drain, /undrain, /scale_up) per second per caller IP; 0 = unlimited */
+    double burst;         /* bucket size for those calls */
+    int    max_failures;  /* wrong secrets and rate-limit hits before a ban; 0 = never ban */
+    double ban;           /* seconds a banned caller is refused; strikes are also counted over this window */
+} admin_cfg_t;
+
 typedef struct ipguard ipguard_t;
 enum { IPGUARD_OK = 0, IPGUARD_BANNED, IPGUARD_CONN_LIMIT, IPGUARD_RATE };
 ipguard_t *ipguard_new(int max_keys);
@@ -539,6 +548,7 @@ typedef struct config {
     int      workers;
     int      max_connections;   /* per worker, 0 = unlimited */
     char    *admin_addr;
+    admin_cfg_t admin;        /* secret, rate limit and bans for the admin API */
     char    *pidfile;
     int      log_level;
     double   grace;
@@ -665,6 +675,7 @@ enum {
     SH_OLD_ERR,     /* ...of which 5xx */
     SH_CANARY,      /* % of new connections that get the new config; 0 = no canary */
     SH_CANARY_GEN,  /* bumped by the master at the start of each probation */
+    SH_SCALE_LAST,  /* CLOCK_MONOTONIC ms of the last scale_up run, so every worker shares one cooldown */
     SH_SLOTS
 };
 void proxy_set_shared_stats(uint64_t *counters);

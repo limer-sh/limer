@@ -135,7 +135,7 @@ make TLS=0      # force a build without OpenSSL (no HTTPS, ACME or HTTP/2)
 make H2=0       # build without nghttp2
 make H3=0       # build without HTTP/3 (ngtcp2, nghttp3, GnuTLS)
 make ENCODE=0   # build without compression
-make check      # all thirteen test suites (see Testing)
+make check      # all fourteen test suites (see Testing)
 make install    # installs to /usr/local/bin
 limer version   # prints which optional features are compiled in
 ```
@@ -186,7 +186,7 @@ replaced from the environment.
 # optional global options, must come first
 {
     workers auto              # worker processes; default 1
-    admin 127.0.0.1:2019      # admin API listener; "off" to disable
+    admin 127.0.0.1:2019      # admin API listener; "off" to disable; { secret ... } (see Admin API)
     log_level info            # debug | info | warn | error
     max_connections auto      # per worker; auto = half the descriptor limit
     pidfile /run/limer.pid
@@ -516,9 +516,17 @@ The command runs through `sh -c`, detached from the server, with the trigger
 in its environment: `LIMER_SCALE_REASON` (`requests` or `connections`),
 `LIMER_SCALE_RATE` and `LIMER_SCALE_CONNS`. A hook might be as small as
 `curl -X POST https://ops.example.com/scale -d "$LIMER_SCALE_RATE"` or an
-`aws autoscaling set-desired-capacity` call. At least one threshold and an
-`exec` are required. Worker 0 does the measuring, so with `workers N` the
-rate is that worker's share of the traffic (roughly the total divided by `N`).
+`aws autoscaling set-desired-capacity` call. `exec` is required, and so is
+a threshold unless the admin API is on. Worker 0 does the measuring, so with
+`workers N` the rate is that worker's share of the traffic (roughly the
+total divided by `N`).
+
+Applications can ask for capacity too: `POST /scale_up` on the admin API
+runs the same hook with `LIMER_SCALE_REASON=webhook` and
+`LIMER_SCALE_CALLER` set to the caller's address. Automatic and webhook runs
+share one cooldown across every worker, so a burst of calls still runs the
+hook once per `cooldown`; protect the endpoint with a secret (see
+[Securing the admin API](#securing-the-admin-api)).
 
 The other half of scaling is taking a backend out of rotation gracefully: see
 the self-drain endpoints in the [Admin API](#admin-api).
@@ -732,6 +740,7 @@ Enable with `admin <addr>` in the global block.
 | `POST /upstreams/<host:port>/weight/<n>` | Change its weight at runtime. |
 | `POST /drain` | Self-drain: stop sending new requests to the upstream(s) at the caller's own address (`?port=N` narrows it to one port). |
 | `POST /undrain` | Self-undrain: put the caller's upstream(s) back into rotation. |
+| `POST /scale_up` | Run the `scale_up` hook now (`202`), or `429` with `Retry-After` inside its cooldown. |
 | `GET /overrides`, `DELETE /overrides` | List or clear the runtime overrides. |
 
 Drain and weight overrides apply to every pool using that upstream address,
@@ -748,6 +757,49 @@ reachable from the backends for this (bind `admin` to a management address
 rather than `127.0.0.1`, or run limer beside the app). Without the call, an
 active health check (`health_uri`) that starts failing achieves the same, only
 one `health_interval` later.
+
+### Securing the admin API
+
+Once backends can reach the admin listener to call the webhooks, they can
+reach every other endpoint too. Give it a secret, a webhook rate limit and
+bans:
+
+```
+{
+    admin 10.0.0.1:2019 {
+        secret {$LIMER_ADMIN_SECRET}   # at least 16 characters, e.g. `openssl rand -hex 24`
+        rate 6/m          # webhook calls per caller address (default 6/m; `off` to disable)
+        burst 3           # calls allowed back to back (default 3)
+        max_failures 5    # wrong secrets and rate-limit hits before a ban (default 5; 0 = never ban)
+        ban 15m           # ban length, and the window strikes are counted over (default 15m)
+    }
+}
+```
+
+- With a secret, every endpoint except `/health` requires
+  `Authorization: Bearer <secret>`; a request without it, or with a wrong one,
+  gets `401`. The comparison runs in constant time.
+- The webhooks (`/drain`, `/undrain`, `/scale_up`) are rate limited per
+  caller address with a token bucket; calls beyond it get `429` with
+  `Retry-After`.
+- Every wrong secret and every call over the rate is a strike. A caller that
+  collects `max_failures` strikes within `ban` is refused with `403` (and
+  `Retry-After`) for `ban`, even with the right secret, and the ban is logged.
+  Other callers are unaffected.
+- The counters live in each worker, so with `workers N` a caller can make up
+  to `N` times as many attempts before every worker has banned it.
+
+A backend then calls, for example:
+
+```
+curl -X POST -H "Authorization: Bearer $LIMER_ADMIN_SECRET" http://10.0.0.1:2019/drain
+```
+
+Keep the secret out of the Limerfile with `{$LIMER_ADMIN_SECRET}` (set it in
+the systemd unit's `Environment=` or an `EnvironmentFile=`). `limer reload`,
+`upgrade` and `stop` use signals, not the admin API, so they need no secret.
+When `admin` listens beyond loopback without a secret, limer.sh logs a
+warning at startup.
 
 ## Reloads, upgrades and rollback
 
@@ -846,7 +898,7 @@ Some things to keep in mind:
 
 ## Testing
 
-`make check` runs thirteen suites; `make check-asan` runs them on a build
+`make check` runs fourteen suites; `make check-asan` runs them on a build
 instrumented with AddressSanitizer and UndefinedBehaviorSanitizer. The
 GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 
@@ -864,6 +916,7 @@ GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 | `make rollback` | `tests/rollback_test.py`: under continuous traffic, a healthy reload is committed after its canary probation, a reload to a dead backend is reverted with only the canary share affected, and the rejected (and an invalid) Limerfile is quarantined while the good one is restored. |
 | `make binrollback` | `tests/binrollback_test.py`: builds a deliberately broken limer, then upgrades under traffic — a good binary is committed, the broken one is rolled back with the same pid, and the previous binary is restored at its install path. |
 | `make h3` | `tests/h3_test.py`: HTTP/3 with the aioquic client — local and proxied responses, forwarded headers, path and query, small and 200 KB POST bodies, a 3 MiB response, 20 concurrent streams on one connection, a bodiless 204, `Alt-Svc` on HTTPS over TCP, HTTP/3 after a reload, and a graceful stop (skips when aioquic is not installed). |
+| `make admin` | `tests/admin_test.py`: the admin secret (`401` without it, `/health` open), `POST /scale_up` and its cooldown, bans for wrong secrets and for webhook floods, ban expiry, self-drain with the secret, one hook run across two workers, and config validation (short secrets, the open-admin warning). |
 | `make status` | `tests/status_test.py`: `retry_status` sends a request to the next upstream on 404 and 503 and replays a POST body, a 404 from every upstream passes through, and `redirect_on` turns it into a redirect. |
 
 ## Security
@@ -900,7 +953,9 @@ proxy keeps serving after every attack.
   or a closed connection become a clean `502`; a bodiless response that
   still advertises a body is never pooled.
 - **Admin API isolation**: the admin endpoints exist only on the `admin`
-  listener; bind it to localhost or a management network.
+  listener; bind it to localhost or a management network, and give it a
+  `secret` when backends reach it for the webhooks. Wrong secrets and
+  webhook floods earn the caller a ban.
 - **No software fingerprint**: limer does not advertise itself. Its own
   responses carry no `Server` header by default (`server_header <value>` sets
   one, e.g. `server_header nginx` to masquerade); proxied responses pass the

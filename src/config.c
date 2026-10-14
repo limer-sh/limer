@@ -712,6 +712,7 @@ static void config_free(config_t *c)
     free(c->path);
     free(c->text);
     free(c->admin_addr);
+    free(c->admin.secret);
     free(c->pidfile);
     free(c->storage);
     free(c->acme_ca);
@@ -1632,6 +1633,27 @@ static void route_add_rewrite(route_t *r, int kind, const char *a, const char *b
 }
 
 /* "10r/s", "600r/m", "100r/h", or a plain number per second */
+/* Does a listen address ("127.0.0.1:2019", "[::1]:2019", "localhost:2019")
+ * only accept connections from this machine? ":2019" and "0.0.0.0:2019" do not. */
+static int addr_is_loopback(const char *addr)
+{
+    char host[256];
+    const char *colon = strrchr(addr, ':');
+    size_t n = colon ? (size_t)(colon - addr) : strlen(addr);
+    if (n >= sizeof host)
+        return 0;
+    memcpy(host, addr, n);
+    host[n] = 0;
+    char *h = host;
+    if (*h == '[') {
+        h++;
+        char *e = strchr(h, ']');
+        if (e)
+            *e = 0;
+    }
+    return strncmp(h, "127.", 4) == 0 || strcaseeq(h, "localhost") || strcmp(h, "::1") == 0;
+}
+
 static int parse_rate(const char *s, double *out)
 {
     char *end;
@@ -2612,6 +2634,59 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
                 return -1;
             free(cfg->admin_addr);
             cfg->admin_addr = strcaseeq(c->args[1], "off") ? NULL : xstrdup(c->args[1]);
+            /* admin <addr> { secret <s>; rate 6/m; burst 3; max_failures 5; ban 15m } */
+            admin_cfg_t *a = &cfg->admin;
+            if (c->nkids) {
+                a->rate = 6.0 / 60.0;
+                a->burst = 3;
+                a->max_failures = 5;
+                a->ban = 900;
+            }
+            for (int j = 0; j < c->nkids; j++) {
+                node_t *o = c->kids[j];
+                const char *n = o->args[0];
+                int rc = 0;
+                if (strcaseeq(n, "secret") || strcaseeq(n, "token")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0) {
+                        if (strlen(o->args[1]) < 16) {
+                            snprintf(err, errlen, "line %d: the admin secret must be at least 16 characters "
+                                     "(e.g. the output of `openssl rand -hex 24`)", o->line);
+                            rc = -1;
+                        } else {
+                            free(a->secret);
+                            a->secret = xstrdup(o->args[1]);
+                        }
+                    }
+                } else if (strcaseeq(n, "rate")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0) {
+                        if (strcaseeq(o->args[1], "off"))
+                            a->rate = 0;
+                        else if (parse_rate(o->args[1], &a->rate) < 0) {
+                            snprintf(err, errlen, "line %d: invalid admin rate '%s' (use e.g. 6/m, or off)", o->line, o->args[1]);
+                            rc = -1;
+                        }
+                    }
+                } else if (strcaseeq(n, "burst")) {
+                    int v = 0;
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0 && (rc = arg_int(o, 1, &v, 1, 10000, err, errlen)) == 0)
+                        a->burst = v;
+                } else if (strcaseeq(n, "max_failures") || strcaseeq(n, "ban_threshold")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
+                        rc = arg_int(o, 1, &a->max_failures, 0, 1000000, err, errlen);
+                } else if (strcaseeq(n, "ban") || strcaseeq(n, "ban_duration")) {
+                    if ((rc = want_args(o, 1, 1, err, errlen)) == 0)
+                        rc = arg_duration(o, 1, &a->ban, err, errlen);
+                    if (rc == 0 && a->ban <= 0) {
+                        snprintf(err, errlen, "line %d: ban must be a positive duration (use max_failures 0 to disable bans)", o->line);
+                        rc = -1;
+                    }
+                } else {
+                    snprintf(err, errlen, "line %d: unknown admin option '%s'", o->line, n);
+                    rc = -1;
+                }
+                if (rc < 0)
+                    return -1;
+            }
         } else if (strcaseeq(k, "log_level") || strcaseeq(k, "log") || strcaseeq(k, "debug")) {
             const char *lv = c->nargs > 1 ? c->args[1] : "debug";
             if (strcaseeq(lv, "debug")) cfg->log_level = LOG_DEBUG;
@@ -2852,8 +2927,7 @@ static int parse_global(config_t *cfg, node_t *d, char *err, size_t errlen)
             }
             if (!s->exec)
                 FAIL("line %d: scale_up needs an `exec <command>`", c->line);
-            if (s->requests <= 0 && s->connections <= 0)
-                FAIL("line %d: scale_up needs a `requests` or `connections` threshold", c->line);
+            /* without a threshold the hook runs only when called through POST /scale_up */
         } else if (strcaseeq(k, "http3")) {
             if (want_args(c, 0, 1, err, errlen) < 0)
                 return -1;
@@ -3089,6 +3163,14 @@ static config_t *config_parse_in(const char *text, const char *path, const char 
         config_unref(cfg);
         return NULL;
     }
+    if (cfg->scale_up.enabled && cfg->scale_up.requests <= 0 && cfg->scale_up.connections <= 0 && !cfg->admin_addr) {
+        snprintf(err, errlen, "scale_up needs a `requests` or `connections` threshold, or the admin API for POST /scale_up");
+        config_unref(cfg);
+        return NULL;
+    }
+    if (cfg->admin_addr && !cfg->admin.secret && !addr_is_loopback(cfg->admin_addr))
+        LOGW("the admin API on %s has no secret: anyone who can reach it can reload, drain and reconfigure; "
+             "add `admin %s { secret ... }`", cfg->admin_addr, cfg->admin_addr);
     if (cfg->admin_addr) {
         server_t *s = server_new();
         s->is_admin = 1;
