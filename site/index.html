@@ -419,10 +419,13 @@
     </div>
     <div class="grid">
       <div class="card fade">
-        <div class="uc-tag">Stateful sharding</div>
-        <h3>Pin a customer to one backend</h3>
-        <p>Per-tenant caches, in-memory sessions and sharded data need the same key to land on the same node — and only its keys to move when a node leaves.</p>
-        <code class="uc-code">lb_policy hash json customer.id</code>
+        <div class="uc-tag">Payment routing</div>
+        <h3>Route each payment by method, currency and country</h3>
+        <p>Cards in EUR or GBP go to the EU processor, GCash and PayPal to the wallet service, peso transfers to the APAC ledger &mdash; and each country stays on one node, so its tax rules, FX rates and fraud models stay warm.</p>
+        <code class="uc-code">match json payment.method == card
+match json currency == EUR GBP
+to eu-1:8080 eu-2:8080 eu-3:8080
+lb_policy hash json customer.country</code>
       </div>
 
       <div class="card fade">

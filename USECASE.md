@@ -4,7 +4,7 @@ limer.sh is a plain reverse proxy when you want one, and a content-aware one
 when you need it. These are shapes it fits particularly well, each with a
 runnable `Limerfile`. See [USERGUIDE.md](USERGUIDE.md) for every directive.
 
-- [Stateful sharding — pin a key to a backend](#stateful-sharding)
+- [Payment routing — by method, currency and country](#payment-routing)
 - [Content-based routing — route on the body](#content-based-routing)
 - [API edge — HTTPS, rate limits, DoS mitigation](#api-edge)
 - [gRPC load balancing](#grpc-load-balancing)
@@ -16,27 +16,75 @@ runnable `Limerfile`. See [USERGUIDE.md](USERGUIDE.md) for every directive.
 
 ---
 
-## Stateful sharding
+## Payment routing
 
-**Problem.** Your backends keep per-customer state — an in-memory cache, a
-session store, a shard of data — so every request for a given customer must
-reach the same node, and when a node leaves only *its* customers should move.
+**Problem.** Every payment hits the same `POST /pay`, but where it should go
+depends on what it is. Cards and wallets clear through different processors,
+each currency settles on the cluster that holds its ledger, and the services
+keep per-country state in memory — tax rules, FX rates, fraud models, card
+scheme tables — so a country's payments should keep landing on the node that
+already has them warm. When a node leaves, only *its* countries should move.
 
-**limer.sh.** Weighted rendezvous hashing on a field inside the request body.
+**limer.sh.** Match on the payment method and currency inside the JSON body
+to pick the pool, then hash on the customer's country or id to pick the node.
 
 ```
-api.example.com {
-    reverse_proxy node-1:8080 node-2:8080 node-3:8080 {
+pay.example.com {
+    # card payments in euro or sterling: the EU card processor,
+    # each country pinned to one node
+    route eu_cards {
+        match json payment.method == card
+        match json currency == EUR GBP
+        to 10.0.1.10:8080 10.0.1.11:8080 10.0.1.12:8080
+        lb_policy hash json customer.country
+    }
+
+    # wallets in any currency: the wallet service, each customer on one node
+    route wallets {
+        match json payment.method == gcash paypal apple_pay
+        to 10.0.2.10:8080 10.0.2.11:8080
         lb_policy hash json customer.id
+    }
+
+    # bank transfers in pesos or Singapore dollars: the APAC ledger
+    route apac_transfers {
+        match json payment.method == bank_transfer
+        match json currency == PHP SGD
+        to 10.0.3.10:8080 10.0.3.11:8080
+        lb_policy hash json customer.country
+    }
+
+    # everything else, by the visitor's country as the CDN reports it
+    reverse_proxy 10.0.9.10:8080 10.0.9.11:8080 10.0.9.12:8080 {
+        lb_policy hash header CF-IPCountry
         health_uri /healthz
     }
 }
 ```
 
-A request with `{"customer":{"id":"acme"},...}` always lands on the same node
-while it is healthy. Requests missing the field fall back to round robin. Hash
-on a header, cookie, query or form field instead with `hash header X-Tenant`,
-`hash cookie sid`, and so on.
+What happens to a few payments:
+
+| Request body | Goes to |
+|---|---|
+| `{"payment":{"method":"card"},"currency":"EUR","customer":{"country":"DE"}}` | `eu_cards`, and every German card payment to the same node |
+| `{"payment":{"method":"card"},"currency":"GBP","customer":{"country":"GB"}}` | `eu_cards`, every UK card payment to one node |
+| `{"payment":{"method":"card"},"currency":"USD","customer":{"country":"US"}}` | the default pool: USD is not listed |
+| `{"payment":{"method":"gcash"},"currency":"PHP","customer":{"id":"c42"}}` | `wallets`, customer `c42` always on the same node |
+| `{"payment":{"method":"bank_transfer"},"currency":"PHP",...}` | `apac_transfers` |
+| no `payment` fields, `CF-IPCountry: PH` | the default pool, the Philippines pinned to one node |
+
+- Matchers in a route are AND-ed and their values OR-ed, so `eu_cards` means
+  *card* **and** (*EUR* **or** *GBP*). The first matching route wins.
+- Location comes from the request: a field in the body
+  (`customer.country`) or a header your CDN or load balancer adds
+  (`CF-IPCountry` on Cloudflare, `CloudFront-Viewer-Country` on CloudFront).
+  limer.sh does no GeoIP lookup of its own.
+- Hashing is weighted rendezvous hashing: when a node leaves, only the
+  countries or customers it held move, and they come back when it recovers.
+  A request missing the hash field falls back to round robin.
+- Country is a coarse key — one large market can outweigh the rest of a pool.
+  Hash on `customer.id` where load matters more than locality, or give a big
+  country its own route (`match json customer.country == US`).
 
 ---
 
