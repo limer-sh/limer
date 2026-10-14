@@ -990,14 +990,14 @@ On a 1-vCPU VM (Linux 6.8; nginx 1.24, HAProxy 2.8.16; best of 3, 10 s runs):
 
 | Scenario | limer | nginx | HAProxy |
 |---|---|---|---|
-| GET, keep-alive, 100 connections | 25,555 req/s, p99 5.9 ms | 25,174 req/s, p99 5.4 ms | 24,557 req/s, p99 5.7 ms |
-| GET, keep-alive, 1000 connections | 19,023 req/s, p99 86 ms | 18,033 req/s, p99 84 ms | 18,056 req/s, p99 62 ms |
-| POST 120 B JSON, 100 connections | 24,451 req/s | 24,113 req/s | 24,521 req/s |
-| GET, new connection per request | 10,035 req/s | 9,991 req/s | 10,427 req/s |
+| GET, keep-alive, 100 connections | 25,402 req/s, p99 6.0 ms | 25,456 req/s, p99 5.3 ms | 25,131 req/s, p99 5.8 ms |
+| GET, keep-alive, 1000 connections | 18,553 req/s, p99 97 ms | 17,531 req/s, p99 86 ms | 17,942 req/s, p99 67 ms |
+| POST 120 B JSON, 100 connections | 24,449 req/s, p99 6.2 ms | 24,240 req/s, p99 6.3 ms | 24,901 req/s, p99 5.7 ms |
+| GET, new connection per request | 10,256 req/s, p99 12.4 ms | 10,064 req/s, p99 13.2 ms | 10,550 req/s, p99 11.8 ms |
 
-The three are level: limer is a few percent ahead on keep-alive GETs, HAProxy
-has the best tail latency at 1000 connections and the fastest fresh-connection
-path, and none of the gaps exceeds about 5% in throughput. On one core the load
+The three are level: limer is ahead at 1000 connections, nginx by a hair on
+keep-alive GETs, HAProxy on POSTs, tail latency at 1000 connections and the fresh-connection
+path, and none of the gaps exceeds about 6% in throughput. On one core the load
 generator and the backends compete with the proxy for the CPU, so this
 measures relative efficiency, not the ceiling; repeat it on a multi-core
 machine with `workers` / `worker_processes` / `nbthread` raised to compare

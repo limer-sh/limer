@@ -205,6 +205,9 @@
   .limer-v{color:var(--lime);font-weight:600}
   .caddy-v{color:var(--muted)}
   .ratio{font-family:var(--mono);color:var(--lime-soft);font-weight:600}
+  .perf-sub{margin:56px 0 8px;font-size:1.25rem;letter-spacing:-.01em}
+  .perf-lead{color:var(--muted);margin:0 0 18px;max-width:720px}
+  td .lat{display:block;color:var(--faint);font-size:12px;font-weight:400;margin-top:2px}
 
   /* ---- quickstart ---- */
   .steps{display:grid;grid-template-columns:1fr 1fr;gap:28px;align-items:start}
@@ -471,7 +474,34 @@ encode gzip zstd br</code>
         </tbody>
       </table>
     </div>
-    <p class="perf-note">~5 KB per active connection · one worker can hold ~500,000 connections in ~2.5 GB · reproduce it all with <span style="color:var(--lime-soft)">bench/run.sh</span></p>
+
+    <h3 class="perf-sub">Head to head with nginx and HAProxy</h3>
+    <p class="perf-lead">One worker each on a 1-vCPU VM, keep-alive to the same two backends, wrk for 10 s, best of 3. The three are level: no gap is larger than about 6%.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Scenario</th><th>limer.sh</th><th>nginx 1.24</th><th>HAProxy 2.8</th></tr></thead>
+        <tbody>
+          <tr><td>GET · keep-alive · 100 conns</td><td class="n limer-v">25,402 req/s<span class="lat">p99 6.0 ms</span></td><td class="n caddy-v">25,456 req/s<span class="lat">p99 5.3 ms</span></td><td class="n caddy-v">25,131 req/s<span class="lat">p99 5.8 ms</span></td></tr>
+          <tr><td>GET · keep-alive · 1000 conns</td><td class="n limer-v">18,553 req/s<span class="lat">p99 97 ms</span></td><td class="n caddy-v">17,531 req/s<span class="lat">p99 86 ms</span></td><td class="n caddy-v">17,942 req/s<span class="lat">p99 67 ms</span></td></tr>
+          <tr><td>POST 120 B JSON · 100 conns</td><td class="n limer-v">24,449 req/s<span class="lat">p99 6.2 ms</span></td><td class="n caddy-v">24,240 req/s<span class="lat">p99 6.3 ms</span></td><td class="n caddy-v">24,901 req/s<span class="lat">p99 5.7 ms</span></td></tr>
+          <tr><td>New connection per request</td><td class="n limer-v">10,256 req/s<span class="lat">p99 12.4 ms</span></td><td class="n caddy-v">10,064 req/s<span class="lat">p99 13.2 ms</span></td><td class="n caddy-v">10,550 req/s<span class="lat">p99 11.8 ms</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 class="perf-sub">HTTP/3 vs HTTP/2 vs HTTP/1.1</h3>
+    <p class="perf-lead">One limer.sh worker over TLS, driven by h2load on the same 1-vCPU VM, 100,000 requests per run, best of 3, zero failures. With several requests in flight per connection &mdash; how browsers load pages &mdash; HTTP/3 is the fastest.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Connections × in flight</th><th>HTTP/1.1 + TLS</th><th>HTTP/2</th><th>HTTP/3</th></tr></thead>
+        <tbody>
+          <tr><td>10 × 10 (multiplexed)</td><td class="n caddy-v">&mdash;</td><td class="n caddy-v">17,470 req/s<span class="lat">p99 8.9 ms</span></td><td class="n limer-v">25,209 req/s<span class="lat">p99 6.8 ms</span></td></tr>
+          <tr><td>10 × 1</td><td class="n caddy-v">20,500 req/s<span class="lat">p99 0.8 ms</span></td><td class="n caddy-v">14,399 req/s<span class="lat">p99 1.0 ms</span></td><td class="n limer-v">10,753 req/s<span class="lat">p99 1.6 ms</span></td></tr>
+          <tr><td>100 × 1</td><td class="n caddy-v">20,101 req/s<span class="lat">p99 7.6 ms</span></td><td class="n caddy-v">13,986 req/s<span class="lat">p99 9.7 ms</span></td><td class="n limer-v">8,797 req/s<span class="lat">p99 16 ms</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="perf-note">~5 KB per active connection · one worker can hold ~500,000 connections in ~2.5 GB · reproduce it all with <span style="color:var(--lime-soft)">bench/run.sh</span>, <span style="color:var(--lime-soft)">bench/compare.sh</span> and <span style="color:var(--lime-soft)">bench/protocols.sh</span></p>
   </div>
 </section>
 
