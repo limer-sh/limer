@@ -336,6 +336,26 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
     if (shared == MAP_FAILED)
         shared = NULL;
     proxy_set_shared_stats(shared);
+
+    /* Self-registration table, shared with every worker across fork. Created
+     * before the workers start and reloaded from <storage>/registry.json so a
+     * restart or an in-place upgrade (which re-mmaps a fresh region) comes up
+     * with the last known members; stale ones time out, live ones re-heartbeat. */
+    registry_t *registry = mmap(NULL, registry_bytes(), PROT_READ | PROT_WRITE,
+                                MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (registry == MAP_FAILED) {
+        registry = NULL;
+    } else {
+        registry_reset(registry);
+        if (cfg->storage) {
+            char rpath[1200];
+            snprintf(rpath, sizeof rpath, "%s/registry.json", cfg->storage);
+            int n = registry_load(registry, rpath, now_mono());
+            if (n > 0)
+                LOGI("discover: restored %d registered member%s from %s", n, n == 1 ? "" : "s", rpath);
+        }
+    }
+    proxy_set_registry(registry);
     config_t *prev_cfg = NULL;              /* last-known-good config while a reload is on probation */
     int probation = 0;
     double probation_until = 0;
@@ -733,6 +753,8 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
         config_unref(prev_cfg);
     if (shared)
         munmap(shared, SH_SLOTS * sizeof(uint64_t));
+    if (registry)
+        munmap(registry, registry_bytes());
     free(pids);
     free(spawned);
     if (pidfile && read_pidfile(pidfile) == getpid())

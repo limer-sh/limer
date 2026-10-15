@@ -278,6 +278,7 @@ typedef struct upstream {
 
     /* runtime state */
     int   drained;            /* runtime: take no new requests */
+    double admit_at;          /* not eligible until now >= this (discovery settle; 0 = immediately) */
     char  sticky_id[20];      /* value used in sticky cookies */
     int   active;             /* in-flight requests */
     uint64_t requests;
@@ -335,9 +336,13 @@ typedef struct pool {
     struct pool *mirror;      /* shadow pool: a copy of the request is sent here, response discarded */
     double mirror_sample;     /* 0..100 percent of requests to mirror (default 100) */
     /* dynamic upstreams */
-    int   dyn_kind;           /* 0 static, 1 A/AAAA lookup, 2 SRV lookup */
+    int   dyn_kind;           /* 0 static, 1 A/AAAA lookup, 2 SRV lookup, 3 registry (self-registration) */
     char *dyn_name;
     int   dyn_port;           /* for A lookups */
+    char **discover_allow;    /* `discover x { allow <cidr...> }`: ranges a registrant may join from */
+    int   ndiscover_allow;
+    double settle;            /* a discovered member must be present+healthy this long before it takes traffic */
+    uint64_t reg_gen_seen;    /* runtime: last registry generation this pool was rebuilt at */
     double refresh;           /* re-resolution interval, 0 = never */
     double dyn_next;          /* runtime: next lookup */
     int   dyn_inflight;       /* runtime: a lookup is queued */
@@ -589,6 +594,47 @@ void pool_recompute(pool_t *p);
 int  pool_add_runtime(pool_t *p, upstream_t *u);        /* 0 ok, -1 full */
 void pool_retire_upstream(pool_t *p, int idx);          /* move ups[idx] to the retired list */
 void pool_reap_retired(pool_t *p);                      /* free retired upstreams nothing uses */
+
+/* ------------------------------------------------------------------ */
+/* registry.c: self-registration service discovery                     */
+/* ------------------------------------------------------------------ */
+/* `discover <name>` pools draw members from this shared table. Backends add and
+ * heartbeat themselves via POST /register and leave via /deregister; an entry
+ * whose heartbeat lapses is evicted on TTL. The table lives in a MAP_SHARED
+ * region the master creates before forking, so every worker shares one set. */
+enum { DYN_STATIC = 0, DYN_DNS_A = 1, DYN_DNS_SRV = 2, DYN_REGISTRY = 3 };
+
+#define REG_MAX_SLOTS  1024
+#define REG_MAX_PER_IP 64     /* entries one source address may hold (abuse bound) */
+#define REG_POOL_LEN   64
+#define REG_ADDR_LEN   72
+
+typedef struct reg_slot {
+    uint32_t state;               /* atomic: 0 free, 1 live */
+    char     pool[REG_POOL_LEN];  /* service name a `discover` pool matches */
+    char     addr[REG_ADDR_LEN];  /* "ip:port" (or "[v6]:port"), for compare/logging */
+    struct sockaddr_storage sa;   /* resolved address, port included */
+    uint32_t salen;
+    int32_t  weight;
+    double   expires;             /* CLOCK_MONOTONIC seconds; 0 means never */
+} reg_slot_t;
+
+typedef struct registry {
+    uint64_t magic;
+    uint64_t gen;                 /* atomic: bumped when membership changes, not on a heartbeat */
+    reg_slot_t slots[REG_MAX_SLOTS];
+} registry_t;
+
+size_t   registry_bytes(void);
+void     registry_reset(registry_t *r);
+int      registry_put(registry_t *r, const char *pool, const struct sockaddr *sa, socklen_t salen, int weight, double expires);
+int      registry_del(registry_t *r, const char *pool, const char *ip, int port);
+int      registry_evict(registry_t *r, double now);
+uint64_t registry_gen(const registry_t *r);
+int      registry_live(const registry_t *r, const char *pool, double now);
+int      registry_save(const registry_t *r, const char *path, double now);
+int      registry_load(registry_t *r, const char *path, double now);
+void     proxy_set_registry(registry_t *r);
 
 /* resolver.c: DNS lookups on a helper thread */
 #define RESOLVE_MAX_RESULTS 64

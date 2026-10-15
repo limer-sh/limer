@@ -41,6 +41,8 @@ int upstream_healthy(const upstream_t *u, double now)
 {
     if (u->drained)
         return 0;
+    if (u->admit_at > now)   /* a discovered member settling before it takes traffic */
+        return 0;
     if (u->hc_status < 0)
         return 0;
     if (u->fail_until > now)

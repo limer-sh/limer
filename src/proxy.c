@@ -61,6 +61,7 @@ static int g_epfd = -1;
 static config_t *g_cfg;
 static ipguard_t *g_ipguard;    /* per-source-IP admission control (DoS mitigation) */
 static uint64_t *g_shared_stats; /* page shared with the master (SH_* slots) */
+static registry_t *g_registry;   /* self-registration table, shared with the master and all workers */
 static config_t *g_canary_old;   /* known-good config still served while a new one is on probation */
 static uint64_t g_canary_gen;    /* SH_CANARY_GEN of the probation g_canary_old belongs to */
 
@@ -4133,10 +4134,16 @@ static void hc_finish(hc_conn_t *h, int ok, const char *detail)
     u->hc_next = g_now + p->health_interval;
     snprintf(u->hc_detail, sizeof u->hc_detail, "%s", detail);
     if (prev != u->hc_status) {
-        if (ok)
-            LOGI("health check: upstream %s is up (%s)", u->hostport, detail);
-        else
+        if (ok) {
+            /* settle a discovered member after it becomes healthy, so a flapping node does
+             * not keep moving hashed keys on and off itself (p->settle is 0 for other pools) */
+            if (p->settle > 0 && u->admit_at < g_now + p->settle)
+                u->admit_at = g_now + p->settle;
+            LOGI("health check: upstream %s is up (%s)%s", u->hostport, detail,
+                 u->admit_at > g_now ? ", settling before it takes traffic" : "");
+        } else {
             LOGW("health check: upstream %s is DOWN (%s)", u->hostport, detail);
+        }
     }
     hc_close(h);
 }
@@ -4284,30 +4291,15 @@ static void upstream_drop_idle(upstream_t *u)
 
 static const char *dyn_kind_name(int k) { return k == 2 ? "srv" : "a"; }
 
-/* A lookup for a whole pool finished: add new upstreams, retire vanished ones. */
-static void pool_apply_lookup(pool_t *p, resolve_job_t *job)
+/* Reconcile a pool's dynamic members against a freshly built set `fresh`: retire
+ * dynamic upstreams no longer listed, add new ones, update weights. Static
+ * upstreams (from `to`/`reverse_proxy <addr>`) are never touched. `fresh` is
+ * consumed (each element is added or freed). For discovery, `settle` delays a new
+ * member from taking traffic and `health_gate` holds it out until a health check
+ * passes; both are 0 for DNS. */
+static void pool_sync_members(pool_t *p, upstream_t **fresh, int nfresh, double settle, int health_gate)
 {
-    if (job->nres == 0) {
-        LOGW("pool %s: dynamic %s %s: %s (keeping %d upstream%s)", p->name, dyn_kind_name(p->dyn_kind), p->dyn_name,
-             job->err[0] ? job->err : "no results", p->nups, p->nups == 1 ? "" : "s");
-        return; /* a failed lookup never empties a pool */
-    }
-    /* build the new set as upstream objects so hostports compare one way */
-    upstream_t *fresh[RESOLVE_MAX_RESULTS];
-    int nfresh = 0;
-    for (int i = 0; i < job->nres; i++) {
-        resolve_result_t *r = &job->res[i];
-        upstream_t *u = upstream_new_resolved(p, r->target, (struct sockaddr *)&r->addr, r->len, r->port, r->weight);
-        int dup = 0;
-        for (int k = 0; k < nfresh && !dup; k++)
-            dup = strcmp(fresh[k]->hostport, u->hostport) == 0;
-        if (dup)
-            upstream_free(u);
-        else
-            fresh[nfresh++] = u;
-    }
     int added = 0, removed = 0, changed = 0;
-    /* retire dynamic upstreams that are no longer listed */
     for (int i = 0; i < p->nups;) {
         upstream_t *u = p->ups[i];
         int keep = !u->dynamic;
@@ -4330,7 +4322,6 @@ static void pool_apply_lookup(pool_t *p, resolve_job_t *job)
         pool_retire_upstream(p, i);
         removed++;
     }
-    /* add the ones we do not have yet */
     for (int k = 0; k < nfresh; k++) {
         upstream_t *u = fresh[k];
         int have = 0;
@@ -4346,13 +4337,81 @@ static void pool_apply_lookup(pool_t *p, resolve_job_t *job)
             upstream_free(u);
             continue;
         }
-        LOGI("pool %s: upstream %s added (weight %d)", p->name, u->hostport, u->weight);
+        if (settle > 0)
+            u->admit_at = g_now + settle;
+        if (health_gate)
+            u->hc_status = -1;   /* hold out of rotation until the first health check passes */
+        LOGI("pool %s: upstream %s added (weight %d)%s", p->name, u->hostport, u->weight,
+             health_gate ? ", pending health check" : (settle > 0 ? ", settling" : ""));
         added++;
     }
     if (changed)
         pool_recompute(p);
     if (added || removed)
         LOGI("pool %s: now %d upstream%s", p->name, p->nups, p->nups == 1 ? "" : "s");
+}
+
+/* Rebuild a `discover` pool from the registry's current live members. Never
+ * empties the pool: if the registry has no members for it, the last known set is
+ * kept (unhealthy ones stop getting traffic via their health check regardless). */
+static void pool_apply_registry(pool_t *p)
+{
+    if (!g_registry || p->dyn_kind != DYN_REGISTRY)
+        return;
+    upstream_t *fresh[REG_MAX_SLOTS];
+    int nfresh = 0;
+    for (int i = 0; i < REG_MAX_SLOTS && nfresh < REG_MAX_SLOTS; i++) {
+        reg_slot_t *sl = &g_registry->slots[i];
+        if (__atomic_load_n(&sl->state, __ATOMIC_ACQUIRE) != 1)
+            continue;
+        if (strcmp(sl->pool, p->dyn_name) != 0)
+            continue;
+        if (sl->expires > 0 && sl->expires < g_now)
+            continue;
+        upstream_t *u = upstream_new_resolved(p, sl->addr, (struct sockaddr *)&sl->sa, sl->salen,
+                                              sl->sa.ss_family == AF_INET6
+                                                  ? ntohs(((struct sockaddr_in6 *)&sl->sa)->sin6_port)
+                                                  : ntohs(((struct sockaddr_in *)&sl->sa)->sin_port),
+                                              sl->weight);
+        int dup = 0;
+        for (int k = 0; k < nfresh && !dup; k++)
+            dup = strcmp(fresh[k]->hostport, u->hostport) == 0;
+        if (dup)
+            upstream_free(u);
+        else
+            fresh[nfresh++] = u;
+    }
+    if (nfresh == 0 && p->nups > 0) {
+        for (int k = 0; k < nfresh; k++)
+            upstream_free(fresh[k]);
+        return;   /* never empty a pool because discovery is momentarily empty */
+    }
+    pool_sync_members(p, fresh, nfresh, p->settle, p->health_uri != NULL);
+}
+
+/* A lookup for a whole pool finished: add new upstreams, retire vanished ones. */
+static void pool_apply_lookup(pool_t *p, resolve_job_t *job)
+{
+    if (job->nres == 0) {
+        LOGW("pool %s: dynamic %s %s: %s (keeping %d upstream%s)", p->name, dyn_kind_name(p->dyn_kind), p->dyn_name,
+             job->err[0] ? job->err : "no results", p->nups, p->nups == 1 ? "" : "s");
+        return; /* a failed lookup never empties a pool */
+    }
+    /* build the new set as upstream objects so hostports compare one way */
+    upstream_t *fresh[RESOLVE_MAX_RESULTS];
+    int nfresh = 0;
+    for (int i = 0; i < job->nres; i++) {
+        resolve_result_t *r = &job->res[i];
+        upstream_t *u = upstream_new_resolved(p, r->target, (struct sockaddr *)&r->addr, r->len, r->port, r->weight);
+        int dup = 0;
+        for (int k = 0; k < nfresh && !dup; k++)
+            dup = strcmp(fresh[k]->hostport, u->hostport) == 0;
+        if (dup)
+            upstream_free(u);
+        else
+            fresh[nfresh++] = u;
+    }
+    pool_sync_members(p, fresh, nfresh, 0, 0);
 }
 
 /* A named static upstream was re-resolved: switch to a new address if it moved. */
@@ -4445,6 +4504,14 @@ static void resolve_tick(void)
             pool_t *p = s->routes[r]->pool;
             if (!p)
                 continue;
+            if (p->dyn_kind == DYN_REGISTRY) {
+                uint64_t gen = registry_gen(g_registry);
+                if (gen != p->reg_gen_seen) {
+                    p->reg_gen_seen = gen;
+                    pool_apply_registry(p);
+                }
+                continue;   /* a discover pool is filled from the registry, not DNS */
+            }
             if (p->dyn_kind && !p->dyn_inflight && p->refresh > 0 && g_now >= p->dyn_next)
                 resolve_submit_pool(p, g_cfg);
             if (p->refresh > 0) {
@@ -5080,8 +5147,11 @@ static int admin_guard(conn_t *c, const char *path)
     const admin_cfg_t *a = &g_cfg->admin;
     if (strcmp(path, "/") == 0 || strcmp(path, "/health") == 0 || strcmp(path, "/healthz") == 0)
         return 1;
-    int webhook = strcmp(path, "/drain") == 0 || strcmp(path, "/undrain") == 0 || strcmp(path, "/scale_up") == 0;
-    if (!a->secret && !(webhook && a->rate > 0))
+    /* /register and /deregister need the secret and are banned for wrong ones, but are not
+     * rate-limited: a backend heartbeats frequently by design, and a registration only refreshes
+     * its own slot (abuse is bounded by the allow-list and the per-IP registry cap instead). */
+    int rate_limited = strcmp(path, "/drain") == 0 || strcmp(path, "/undrain") == 0 || strcmp(path, "/scale_up") == 0;
+    if (!a->secret && !(rate_limited && a->rate > 0))
         return 1;
     admin_peer_t *p = admin_peer(c->peer_ip);
     char extra[128];
@@ -5108,7 +5178,7 @@ static int admin_guard(conn_t *c, const char *path)
             return 0;
         }
     }
-    if (webhook && a->rate > 0) {
+    if (rate_limited && a->rate > 0) {
         p->tokens += (g_now - p->refilled) * a->rate;
         if (p->tokens > a->burst)
             p->tokens = a->burst;
@@ -5126,6 +5196,32 @@ static int admin_guard(conn_t *c, const char *path)
 
 static int  scale_claim(void);
 static void scale_fire(const char *reason, double rate, int conns, const char *caller);
+
+/* Copy the value of `key` from a URL query string ("a=1&b=2") into out. */
+static int admin_qparam(const char *query, const char *key, char *out, size_t outlen)
+{
+    out[0] = 0;
+    if (!query)
+        return 0;
+    size_t kl = strlen(key);
+    for (const char *p = query; *p;) {
+        const char *amp = strchr(p, '&');
+        const char *end = amp ? amp : p + strlen(p);
+        if ((size_t)(end - p) > kl + 1 && strncmp(p, key, kl) == 0 && p[kl] == '=') {
+            const char *v = p + kl + 1;
+            size_t n = (size_t)(end - v);
+            if (n >= outlen)
+                n = outlen - 1;
+            memcpy(out, v, n);
+            out[n] = 0;
+            return 1;
+        }
+        if (!amp)
+            break;
+        p = amp + 1;
+    }
+    return 0;
+}
 
 static void admin_handle(conn_t *c)
 {
@@ -5298,9 +5394,102 @@ static void admin_handle(conn_t *c)
             status = 202;
             buf_puts(&b, "{\"status\":\"scale_up started\"}\n");
         }
+    } else if (strcmp(path, "/register") == 0 || strcmp(path, "/deregister") == 0) {
+        /* Self-registration: a backend joins (or leaves) a `discover` pool. The
+         * address is the caller's own (c->peer) plus the port it gives, so a caller
+         * can only register itself; the pool's `allow` CIDRs scope who may join. */
+        int reg = strcmp(path, "/register") == 0;
+        char svc[REG_POOL_LEN] = "", sport[16] = "", sttl[16] = "", sweight[16] = "";
+        admin_qparam(c->req.query, "service", svc, sizeof svc);
+        if (!svc[0])
+            admin_qparam(c->req.query, "pool", svc, sizeof svc);
+        admin_qparam(c->req.query, "port", sport, sizeof sport);
+        admin_qparam(c->req.query, "ttl", sttl, sizeof sttl);
+        admin_qparam(c->req.query, "weight", sweight, sizeof sweight);
+        int port = atoi(sport);
+        if (strcmp(c->req.method, "POST") != 0) {
+            status = 405;
+            buf_puts(&b, "{\"error\":\"use POST\"}\n");
+        } else if (!svc[0] || port < 1 || port > 65535) {
+            status = 400;
+            buf_puts(&b, "{\"error\":\"need ?service=<pool>&port=<n> (and for /register, optional ttl, weight)\"}\n");
+        } else if (!g_registry) {
+            status = 503;
+            buf_puts(&b, "{\"error\":\"service discovery is not available in this build\"}\n");
+        } else {
+            /* the pool must exist as a `discover` pool, and the caller must be allowed into it */
+            int found = 0, allowed = 1;
+            for (int i = 0; i < g_cfg->nservers && !found; i++) {
+                server_t *s = g_cfg->servers[i];
+                for (int r = 0; r < s->nroutes && !found; r++) {
+                    pool_t *p = s->routes[r]->pool;
+                    if (!p || p->dyn_kind != DYN_REGISTRY || strcmp(p->dyn_name, svc) != 0)
+                        continue;
+                    found = 1;
+                    if (p->ndiscover_allow) {
+                        allowed = 0;
+                        for (int a = 0; a < p->ndiscover_allow && !allowed; a++)
+                            if (cidr_match(p->discover_allow[a], (struct sockaddr *)&c->peer))
+                                allowed = 1;
+                    }
+                }
+            }
+            if (!found) {
+                status = 404;
+                buf_printf(&b, "{\"error\":\"no discover pool named '%s'\"}\n", svc);
+            } else if (!allowed) {
+                status = 403;
+                buf_printf(&b, "{\"error\":\"%s is not allowed to register for '%s'\"}\n", c->peer_ip, svc);
+            } else {
+                struct sockaddr_storage ss = c->peer;
+                socklen_t sl = ss.ss_family == AF_INET6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+                if (ss.ss_family == AF_INET6)
+                    ((struct sockaddr_in6 *)&ss)->sin6_port = htons((uint16_t)port);
+                else
+                    ((struct sockaddr_in *)&ss)->sin_port = htons((uint16_t)port);
+                if (reg) {
+                    int ttl = sttl[0] ? atoi(sttl) : 30;
+                    if (ttl < 1) ttl = 1;
+                    if (ttl > 3600) ttl = 3600;
+                    int weight = sweight[0] ? atoi(sweight) : 1;
+                    int rc = registry_put(g_registry, svc, (struct sockaddr *)&ss, sl, weight, g_now + ttl);
+                    if (rc < 0) {
+                        status = 503;
+                        buf_puts(&b, "{\"error\":\"registry is full\"}\n");
+                    } else {
+                        if (rc == 1)
+                            LOGI("discover: %s:%d registered in pool %s (ttl %ds)", c->peer_ip, port, svc, ttl);
+                        buf_printf(&b, "{\"status\":\"registered\",\"service\":\"%s\",\"address\":\"%s:%d\",\"ttl\":%d}\n",
+                                   svc, c->peer_ip, port, ttl);
+                    }
+                } else {
+                    int n = registry_del(g_registry, svc, c->peer_ip, port);
+                    if (n)
+                        LOGI("discover: %s:%d left pool %s", c->peer_ip, port, svc);
+                    buf_printf(&b, "{\"status\":\"deregistered\",\"service\":\"%s\",\"removed\":%d}\n", svc, n);
+                }
+            }
+        }
+    } else if (strcmp(path, "/registry") == 0) {
+        if (!g_registry) {
+            buf_puts(&b, "{\"members\":[]}\n");
+        } else {
+            buf_puts(&b, "{\"members\":[");
+            int first = 1;
+            for (int i = 0; i < REG_MAX_SLOTS; i++) {
+                reg_slot_t *sl = &g_registry->slots[i];
+                if (__atomic_load_n(&sl->state, __ATOMIC_ACQUIRE) != 1)
+                    continue;
+                double ttl = sl->expires > 0 ? sl->expires - g_now : -1;
+                buf_printf(&b, "%s{\"service\":\"%s\",\"address\":\"%s\",\"weight\":%d,\"expires_in\":%.0f}",
+                           first ? "" : ",", sl->pool, sl->addr, sl->weight, ttl < 0 ? 0 : ttl);
+                first = 0;
+            }
+            buf_puts(&b, "]}\n");
+        }
     } else {
         status = 404;
-        buf_puts(&b, "{\"error\":\"not found\",\"endpoints\":[\"/health\",\"/upstreams\",\"/metrics\",\"/config\",\"/overrides\",\"/reload (POST)\",\"/drain|/undrain (POST, self)\",\"/scale_up (POST)\",\"/upstreams/<host:port>/drain|undrain|weight/<n> (POST)\"]}\n");
+        buf_puts(&b, "{\"error\":\"not found\",\"endpoints\":[\"/health\",\"/upstreams\",\"/metrics\",\"/config\",\"/overrides\",\"/reload (POST)\",\"/drain|/undrain (POST, self)\",\"/scale_up (POST)\",\"/register|/deregister (POST, self)\",\"/registry\",\"/upstreams/<host:port>/drain|undrain|weight/<n> (POST)\"]}\n");
     }
     c->route = NULL;
     conn_write_simple_response(c, status, ctype, b.data ? b.data : "", b.len, NULL, 0, extra[0] ? extra : NULL);
@@ -5618,6 +5807,24 @@ static void tick(void)
     if (!g_shutting_down)
         scale_check();
 
+    /* worker 0 owns registry maintenance: evict members whose heartbeat lapsed, and
+     * persist the set (debounced) so a restart or upgrade starts populated. The
+     * eviction bumps the generation, so every worker rebuilds its discover pools. */
+    if (g_registry && g_worker_id == 0 && !g_shutting_down) {
+        static double reg_next_check, reg_last_saved_gen = (double)-1;
+        if (g_now >= reg_next_check) {
+            reg_next_check = g_now + 1.0;
+            registry_evict(g_registry, g_now);
+            uint64_t gen = registry_gen(g_registry);
+            if (g_cfg && g_cfg->storage && (double)gen != reg_last_saved_gen) {
+                char path[1200];
+                snprintf(path, sizeof path, "%s/registry.json", g_cfg->storage);
+                if (registry_save(g_registry, path, g_now) == 0)
+                    reg_last_saved_gen = (double)gen;
+            }
+        }
+    }
+
     /* the master ended the canary (committed): every new connection uses the new config */
     if (g_canary_old && sh_get(SH_CANARY) == 0) {
         retire_config(g_canary_old);
@@ -5700,6 +5907,7 @@ static void on_sighup(int sig)  { (void)sig; g_reload_flag = 1; }
 static void on_sigterm(int sig) { (void)sig; g_shutdown_flag = 1; }
 
 void proxy_set_shared_stats(uint64_t *counters) { g_shared_stats = counters; }
+void proxy_set_registry(registry_t *r) { g_registry = r; }
 void proxy_request_reload(void)   { g_reload_flag = 1; }
 void proxy_request_shutdown(void) { g_shutdown_flag = 1; }
 

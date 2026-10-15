@@ -59,6 +59,9 @@ HTTPS with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
 - **Streaming request bodies**: large uploads and bidirectional gRPC are
   forwarded as they arrive, with backpressure both ways, unless a matcher,
   hash key or placeholder needs to read the body (then it is buffered).
+- **Service discovery**: backends self-register into a pool over the admin
+  API (`discover <name>` + `POST /register`), health- and settle-gated, with
+  no external registry; or pull from DNS.
 - **Dynamic upstreams**: a pool can come from DNS, `dynamic a <name> <port>`
   (one upstream per A/AAAA record) or `dynamic srv <name>` (SRV targets with
   their ports and weights), re-resolved on an interval; named upstreams are
@@ -135,7 +138,7 @@ make TLS=0      # force a build without OpenSSL (no HTTPS, ACME or HTTP/2)
 make H2=0       # build without nghttp2
 make H3=0       # build without HTTP/3 (ngtcp2, nghttp3, GnuTLS)
 make ENCODE=0   # build without compression
-make check      # all fourteen test suites (see Testing)
+make check      # all fifteen test suites (see Testing)
 make install    # installs to /usr/local/bin
 limer version   # prints which optional features are compiled in
 ```
@@ -354,6 +357,7 @@ Path and host use glob matching with `*`. Regexes are POSIX extended.
 | `tls_insecure_skip_verify`, `tls_server_name <name>`, `tls_trusted_ca_certs <pem>` | | Upstream TLS verification. |
 | `tls_client_auth <cert.pem> <key.pem>` | | Present a client certificate to the upstream. |
 | `dynamic a <name> <port>` / `dynamic srv <name>` | | Populate the pool from DNS (see Dynamic upstreams). |
+| `discover <name> [{ allow <cidr...>; settle <dur> }]` | | Fill the pool from self-registered backends (POST /register); see Service discovery. |
 | `refresh <dur>` | `30s` | Re-resolution interval for dynamic and named upstreams (`off` to pin). |
 | `mirror <upstreams...> [{ sample <pct> }]` | | Shadow a copy of each request to another pool; the reply is discarded. |
 | `transport http { keepalive_idle_conns N; tls; versions h2|h2c|1.1; ... }` | | Caddy-compatible spelling of the above; `versions h2c` or `h2` makes every upstream in the pool HTTP/2. |
@@ -599,6 +603,76 @@ specific servers (plain DNS, IPv4, optional `:port`); without it the system
 resolver and `/etc/hosts` apply. Runtime drain/weight overrides and reloads
 carry across re-resolution.
 
+### Service discovery (self-registration)
+
+Where there is no DNS to point `dynamic` at, backends can register themselves
+with limer.sh over the admin API, Eureka-style — no external registry.
+
+```
+{
+    admin 10.0.0.1:2019 {
+        secret {$LIMER_ADMIN_SECRET}
+    }
+}
+api.example.com {
+    reverse_proxy {
+        discover orders {
+            allow 10.0.0.0/8          # only these ranges may register
+            settle 10s                # present + healthy this long before taking traffic
+        }
+        health_uri /healthz           # admit a new member only after this passes
+        lb_policy hash json customer.id
+    }
+}
+```
+
+A backend joins by POSTing to the admin API and keeps its place by repeating
+the call (a heartbeat); it leaves with `/deregister`, and a backend whose
+heartbeat lapses is evicted when its TTL passes:
+
+```
+# register / heartbeat (every ttl/3 or so); the address is the caller's own
+curl -X POST -H "Authorization: Bearer $LIMER_ADMIN_SECRET" \
+     "http://10.0.0.1:2019/register?service=orders&port=8080&ttl=15"
+# leave on graceful shutdown
+curl -X POST -H "Authorization: Bearer $LIMER_ADMIN_SECRET" \
+     "http://10.0.0.1:2019/deregister?service=orders&port=8080"
+```
+
+How it behaves, and why:
+
+- **It fills a pool, never creates routes.** `discover <name>` only adds and
+  removes members of a pool you defined; it never invents hostnames or routes,
+  and never triggers certificate issuance for a name nobody reviewed.
+- **Registration is scoped.** A registrant joins only with its own source
+  address (`port` is the port it serves on), behind the admin `secret`, and
+  only from the pool's `allow` ranges. Registering for a pool that is not a
+  `discover <name>` is refused.
+- **A new member is admitted only after it is healthy.** With `health_uri`
+  set, a just-registered backend is held out of rotation until its first
+  active health check passes.
+- **`settle` steadies hashing.** Rendezvous hashing only moves the keys a
+  joining node takes over; a flapping node would move them back and forth.
+  A member must be present and healthy for `settle` before it joins the ring,
+  and it re-settles after any health flap.
+- **Discovery never empties a pool.** If every member deregisters or lapses at
+  once, the last known set is kept (unhealthy ones stop getting traffic via
+  their health check regardless) — a momentary discovery gap never causes an
+  outage.
+- **It survives restarts.** The live set is held in memory shared by every
+  worker and persisted to `<storage>/registry.json`, so a restart or a
+  `limer upgrade` comes up populated; stale members time out, live ones
+  re-heartbeat. `GET /registry` lists the current members.
+
+Registration is bounded without rate-limiting the heartbeats: at most
+`REG_MAX_PER_IP` (64) entries per source address and 1024 in all. Keep
+orchestrator integrations out of the server: a small external program — in
+any language — that turns Docker, Kubernetes or Consul events into `/register`
+and `/deregister` calls is the same "your own service is the plugin" approach
+as the other hooks, and keeps the core small enough to audit.
+`tls_insecure_skip_verify` and the other pool options apply to discovered
+members as they do to static ones.
+
 ### Mutual TLS
 
 ```
@@ -768,6 +842,9 @@ Enable with `admin <addr>` in the global block.
 | `POST /upstreams/<host:port>/weight/<n>` | Change its weight at runtime. |
 | `POST /drain` | Self-drain: stop sending new requests to the upstream(s) at the caller's own address (`?port=N` narrows it to one port). |
 | `POST /undrain` | Self-undrain: put the caller's upstream(s) back into rotation. |
+| `POST /register` | Self-register into a `discover` pool: `?service=<pool>&port=<n>&ttl=<s>&weight=<n>`; repeat as a heartbeat. |
+| `POST /deregister` | Leave a `discover` pool: `?service=<pool>&port=<n>`. |
+| `GET /registry` | List the currently registered members. |
 | `POST /scale_up` | Run the `scale_up` hook now (`202`), or `429` with `Retry-After` inside its cooldown. |
 | `GET /overrides`, `DELETE /overrides` | List or clear the runtime overrides. |
 
@@ -931,7 +1008,7 @@ coreutils gnu-sed`; the scripts find them), and the checks that need more
 loopback addresses than `127.0.0.1` are skipped with a note unless you add
 them (`sudo ifconfig lo0 alias 127.0.0.2 up`, likewise `.3` and `.5`).
 
-`make check` runs fourteen suites; `make check-asan` runs them on a build
+`make check` runs fifteen suites; `make check-asan` runs them on a build
 instrumented with AddressSanitizer and UndefinedBehaviorSanitizer. The
 GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 
@@ -950,6 +1027,7 @@ GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 | `make binrollback` | `tests/binrollback_test.py`: builds a deliberately broken limer, then upgrades under traffic — a good binary is committed, the broken one is rolled back with the same pid, and the previous binary is restored at its install path. |
 | `make h3` | `tests/h3_test.py`: HTTP/3 with the aioquic client — local and proxied responses, forwarded headers, path and query, small and 200 KB POST bodies, a 3 MiB response, 20 concurrent streams on one connection, a bodiless 204, `Alt-Svc` on HTTPS over TCP, HTTP/3 after a reload, and a graceful stop (skips when aioquic is not installed). |
 | `make admin` | `tests/admin_test.py`: the admin secret (`401` without it, `/health` open), `POST /scale_up` and its cooldown, bans for wrong secrets and for webhook floods, ban expiry, self-drain with the secret, one hook run across two workers, and config validation (short secrets, the open-admin warning). |
+| `make discover` | `tests/discover_test.py`: a `discover` pool fills from self-registration — health- and settle-gated admission, heartbeat expiry, deregister, the allow-list, unknown-pool refusal, and that discovery never empties a pool. |
 | `make status` | `tests/status_test.py`: `retry_status` sends a request to the next upstream on 404 and 503 and replays a POST body, a 404 from every upstream passes through, and `redirect_on` turns it into a redirect. |
 
 ## Security

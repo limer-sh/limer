@@ -630,6 +630,9 @@ static void pool_free(pool_t *p)
         upstream_free(p->retired[i]);
     free(p->retired);
     free(p->dyn_name);
+    for (int i = 0; i < p->ndiscover_allow; i++)
+        free(p->discover_allow[i]);
+    free(p->discover_allow);
     if (p->mirror)
         pool_free(p->mirror);
     free(p->name);
@@ -1217,6 +1220,37 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
                 FAIL("line %d: unknown dynamic option '%s'", kk->line, kk->args[0]);
             }
         }
+    } else if (strcaseeq(k, "discover")) {
+        /* discover <name> [{ allow <cidr...>; settle <dur> }] : members come from the
+         * self-registration registry (POST /register), not DNS. */
+        if (d->nargs != 2)
+            FAIL("line %d: discover needs a service name, e.g. 'discover orders'", d->line);
+        if (p->dyn_kind)
+            FAIL("line %d: a pool has one discovery source (dynamic or discover), not both", d->line);
+        p->dyn_kind = DYN_REGISTRY;
+        free(p->dyn_name);
+        p->dyn_name = xstrdup(d->args[1]);
+        for (int i = 0; i < d->nkids; i++) {
+            node_t *kk = d->kids[i];
+            if (strcaseeq(kk->args[0], "allow") || strcaseeq(kk->args[0], "allow_from")) {
+                if (want_args(kk, 1, 256, err, errlen) < 0)
+                    return -1;
+                for (int a = 1; a < kk->nargs; a++) {
+                    struct sockaddr_storage ss;
+                    if (inet_pton(AF_INET, kk->args[a], &((struct sockaddr_in *)&ss)->sin_addr) != 1 &&
+                        inet_pton(AF_INET6, kk->args[a], &((struct sockaddr_in6 *)&ss)->sin6_addr) != 1 &&
+                        strchr(kk->args[a], '/') == NULL)
+                        FAIL("line %d: discover allow needs an IP or CIDR, got '%s'", kk->line, kk->args[a]);
+                    p->discover_allow = xrealloc(p->discover_allow, (size_t)(p->ndiscover_allow + 1) * sizeof(char *));
+                    p->discover_allow[p->ndiscover_allow++] = xstrdup(kk->args[a]);
+                }
+            } else if (strcaseeq(kk->args[0], "settle")) {
+                if (want_args(kk, 1, 1, err, errlen) < 0 || arg_duration(kk, 1, &p->settle, err, errlen) < 0)
+                    return -1;
+            } else {
+                FAIL("line %d: unknown discover option '%s' (use allow, settle)", kk->line, kk->args[0]);
+            }
+        }
     } else if (strcaseeq(k, "refresh") || strcaseeq(k, "resolve_interval")) {
         if (want_args(d, 1, 1, err, errlen) < 0)
             return -1;
@@ -1419,8 +1453,8 @@ static void config_resolve_dynamic(config_t *cfg)
         server_t *s = cfg->servers[i];
         for (int r = 0; r < s->nroutes; r++) {
             pool_t *p = s->routes[r]->pool;
-            if (!p || !p->dyn_kind)
-                continue;
+            if (!p || !p->dyn_kind || p->dyn_kind == DYN_REGISTRY)
+                continue;   /* a discover pool is filled from the registry, not DNS */
             resolve_job_t *job = xcalloc(1, sizeof *job);
             resolve_job_init(job, cfg, p->dyn_kind == 2 ? RESOLVE_SRV : RESOLVE_ADDR, p->dyn_name, p->dyn_port);
             resolve_sync(job);

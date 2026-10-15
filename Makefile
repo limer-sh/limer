@@ -136,13 +136,16 @@ status: $(BIN)
 admin: $(BIN)
 	python3 tests/admin_test.py
 
+discover: $(BIN)
+	python3 tests/discover_test.py
+
 # Needs `pebble` (PEBBLE=/path), optionally `pebble-challtestsrv` (CHALLTESTSRV=/path) for dns-01,
 # and `127.0.0.1 limer.test www.limer.test alpn.limer.test dns.limer.test` in /etc/hosts; skips otherwise.
 acme: $(BIN)
 	./tests/run_acme.sh
 
 # Everything: unit tests, parser fuzzing, integration, feature, ACME, security and DoS-guard suites.
-check: unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status admin
+check: unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status admin discover
 
 # The same suites with sanitizers enabled (slower; rebuilds everything).
 check-asan:
@@ -157,4 +160,4 @@ install: $(BIN)
 clean:
 	rm -rf build $(BIN) tests/tmp
 
-.PHONY: all unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status admin check check-asan install clean
+.PHONY: all unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status admin discover check check-asan install clean

@@ -1420,6 +1420,84 @@ TEST(test_ratelimit)
 }
 
 /* ------------------------------------------------------------------ */
+static socklen_t mksa(struct sockaddr_storage *ss, const char *ip, int port)
+{
+    memset(ss, 0, sizeof *ss);
+    struct sockaddr_in *s = (struct sockaddr_in *)ss;
+    s->sin_family = AF_INET;
+    s->sin_port = htons((uint16_t)port);
+    inet_pton(AF_INET, ip, &s->sin_addr);
+    return sizeof *s;
+}
+
+TEST(test_registry)
+{
+    registry_t *r = calloc(1, sizeof *r);
+    struct sockaddr_storage ss;
+    socklen_t sl;
+    registry_reset(r);
+    CHECK(registry_gen(r) == 0);
+    CHECK(registry_live(r, "orders", 100) == 0);
+
+    sl = mksa(&ss, "10.0.0.1", 8080);
+    CHECK(registry_put(r, "orders", (struct sockaddr *)&ss, sl, 1, 100) == 1);  /* new */
+    uint64_t g = registry_gen(r);
+    CHECK(g > 0);
+    CHECK(registry_live(r, "orders", 50) == 1);
+    CHECK(registry_live(r, "other", 50) == 0);
+
+    CHECK(registry_put(r, "orders", (struct sockaddr *)&ss, sl, 1, 120) == 0);   /* heartbeat: no change */
+    CHECK(registry_gen(r) == g);
+    CHECK(registry_put(r, "orders", (struct sockaddr *)&ss, sl, 5, 120) == 1);   /* weight change */
+    CHECK(registry_gen(r) > g);
+
+    sl = mksa(&ss, "10.0.0.2", 8080);
+    registry_put(r, "orders", (struct sockaddr *)&ss, sl, 1, 120);
+    CHECK(registry_live(r, "orders", 50) == 2);
+
+    /* a member for a different pool is separate */
+    sl = mksa(&ss, "10.0.0.3", 9090);
+    registry_put(r, "carts", (struct sockaddr *)&ss, sl, 1, 120);
+    CHECK(registry_live(r, "orders", 50) == 2);
+    CHECK(registry_live(r, "carts", 50) == 1);
+
+    /* deregister by ip+port */
+    CHECK(registry_del(r, "orders", "10.0.0.2", 8080) == 1);
+    CHECK(registry_live(r, "orders", 50) == 1);
+    CHECK(registry_del(r, "orders", "10.0.0.9", 8080) == 0);   /* not there */
+
+    /* eviction by expiry */
+    CHECK(registry_evict(r, 200) == 2);   /* 10.0.0.1 (exp 120) and 10.0.0.3 (exp 120) */
+    CHECK(registry_live(r, "orders", 200) == 0);
+
+    /* per-IP cap */
+    registry_reset(r);
+    int ok = 0;
+    for (int p = 1; p <= REG_MAX_PER_IP + 5; p++) {
+        sl = mksa(&ss, "10.1.1.1", 20000 + p);
+        if (registry_put(r, "big", (struct sockaddr *)&ss, sl, 1, 1000) >= 0)
+            ok++;
+    }
+    CHECK(ok == REG_MAX_PER_IP);   /* extra ports from one IP are refused */
+
+    /* save / load round trip */
+    registry_reset(r);
+    sl = mksa(&ss, "10.2.2.2", 7000);
+    registry_put(r, "svc", (struct sockaddr *)&ss, sl, 3, 1030);
+    char path[] = "/tmp/limer-reg-unit.json";
+    CHECK(registry_save(r, path, 1000) == 0);
+    registry_t *r2 = calloc(1, sizeof *r2);
+    registry_reset(r2);
+    int loaded = registry_load(r2, path, 2000);   /* different "now": remaining TTL preserved */
+    CHECK(loaded == 1);
+    CHECK(registry_live(r2, "svc", 2000) == 1);
+    CHECK(registry_live(r2, "svc", 2031) == 0);   /* remaining 30s from load time */
+    unlink(path);
+    free(r);
+    free(r2);
+}
+
+/* ------------------------------------------------------------------ */
 int main(void)
 {
     log_level = LOG_ERROR;
@@ -1435,6 +1513,7 @@ int main(void)
     test_cache_run();
     test_balance_run();
     test_ratelimit_run();
+    test_registry_run();
     printf("unit tests: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
