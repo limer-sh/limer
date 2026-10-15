@@ -390,7 +390,7 @@
         <h3>Safe deploys</h3><p>Reloads and <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">limer upgrade</code> with no downtime and the same pid. New configs and binaries run as a 5% canary and roll back on their own if they cause 5xx &mdash; the bad file is moved aside so a restart can&rsquo;t bring it back.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M12 6v6l4 2"/></svg></div>
-        <h3>Dynamic upstreams</h3><p>Pools from DNS A/AAAA or SRV records, or backends that self-register over the admin API &mdash; health- and settle-gated, no external registry. Mutual TLS, mirroring and canary splitting built in.</p></div>
+        <h3>Dynamic upstreams</h3><p>Pools from DNS A/AAAA or SRV records, or backends that self-register over the admin API &mdash; health- and settle-gated, no external registry. Members can broadcast to each other (cache busts, live updates) with no message broker. Mutual TLS, mirroring and canary splitting built in.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M4 4h16v6H4zM4 14h16v6H4z"/><path d="M8 7h.01M8 17h.01"/></svg></div>
         <h3>Ops you can see</h3><p>Prometheus metrics, JSON upstream status, runtime drain and weight overrides that survive reloads, multi-process workers with SO_REUSEPORT.</p></div>

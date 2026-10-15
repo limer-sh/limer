@@ -146,7 +146,7 @@ acme: $(BIN)
 	./tests/run_acme.sh
 
 # Everything: unit tests, parser fuzzing, integration, feature, ACME, security and DoS-guard suites.
-check: unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status admin discover
+check: unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status admin discover broadcast
 
 # The same suites with sanitizers enabled (slower; rebuilds everything).
 check-asan:
@@ -161,4 +161,4 @@ install: $(BIN)
 clean:
 	rm -rf build $(BIN) tests/tmp
 
-.PHONY: all unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status admin discover check check-asan install clean
+.PHONY: all unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status admin discover broadcast check check-asan install clean
