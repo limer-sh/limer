@@ -633,6 +633,7 @@ static void pool_free(pool_t *p)
     for (int i = 0; i < p->ndiscover_allow; i++)
         free(p->discover_allow[i]);
     free(p->discover_allow);
+    free(p->broadcast_path);
     if (p->mirror)
         pool_free(p->mirror);
     free(p->name);
@@ -1221,8 +1222,8 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
             }
         }
     } else if (strcaseeq(k, "discover")) {
-        /* discover <name> [{ allow <cidr...>; settle <dur> }] : members come from the
-         * self-registration registry (POST /register), not DNS. */
+        /* discover <name> [{ allow <cidr...>; settle <dur>; broadcast <path> }] : members
+         * come from the self-registration registry (POST /register), not DNS. */
         if (d->nargs != 2)
             FAIL("line %d: discover needs a service name, e.g. 'discover orders'", d->line);
         if (p->dyn_kind)
@@ -1247,8 +1248,15 @@ static int parse_pool_directive(pool_t *p, node_t *d, int *handled, char *err, s
             } else if (strcaseeq(kk->args[0], "settle")) {
                 if (want_args(kk, 1, 1, err, errlen) < 0 || arg_duration(kk, 1, &p->settle, err, errlen) < 0)
                     return -1;
+            } else if (strcaseeq(kk->args[0], "broadcast")) {
+                if (want_args(kk, 1, 1, err, errlen) < 0)
+                    return -1;
+                if (kk->args[1][0] != '/' || strpbrk(kk->args[1], " \t\r\n"))
+                    FAIL("line %d: discover broadcast needs a path starting with '/', got '%s'", kk->line, kk->args[1]);
+                free(p->broadcast_path);
+                p->broadcast_path = xstrdup(kk->args[1]);
             } else {
-                FAIL("line %d: unknown discover option '%s' (use allow, settle)", kk->line, kk->args[0]);
+                FAIL("line %d: unknown discover option '%s' (use allow, settle, broadcast)", kk->line, kk->args[0]);
             }
         }
     } else if (strcaseeq(k, "refresh") || strcaseeq(k, "resolve_interval")) {

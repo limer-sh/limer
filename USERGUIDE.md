@@ -673,6 +673,46 @@ as the other hooks, and keeps the core small enough to audit.
 `tls_insecure_skip_verify` and the other pool options apply to discovered
 members as they do to static ones.
 
+#### Broadcasts between members
+
+Members of a pool sometimes need to tell each other something: a cache entry
+is stale, a record changed and pages showing it should refresh. With
+`broadcast <path>` in its `discover` block, a pool fans messages out to all of
+its members, with no message broker:
+
+```
+app.example.com {
+    reverse_proxy {
+        discover app {
+            allow 10.0.0.0/8
+            broadcast /_internal/announce
+        }
+    }
+}
+```
+
+```
+# from any member: every member (the sender included) gets
+#   POST /_internal/announce   with this body and Content-Type,
+#   and the header  X-Limer-Broadcast: app
+curl -X POST -H "Authorization: Bearer $LIMER_ADMIN_SECRET" \
+     -H "Content-Type: application/json" -d '{"changed":["orders"]}' \
+     "http://10.0.0.1:2019/broadcast?service=app"
+# -> {"status":"sent","service":"app","members":3}
+```
+
+- **Who may broadcast** is decided as for `/register`: the admin `secret`,
+  and a source address inside the pool's `allow` ranges. A pool without
+  `broadcast` refuses (`404`), so the feature is off unless a pool asks for it.
+- **Delivery is fire-and-forget**, like `mirror`: each member gets one try,
+  answers are discarded, and a member that is down misses the message. Use it
+  for hints ("look again"), not for data that must arrive. Members that need
+  certainty should re-check on their own as well (for example on reconnect).
+- **The sender gets its own message** too; include an id in the body to
+  recognise it.
+- Bodies are limited to 64 KiB. Members are sent to over HTTP/1.1 (HTTP/2-only
+  members are skipped).
+
 ### Mutual TLS
 
 ```
@@ -845,6 +885,7 @@ Enable with `admin <addr>` in the global block.
 | `POST /register` | Self-register into a `discover` pool: `?service=<pool>&port=<n>&ttl=<s>&weight=<n>`; repeat as a heartbeat. |
 | `POST /deregister` | Leave a `discover` pool: `?service=<pool>&port=<n>`. |
 | `GET /registry` | List the currently registered members. |
+| `POST /broadcast` | Send the request body to every member of a `discover` pool with a `broadcast` path: `?service=<pool>` (see Broadcasts). |
 | `POST /scale_up` | Run the `scale_up` hook now (`202`), or `429` with `Retry-After` inside its cooldown. |
 | `GET /overrides`, `DELETE /overrides` | List or clear the runtime overrides. |
 

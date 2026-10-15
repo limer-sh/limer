@@ -342,6 +342,7 @@ typedef struct pool {
     char **discover_allow;    /* `discover x { allow <cidr...> }`: ranges a registrant may join from */
     int   ndiscover_allow;
     double settle;            /* a discovered member must be present+healthy this long before it takes traffic */
+    char *broadcast_path;     /* `discover x { broadcast /path }`: POST /broadcast fans a body out to every member here */
     uint64_t reg_gen_seen;    /* runtime: last registry generation this pool was rebuilt at */
     double refresh;           /* re-resolution interval, 0 = never */
     double dyn_next;          /* runtime: next lookup */

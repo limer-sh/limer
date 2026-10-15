@@ -138,6 +138,7 @@ admin: $(BIN)
 
 discover: $(BIN)
 	python3 tests/discover_test.py
+	python3 tests/broadcast_test.py
 
 # Needs `pebble` (PEBBLE=/path), optionally `pebble-challtestsrv` (CHALLTESTSRV=/path) for dns-01,
 # and `127.0.0.1 limer.test www.limer.test alpn.limer.test dns.limer.test` in /etc/hosts; skips otherwise.

@@ -41,7 +41,7 @@ redirects plain HTTP to HTTPS.
   the same backend and only a departed upstream's keys get remapped.
 - **A full edge in one binary** — reverse proxy with health checks, sticky
   sessions, rate limiting, response caching, dynamic upstreams (DNS A/SRV
-  or self-registration via the admin API),
+  or self-registration via the admin API, with broadcasts between members),
   traffic splitting and mirroring, mutual TLS, static files and compression.
 - **Automatic HTTPS** — Let's Encrypt over http-01, tls-alpn-01 or dns-01
   (wildcards included); `tls internal` for local dev.

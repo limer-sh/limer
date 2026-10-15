@@ -61,7 +61,8 @@ static int g_epfd = -1;
 static config_t *g_cfg;
 static ipguard_t *g_ipguard;    /* per-source-IP admission control (DoS mitigation) */
 static uint64_t *g_shared_stats; /* page shared with the master (SH_* slots) */
-static registry_t *g_registry;   /* self-registration table, shared with the master and all workers */
+static registry_t *g_registry;
+#define BROADCAST_MAX_BODY 65536   /* POST /broadcast: largest body fanned out to a pool */   /* self-registration table, shared with the master and all workers */
 static config_t *g_canary_old;   /* known-good config still served while a new one is on probation */
 static uint64_t g_canary_gen;    /* SH_CANARY_GEN of the probation g_canary_old belongs to */
 
@@ -1805,6 +1806,37 @@ static void conn_fire_mirror(conn_t *c, pool_t *mp)
         }
         ev_mod(&uc->ev, EPOLLIN | EPOLLRDHUP | (rc == 0 ? EPOLLOUT : 0));
     }
+}
+
+/* Fire-and-forget a POST of `body` to one upstream (a broadcast); the response
+ * is discarded, like a mirror's. Returns 1 if the request was started. */
+static int fire_broadcast(upstream_t *u, pool_t *p, config_t *cfg, const char *svc, const char *ctype,
+                          const char *body, size_t len)
+{
+    if (u->gone || u->h2) /* HTTP/2 upstreams are not supported, as for mirrors */
+        return 0;
+    uconn_t *uc = uconn_connect(u, p, cfg);
+    if (!uc)
+        return 0;
+    uc->mirror = 1;
+    uc->idle_since = g_now;
+    buf_reset(&uc->wbuf);
+    buf_printf(&uc->wbuf,
+               "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+               "Connection: close\r\nX-Limer-Broadcast: %s\r\n\r\n",
+               p->broadcast_path, u->hostport, ctype, len, svc);
+    if (len)
+        buf_append(&uc->wbuf, body, len);
+    if (uc->connected) {
+        uc->state = US_ACTIVE;
+        int rc = uc_flush(uc);
+        if (rc < 0) {
+            uconn_close(uc);
+            return 0;
+        }
+        ev_mod(&uc->ev, EPOLLIN | EPOLLRDHUP | (rc == 0 ? EPOLLOUT : 0));
+    }
+    return 1;
 }
 
 static void conn_try_upstream(conn_t *c)
@@ -5469,6 +5501,71 @@ static void admin_handle(conn_t *c)
                     buf_printf(&b, "{\"status\":\"deregistered\",\"service\":\"%s\",\"removed\":%d}\n", svc, n);
                 }
             }
+        }
+    } else if (strcmp(path, "/broadcast") == 0) {
+        /* Fan a body out to every member of a `discover` pool that has `broadcast
+         * <path>`: each gets it as POST <path>, fire-and-forget. For backends that
+         * keep each other informed (cache invalidation, live-update announcements)
+         * without a message broker. The caller must be allowed into the pool, as
+         * for /register; members receive their own broadcasts too. */
+        char svc[REG_POOL_LEN] = "";
+        admin_qparam(c->req.query, "service", svc, sizeof svc);
+        if (!svc[0])
+            admin_qparam(c->req.query, "pool", svc, sizeof svc);
+        pool_t *bp = NULL;
+        int found = 0, allowed = 1;
+        for (int i = 0; i < g_cfg->nservers && !bp; i++) {
+            server_t *s = g_cfg->servers[i];
+            for (int r = 0; r < s->nroutes && !bp; r++) {
+                pool_t *p = s->routes[r]->pool;
+                if (!p || p->dyn_kind != DYN_REGISTRY || strcmp(p->dyn_name, svc) != 0)
+                    continue;
+                found = 1;
+                if (!p->broadcast_path)
+                    continue;
+                bp = p;
+                if (p->ndiscover_allow) {
+                    allowed = 0;
+                    for (int a = 0; a < p->ndiscover_allow && !allowed; a++)
+                        if (cidr_match(p->discover_allow[a], (struct sockaddr *)&c->peer))
+                            allowed = 1;
+                }
+            }
+        }
+        if (strcmp(c->req.method, "POST") != 0) {
+            status = 405;
+            buf_puts(&b, "{\"error\":\"use POST\"}\n");
+        } else if (!svc[0]) {
+            status = 400;
+            buf_puts(&b, "{\"error\":\"need ?service=<pool>\"}\n");
+        } else if (!bp) {
+            status = 404;
+            if (found)
+                buf_printf(&b, "{\"error\":\"pool '%s' has no broadcast path (discover %s { broadcast /path })\"}\n", svc, svc);
+            else
+                buf_printf(&b, "{\"error\":\"no discover pool named '%s'\"}\n", svc);
+        } else if (!allowed) {
+            status = 403;
+            buf_printf(&b, "{\"error\":\"%s is not allowed to broadcast to '%s'\"}\n", c->peer_ip, svc);
+        } else if (buf_readable(&c->req.body) > BROADCAST_MAX_BODY) {
+            status = 413;
+            buf_printf(&b, "{\"error\":\"a broadcast body is at most %d bytes\"}\n", BROADCAST_MAX_BODY);
+        } else {
+            /* catch up with registrations this worker has not applied yet */
+            uint64_t gen = registry_gen(g_registry);
+            if (gen != bp->reg_gen_seen) {
+                bp->reg_gen_seen = gen;
+                pool_apply_registry(bp);
+            }
+            const char *ct = http_hdr_get(c->req.hdrs, c->req.nhdr, "Content-Type");
+            if (!ct || !*ct || strpbrk(ct, "\r\n"))
+                ct = "application/octet-stream";
+            int sent = 0;
+            for (int i = 0; i < bp->nups; i++)
+                sent += fire_broadcast(bp->ups[i], bp, c->cfg, svc, ct, buf_rptr(&c->req.body),
+                                       buf_readable(&c->req.body));
+            g_stats.requests += (uint64_t)sent;
+            buf_printf(&b, "{\"status\":\"sent\",\"service\":\"%s\",\"members\":%d}\n", svc, sent);
         }
     } else if (strcmp(path, "/registry") == 0) {
         if (!g_registry) {
