@@ -754,6 +754,7 @@ void config_unref(config_t *c)
 static const config_t *g_loading_cfg; /* set while config_parse_in runs */
 int config_lenient_resolve;
 int config_no_dns;
+int config_check_only;
 
 static int resolve_failed(upstream_t *u, int line, const char *detail, char *err, size_t errlen)
 {
@@ -2382,6 +2383,13 @@ static int parse_log(server_t *s, node_t *d, char *err, size_t errlen)
                     FAIL("line %d: 'output file' needs a path", k->line);
                 snprintf(fspec, sizeof fspec, "%s", k->args[2]);
                 spec = fspec;
+            }
+            if (config_check_only) {
+                /* validate and the signalling commands often run as root: opening the
+                 * file here would create it root-owned, and the server could not write it */
+                if (log_check_target(spec, err, errlen) < 0)
+                    return -1;
+                continue;
             }
             if (s->log_fd > 2)
                 close(s->log_fd);

@@ -4,6 +4,8 @@
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pwd.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
@@ -81,6 +83,28 @@ void log_access_to(int fd, const char *line, size_t len)
     (void)!writev(fd, iov, 3);
 }
 
+static const char *user_name(uid_t uid, char *out, size_t n)
+{
+    struct passwd *pw = getpwuid(uid);
+    if (pw)
+        snprintf(out, n, "%s", pw->pw_name);
+    else
+        snprintf(out, n, "uid %d", (int)uid);
+    return out;
+}
+
+static void parent_dir(const char *path, char *out, size_t n)
+{
+    snprintf(out, n, "%s", path);
+    char *slash = strrchr(out, '/');
+    if (!slash)
+        snprintf(out, n, ".");
+    else if (slash == out)
+        out[1] = 0;
+    else
+        *slash = 0;
+}
+
 int log_open_target(const char *spec, char *err, size_t errlen)
 {
     if (!spec || strcaseeq(spec, "stdout"))
@@ -93,9 +117,61 @@ int log_open_target(const char *spec, char *err, size_t errlen)
     if (str_has_prefix(path, "file "))
         path += 5;
     int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-    if (fd < 0)
-        snprintf(err, errlen, "cannot open log file '%s': %s", path, strerror(errno));
+    if (fd < 0) {
+        /* Permission denied: say whose file (or directory) it is, and who limer runs as */
+        int e = errno;
+        struct stat st;
+        char dir[1024], owner[64], me[64];
+        parent_dir(path, dir, sizeof dir);
+        if (e == EACCES && stat(path, &st) == 0)
+            snprintf(err, errlen, "cannot open log file '%s': %s (it belongs to %s, and limer runs as %s)", path,
+                     strerror(e), user_name(st.st_uid, owner, sizeof owner), user_name(geteuid(), me, sizeof me));
+        else if (e == EACCES && stat(dir, &st) == 0)
+            snprintf(err, errlen, "cannot create log file '%s': %s (%s belongs to %s, and limer runs as %s)", path,
+                     strerror(e), dir, user_name(st.st_uid, owner, sizeof owner), user_name(geteuid(), me, sizeof me));
+        else
+            snprintf(err, errlen, "cannot open log file '%s': %s", path, strerror(e));
+    }
     return fd;
+}
+
+int log_check_target(const char *spec, char *err, size_t errlen)
+{
+    if (!spec || strcaseeq(spec, "stdout") || strcaseeq(spec, "stderr") || strcaseeq(spec, "off") ||
+        strcaseeq(spec, "discard") || strcaseeq(spec, "none"))
+        return 0;
+    const char *path = spec;
+    if (str_has_prefix(path, "file "))
+        path += 5;
+    struct stat st, ds;
+    char dir[1024], owner[64];
+    parent_dir(path, dir, sizeof dir);
+    if (stat(path, &st) == 0) {
+        if (access(path, W_OK) < 0) {
+            int e = errno;   /* before user_name(): getpwuid() may change errno */
+            snprintf(err, errlen, "cannot write log file '%s': %s (it belongs to %s)", path, strerror(e),
+                     user_name(st.st_uid, owner, sizeof owner));
+            return -1;
+        }
+        /* Root can write anything, so ask whether the server could: a file of root's in a
+         * directory that belongs to another user is one a server running as that user cannot write. */
+        if (geteuid() == 0 && st.st_uid == 0 && S_ISREG(st.st_mode) && stat(dir, &ds) == 0 && ds.st_uid != 0) {
+            user_name(ds.st_uid, owner, sizeof owner);
+            snprintf(err, errlen, "log file '%s' belongs to root, but %s belongs to %s: a server running as %s cannot write it (chown %s '%s')",
+                     path, dir, owner, owner, owner, path);
+            return -1;
+        }
+        return 0;
+    }
+    if (errno != ENOENT) {
+        snprintf(err, errlen, "cannot open log file '%s': %s", path, strerror(errno));
+        return -1;
+    }
+    if (access(dir, W_OK) < 0) {
+        snprintf(err, errlen, "cannot create log file '%s': %s: %s", path, dir, strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 void log_json_escape(buf_t *b, const char *s)

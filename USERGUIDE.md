@@ -184,8 +184,8 @@ make
 ```
 limer run                     # uses ./Limerfile or /etc/limer/Limerfile
 limer run -c path/Limerfile   # explicit config
-limer validate -c Limerfile   # parse, resolve upstreams, load certificates
-limer reload                  # SIGHUP the running instance (needs `pidfile`)
+limer validate -c Limerfile   # parse, resolve upstreams, load certificates; creates no log file
+limer reload                  # SIGHUP the running instance and wait for its answer (needs `pidfile`)
 limer upgrade                 # swap in a new binary with no downtime (SIGUSR2)
 limer stop                    # graceful SIGTERM
 limer version
@@ -951,9 +951,16 @@ warning at startup.
 
 | Signal | Command | Effect |
 |---|---|---|
-| `SIGHUP` | `limer reload` | Reload the Limerfile. Listeners are kept or added; sites and pools are swapped atomically; in-flight requests finish on the old config; a config that fails to parse or bind is rejected and logged. |
+| `SIGHUP` | `limer reload` | Reload the Limerfile. Listeners are kept or added; sites and pools are swapped atomically; in-flight requests finish on the old config; a config that fails to parse or bind is rejected and logged. `limer reload` waits up to 10 s for the master's answer and prints it: exit 0 when the workers are reloading, 1 with the reason when the master refused the config or ignored the signal, and 1 when no answer came (the master is stuck, or older than this command). |
 | `SIGUSR2` | `limer upgrade` | Replace the running binary with the one now on disk, with no downtime (see below). |
 | `SIGTERM` / `SIGINT` | `limer stop` | Stop accepting, finish in-flight requests within `grace`, exit. |
+
+`limer validate`, and `reload`, `upgrade` and `stop` when they read the
+Limerfile, check each access log file as the server would use it but create
+and open none: run as root, they would otherwise leave a root-owned file that a
+server running as another user could not write. As root, `validate` also
+refuses a log file that belongs to root in a directory that belongs to another
+user, since that is the user the server most likely runs as.
 
 `limer run` always starts a master process that supervises `workers` worker
 processes (1 by default). The workers each own all listeners via

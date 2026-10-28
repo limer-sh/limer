@@ -35,6 +35,8 @@ void log_access(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void log_access_to(int fd, const char *line, size_t len);
 /* open an access log destination: "stdout", "stderr" or a file path; returns fd or -1 */
 int  log_open_target(const char *spec, char *err, size_t errlen);
+/* check a destination as log_open_target would use it, creating and opening nothing; 0 or -1 */
+int  log_check_target(const char *spec, char *err, size_t errlen);
 void log_json_escape(buf_t *b, const char *s);
 
 #define LOGD(...) do { if (log_level <= LOG_DEBUG) log_msg(LOG_DEBUG, __VA_ARGS__); } while (0)
@@ -585,6 +587,7 @@ typedef struct config {
 config_t *config_load(const char *path, char *err, size_t errlen);
 extern int config_lenient_resolve;   /* reloads: an unresolvable named upstream keeps its old address */
 extern int config_no_dns;            /* tests: never look names up; a named upstream stays unresolved */
+extern int config_check_only;        /* validate, reload, upgrade, stop: check log files, create and open none */
 /* runtime overrides (<storage>/overrides.conf): "hostport drained=<0|1> weight=<n>" per line */
 int  overrides_apply(config_t *cfg);
 int  overrides_apply_upstream(const config_t *cfg, upstream_t *u);

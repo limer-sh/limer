@@ -1102,7 +1102,15 @@ int acme_manager_start(config_t *cfg)
         for (int fd = 3; fd < 65536; fd++)
             close(fd);
         /* The master forks this from its loop, where it blocks its signals and handles them
-         * itself: start clean, or the SIGTERM that stops the manager is never delivered. */
+         * itself: start clean, or the SIGTERM that stops the manager is never delivered.
+         * The manager's own handlers go in before the mask is cleared: a reload right after
+         * this one sends SIGTERM before the child gets here, and the master's handler, still
+         * installed, would take it and set the master's flag, so the manager never stopped
+         * and the master waited the 5 s of acme_manager_stop() for it (BUGREPORT1.md). */
+        manager_stop = 0;
+        signal(SIGTERM, manager_sig);
+        signal(SIGINT, manager_sig);
+        signal(SIGHUP, SIG_IGN);
         signal(SIGCHLD, SIG_DFL);
         signal(SIGUSR2, SIG_DFL);
         signal(SIGALRM, SIG_DFL);

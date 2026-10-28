@@ -3,7 +3,7 @@
  *
  *   limer run [-c Limerfile]      run in the foreground (like `caddy run`)
  *   limer validate [-c Limerfile] check a configuration file
- *   limer reload [-c Limerfile]   ask a running instance to reload
+ *   limer reload [-c Limerfile]   ask a running instance to reload, and report its answer
  *   limer stop [-c Limerfile]     ask a running instance to stop
  *   limer version
  */
@@ -11,11 +11,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static const char *default_config_paths[] = { "Limerfile", "/etc/limer/Limerfile", NULL };
@@ -27,7 +29,7 @@ static void usage(FILE *out)
           "Usage:\n"
           "  limer run      [-c FILE] [-w N]   Run the load balancer (foreground)\n"
           "  limer validate [-c FILE]          Validate the configuration and exit\n"
-          "  limer reload   [-c FILE]          Reload the configuration of a running instance\n"
+          "  limer reload   [-c FILE]          Reload the configuration of a running instance, and wait for its answer\n"
           "  limer upgrade  [-c FILE]          Replace the running binary with no downtime\n"
           "  limer stop     [-c FILE]          Gracefully stop a running instance\n"
           "  limer version                     Print the version\n"
@@ -138,6 +140,36 @@ static int replace_file(const char *dst, const char *src_path, const char *data,
     if (rc < 0)
         unlink(tmp);
     return rc;
+}
+
+/* CLOCK_MONOTONIC is the same clock in every process, so `limer reload` can
+ * compare its own reading with the master's. */
+static unsigned long long mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000ULL + (unsigned long long)ts.tv_nsec / 1000;
+}
+
+/* The outcome of each SIGHUP, for `limer reload` to wait on, in <pidfile>.reload:
+ * "<pid> <started> ok|error <detail>", where started is mono_us() when the master
+ * began handling it: an answer that began before a signal was sent read the
+ * config before it, so it is not that signal's answer. */
+static void write_reload_status(const char *pidfile, unsigned long long started, int ok, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+static void write_reload_status(const char *pidfile, unsigned long long started, int ok, const char *fmt, ...)
+{
+    if (!pidfile)
+        return;
+    char detail[800], line[1024], path[1100];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(detail, sizeof detail, fmt, ap);
+    va_end(ap);
+    int len = snprintf(line, sizeof line, "%d %llu %s %s\n", (int)getpid(), started, ok ? "ok" : "error", detail);
+    snprintf(path, sizeof path, "%s.reload", pidfile);
+    if (replace_file(path, NULL, line, (size_t)len, 0644, NULL) < 0)
+        LOGW("reload: cannot write %s: %s", path, strerror(errno));
 }
 
 /* Where the running image can be read from. On Linux /proc/self/exe still
@@ -430,15 +462,20 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
         }
         if (m_got_hup) {
             m_got_hup = 0;
-            if (!stopping && bin_probation) {
+            unsigned long long hup_at = mono_us();
+            if (stopping) {
+                write_reload_status(pidfile, hup_at, 0, "ignored: the server is stopping");
+            } else if (bin_probation) {
                 LOGW("reload: ignored while a binary upgrade is on probation; try again in a few seconds");
-            } else if (!stopping) {
+                write_reload_status(pidfile, hup_at, 0, "ignored while a binary upgrade is on probation; try again in a few seconds");
+            } else {
                 char err[512];
                 config_lenient_resolve = 1; /* workers keep known addresses for names DNS cannot answer right now */
                 config_t *test = config_load(cfg_path, err, sizeof err);
                 config_lenient_resolve = 0;
                 if (!test) {
                     LOGE("reload: configuration invalid, not reloading workers: %s", err);
+                    write_reload_status(pidfile, hup_at, 0, "configuration invalid, not reloading workers: %s", err);
                     /* with auto_rollback, also keep the invalid file from being
                      * loaded (or blocking startup) on the next restart */
                     config_t *good = probation ? prev_cfg : cfg;
@@ -487,6 +524,10 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                     cfg = test;
                     proxy_prebind_prune(cfg);
                     acme_manager_start(cfg);
+                    if (rb.enabled && shared)
+                        write_reload_status(pidfile, hup_at, 1, "workers reloading; on probation for %.0fs", rb.window);
+                    else
+                        write_reload_status(pidfile, hup_at, 1, "workers reloading");
                 }
             }
         }
@@ -766,11 +807,58 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
 /* commands                                                            */
 /* ------------------------------------------------------------------ */
 
+#define RELOAD_WAIT_SECONDS 10
+
+static int read_line(const char *path, char *out, size_t n)
+{
+    out[0] = 0;
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    if (!fgets(out, (int)n, f))
+        out[0] = 0;
+    fclose(f);
+    out[strcspn(out, "\n")] = 0;
+    return out[0] != 0;
+}
+
+/* After SIGHUP: wait for the master's answer in <pidfile>.reload (see write_reload_status),
+ * one it began handling after `sent`, and report what it says. */
+static int wait_reload(pid_t pid, const char *status_path, unsigned long long sent)
+{
+    char line[1024];
+    for (int i = 0; i < RELOAD_WAIT_SECONDS * 20; i++) {
+        usleep(50000);
+        int from = 0;
+        unsigned long long started = 0;
+        if (!read_line(status_path, line, sizeof line) || sscanf(line, "%d %llu", &from, &started) != 2 ||
+            from != (int)pid || started < sent)
+            continue;
+        char *p = line;
+        for (int field = 0; field < 2 && p; field++) {   /* skip "<pid> <started> " */
+            p = strchr(p, ' ');
+            if (p)
+                p++;
+        }
+        if (p && str_has_prefix(p, "ok")) {
+            printf("reloaded (pid %d): %s\n", (int)pid, p[2] == ' ' ? p + 3 : "ok");
+            return 0;
+        }
+        fprintf(stderr, "limer: reload failed (pid %d): %s\n", (int)pid,
+                p && str_has_prefix(p, "error ") ? p + 6 : line);
+        return 1;
+    }
+    fprintf(stderr, "limer: pid %d did not answer the reload within %d s: it may be stuck, "
+            "or be a limer from before reloads were answered (see its log)\n", (int)pid, RELOAD_WAIT_SECONDS);
+    return 1;
+}
+
 static int cmd_signal(const char *cfg_path, const char *pidfile_override, int sig, const char *verb)
 {
     char err[512];
     char *pidfile = pidfile_override ? xstrdup(pidfile_override) : NULL;
     if (!pidfile) {
+        config_check_only = 1;   /* often run as root: create no log file the server could not write */
         config_t *cfg = config_load(cfg_path, err, sizeof err);
         if (!cfg) {
             fprintf(stderr, "limer: %s\n", err);
@@ -789,13 +877,18 @@ static int cmd_signal(const char *cfg_path, const char *pidfile_override, int si
         free(pidfile);
         return 1;
     }
+    char status_path[1100];
+    snprintf(status_path, sizeof status_path, "%s.reload", pidfile);
+    unsigned long long sent = mono_us();
     if (kill(pid, sig) < 0) {
         fprintf(stderr, "limer: cannot signal pid %d: %s\n", (int)pid, strerror(errno));
         free(pidfile);
         return 1;
     }
-    printf("%s requested (pid %d)\n", verb, (int)pid);
     free(pidfile);
+    if (sig == SIGHUP)
+        return wait_reload(pid, status_path, sent);
+    printf("%s requested (pid %d)\n", verb, (int)pid);
     return 0;
 }
 
@@ -893,6 +986,8 @@ int main(int argc, char **argv)
         return cmd_signal(cfg_path, pidfile_opt, SIGTERM, "stop");
 
     char err[512];
+    if (strcmp(cmd, "validate") == 0)
+        config_check_only = 1;   /* often run as root: create no log file the server could not write */
     config_t *cfg = config_load(cfg_path, err, sizeof err);
     if (!cfg) {
         fprintf(stderr, "limer: %s: %s\n", cfg_path, err);

@@ -70,7 +70,7 @@ sudo make install           # installs to /usr/local/bin
 
 limer run -c Limerfile      # run in the foreground
 limer validate -c Limerfile # parse, resolve upstreams, load certificates
-limer reload                # zero-downtime reload
+limer reload                # zero-downtime reload; waits for the answer
 limer upgrade               # swap in a newly installed binary, no downtime
 ```
 
