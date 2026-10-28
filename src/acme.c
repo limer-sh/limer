@@ -21,6 +21,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -39,6 +40,10 @@
 #define ACME_CHECK_INTERVAL 3600             /* seconds between renewal checks   */
 #define ACME_MAX_BODY       (1 << 20)
 
+/* Set by SIGTERM in the manager: the loop ends, and so does an order in progress, at its
+ * next request. Always 0 in the master. */
+static volatile sig_atomic_t manager_stop;
+
 /* ------------------------------------------------------------------ */
 /* Storage helpers                                                     */
 /* ------------------------------------------------------------------ */
@@ -49,9 +54,10 @@ static int file_exists(const char *p)
     return stat(p, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-static int write_file_atomic(const char *path, const void *data, size_t n, mode_t mode)
+/* Write <path>.tmp in full and fsync it; the caller renames it into place. */
+static int write_file_tmp(const char *path, const void *data, size_t n, mode_t mode)
 {
-    char tmp[2048];
+    char tmp[2100];   /* path (up to 2048) + ".tmp" */
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
     if (fd < 0)
@@ -69,11 +75,23 @@ static int write_file_atomic(const char *path, const void *data, size_t n, mode_
     }
     fsync(fd);
     close(fd);
+    return 0;
+}
+
+static int rename_tmp(const char *path)
+{
+    char tmp[2100];   /* path (up to 2048) + ".tmp" */
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
     if (rename(tmp, path) < 0) {
         unlink(tmp);
         return -1;
     }
     return 0;
+}
+
+static int write_file_atomic(const char *path, const void *data, size_t n, mode_t mode)
+{
+    return write_file_tmp(path, data, n, mode) == 0 ? rename_tmp(path) : -1;
 }
 
 static char *read_small_file(const char *path, size_t *len)
@@ -238,6 +256,8 @@ static int https_call(acme_t *a, const char *method, const char *url, const char
 {
     memset(out, 0, sizeof *out);
     buf_init(&out->body);
+    if (manager_stop)
+        return -1;   /* stopping: the order in progress ends here */
     char host[300], path[2048];
     int port, tls;
     if (url_split(url, host, sizeof host, &port, path, sizeof path, &tls) < 0) {
@@ -247,7 +267,9 @@ static int https_call(acme_t *a, const char *method, const char *url, const char
     LOGD("acme: %s %s (host %s port %d path %s)", method, url, host, port, path);
     int fd = tcp_connect_blocking(host, port);
     if (fd < 0) {
-        LOGE("acme: cannot connect to %s:%d: %s", host, port, strerror(errno));
+        /* a SIGTERM interrupts connect(), and the next address's error is no news */
+        if (!manager_stop)
+            LOGE("acme: cannot connect to %s:%d: %s", host, port, strerror(errno));
         return -1;
     }
     SSL *ssl = NULL;
@@ -360,7 +382,8 @@ static int https_call(acme_t *a, const char *method, const char *url, const char
     if (rc < 0 || !head_done) {
         http_resp_free(&resp);
         buf_free(&out->body);
-        LOGE("acme: no valid response from %s", url);
+        if (!manager_stop)   /* a SIGTERM cut the request short: the order is being left, not failing */
+            LOGE("acme: no valid response from %s", url);
         return -1;
     }
     LOGD("acme: response %d (%zu body bytes)", resp.status, buf_readable(&out->body));
@@ -714,8 +737,6 @@ static int poll_status(acme_t *a, const char *url, const char *what, char *statu
     return 0;
 }
 
-static volatile sig_atomic_t manager_stop;
-
 /* run "<script> <action> <domain> <txt>" and wait for it */
 static int run_dns_script(const char *script, const char *action, const char *domain, const char *txt)
 {
@@ -947,8 +968,18 @@ static int acme_obtain(acme_t *a, char **hosts, int nhosts)
     PEM_write_bio_PrivateKey(bio, key, NULL, NULL, 0, NULL, NULL);
     char *pem = NULL;
     long pl = BIO_get_mem_data(bio, &pem);
-    int ok = write_file_atomic(keyp, pem, (size_t)pl, 0600) == 0 &&
-             write_file_atomic(certp, r.body.data, r.body.len, 0644) == 0;
+    /* Both files in full first, then the two renames back to back, so a kill can't land
+     * between the new key and its certificate while they are written (and cert_remaining()
+     * orders again should a pair ever disagree). */
+    int ok = write_file_tmp(keyp, pem, (size_t)pl, 0600) == 0;
+    if (ok && write_file_tmp(certp, r.body.data, r.body.len, 0644) < 0) {
+        char keytmp[2100];
+        snprintf(keytmp, sizeof keytmp, "%s.tmp", keyp);
+        unlink(keytmp);
+        ok = 0;
+    }
+    if (ok)
+        ok = rename_tmp(keyp) == 0 && rename_tmp(certp) == 0;
     BIO_free(bio);
     EVP_PKEY_free(key);
     aresp_free(&r);
@@ -982,6 +1013,23 @@ static double cert_remaining(const config_t *cfg, char **hosts, int nhosts, int 
     fclose(f);
     if (!x)
         return -1;
+    /* A key that isn't this certificate's (a write cut short) leaves the site on a
+     * temporary certificate: treat it as missing, so a new one is ordered now. */
+    char keyp[2048];
+    snprintf(keyp, sizeof keyp, "%s/certs/%s/key.pem", cfg->storage, hosts[0]);
+    EVP_PKEY *pkey = NULL;
+    if ((f = fopen(keyp, "r"))) {
+        pkey = PEM_read_PrivateKey(f, NULL, NULL, NULL);
+        fclose(f);
+    }
+    int matches = pkey && X509_check_private_key(x, pkey) == 1;
+    ERR_clear_error();
+    EVP_PKEY_free(pkey);
+    if (!matches) {
+        LOGW("acme: %s does not hold the key of %s's certificate; ordering a new one", keyp, hosts[0]);
+        X509_free(x);
+        return -1;
+    }
     int days = 0, secs = 0;
     ASN1_TIME_diff(&days, &secs, NULL, X509_get0_notAfter(x));
     double remaining = (double)days * 86400 + secs;
@@ -1022,6 +1070,23 @@ static int manager_main(config_t *cfg)
     signal(SIGINT, manager_sig);
     signal(SIGHUP, SIG_IGN);
     pid_t parent = getppid();
+    /* One manager at a time: a reload starts the next one without waiting for the previous
+     * to finish its order, and this one waits for it here. The lock goes with the process,
+     * however it ends. */
+    char lockp[2048];
+    snprintf(lockp, sizeof lockp, "%s/acme", cfg->storage);
+    mkdir_p(lockp);
+    snprintf(lockp, sizeof lockp, "%s/acme/lock", cfg->storage);
+    int lock = open(lockp, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock < 0)
+        LOGW("acme: cannot open %s (%s); not waiting for an earlier certificate manager", lockp, strerror(errno));
+    for (int waited = 0; lock >= 0 && flock(lock, LOCK_EX | LOCK_NB) < 0; waited++) {
+        if (manager_stop)
+            return 0;
+        if (waited == 0)
+            LOGI("acme: waiting for the previous certificate manager to finish");
+        usleep(100000);
+    }
     unsigned backoff = 60;
     for (;;) {
         acme_t a;
@@ -1053,15 +1118,17 @@ static int manager_main(config_t *cfg)
             LOGI("acme: %s certificate for %s", rem < 0 ? "obtaining" : "renewing", s->hosts[0]);
             if (acme_obtain(&a, s->hosts, s->nhosts) == 0)
                 any_obtained = 1;
+            else if (manager_stop)
+                LOGI("acme: order for %s left unfinished: the certificate manager is stopping", s->hosts[0]);
             else
                 any_failed = 1;
         }
         if (inited)
             acme_free(&a);
+        if (any_obtained && parent > 1 && getppid() == parent)
+            kill(parent, SIGHUP);   /* even when stopping: the certificate is stored, and only a reload loads it */
         if (manager_stop)
             break;
-        if (any_obtained && parent > 1)
-            kill(parent, SIGHUP);
         unsigned wait = ACME_CHECK_INTERVAL;
         if (any_failed) {
             wait = backoff;
@@ -1124,31 +1191,98 @@ int acme_manager_start(config_t *cfg)
     return 0;
 }
 
+/* Managers told to stop that the master hasn't reaped yet. */
+#define MAX_RETIRING 16
+static pid_t retiring[MAX_RETIRING];
+
+/* Wait for the managers in pids (0 = none) to exit: 5 s, then SIGKILL. */
+static void wait_managers(pid_t *pids, int n)
+{
+    for (int i = 0; i < 500; i++) {
+        int left = 0;
+        for (int k = 0; k < n; k++) {
+            if (pids[k] <= 0)
+                continue;
+            pid_t r = waitpid(pids[k], NULL, WNOHANG);
+            if (r == pids[k] || (r < 0 && errno == ECHILD))
+                pids[k] = 0;
+            else
+                left = 1;
+        }
+        if (!left)
+            return;
+        usleep(10000);
+    }
+    for (int k = 0; k < n; k++)
+        if (pids[k] > 0) {
+            LOGW("acme: certificate manager %d did not stop on SIGTERM; killing it", (int)pids[k]);
+            kill(pids[k], SIGKILL);
+            waitpid(pids[k], NULL, 0);
+            pids[k] = 0;
+        }
+}
+
+/* For a reload: tell the manager to stop and return at once. It ends at its next request
+ * (an order in progress is left for the next manager), the master reaps it, and the next
+ * manager waits for its lock. Waiting here blocked the master for up to 5 s whenever a
+ * reload came during an order (BUGREPORT1.md, problem 5). */
 void acme_manager_stop(void)
+{
+    if (manager_pid <= 0)
+        return;
+    kill(manager_pid, SIGTERM);
+    for (int i = 0; i < MAX_RETIRING; i++)
+        if (retiring[i] <= 0) {
+            retiring[i] = manager_pid;
+            manager_pid = 0;
+            return;
+        }
+    /* a burst of reloads filled the table: wait for this one as before */
+    pid_t one = manager_pid;
+    manager_pid = 0;
+    wait_managers(&one, 1);
+}
+
+/* For stopping, and before an upgrade's exec (the new image would not know them): stop
+ * every manager and wait, 5 s at most. */
+void acme_manager_stop_wait(void)
 {
     if (manager_pid > 0) {
         kill(manager_pid, SIGTERM);
-        /* never let the master hang on it: 5 s to finish, then SIGKILL */
-        int done = 0;
-        for (int i = 0; i < 500 && !done; i++) {
-            pid_t r = waitpid(manager_pid, NULL, WNOHANG);
-            if (r == manager_pid || (r < 0 && errno == ECHILD))
-                done = 1;
-            else
-                usleep(10000);
+        for (int i = 0; i < MAX_RETIRING; i++)
+            if (retiring[i] <= 0) {
+                retiring[i] = manager_pid;
+                manager_pid = 0;
+                break;
+            }
+        if (manager_pid > 0) {
+            pid_t one = manager_pid;
+            manager_pid = 0;
+            wait_managers(&one, 1);
         }
-        if (!done) {
-            LOGW("acme: certificate manager %d did not stop on SIGTERM; killing it", (int)manager_pid);
-            kill(manager_pid, SIGKILL);
-            waitpid(manager_pid, NULL, 0);
-        }
-        manager_pid = 0;
     }
+    wait_managers(retiring, MAX_RETIRING);
+}
+
+int acme_manager_reaped(pid_t pid)
+{
+    if (pid <= 0)
+        return 0;
+    for (int i = 0; i < MAX_RETIRING; i++)
+        if (retiring[i] == pid) {
+            retiring[i] = 0;
+            return 1;
+        }
+    if (pid == manager_pid)
+        manager_pid = 0;   /* it exited on its own: never signal its pid again */
+    return 0;
 }
 
 #else /* !LIMER_TLS */
 
 int acme_manager_start(config_t *cfg) { (void)cfg; return 0; }
 void acme_manager_stop(void) {}
+void acme_manager_stop_wait(void) {}
+int acme_manager_reaped(pid_t pid) { (void)pid; return 0; }
 
 #endif

@@ -760,7 +760,9 @@ int         path_has_dotfile(const char *clean);
 /* ACME (acme.c) */
 int  acme_load_stored(config_t *cfg, server_t *s, char *err, size_t errlen);
 int  acme_manager_start(config_t *cfg);   /* fork the certificate manager if needed */
-void acme_manager_stop(void);
+void acme_manager_stop(void);             /* reloads: SIGTERM it and return; the master reaps it */
+void acme_manager_stop_wait(void);        /* stopping, exec: stop every manager, wait 5 s at most */
+int  acme_manager_reaped(pid_t pid);      /* 1 when the master reaped a manager told to stop */
 int  acme_challenge_lookup(const config_t *cfg, const char *token, buf_t *out);
 
 int  tls_init_server(server_t *s, char *err, size_t errlen);   /* from files */

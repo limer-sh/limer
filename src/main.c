@@ -264,7 +264,7 @@ static void bin_rollback(const char *why, const char *prev_bin, const pid_t *pid
             quarantine(self, prev_bin, NULL, "upgrade rollback") == 0)
             target = self;
     }
-    acme_manager_stop();
+    acme_manager_stop_wait();
     sigprocmask(SIG_SETMASK, unblocked, NULL);
     execv(target, g_argv);
     if (target != prev_bin)
@@ -571,7 +571,7 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                                  cfg->storage, strerror(errno));
                         }
                     }
-                    acme_manager_stop();  /* the replacement image starts its own certificate manager */
+                    acme_manager_stop_wait();  /* the replacement image starts its own certificate manager */
                     LOGI("upgrade: re-executing into the new binary");
                     sigprocmask(SIG_SETMASK, &old, NULL);
                     execvp(g_argv[0], g_argv);
@@ -723,7 +723,8 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                     if (pids[i] == p)
                         is_worker = 1;
                 if (!is_worker) {
-                    LOGW("master: certificate manager exited (%d); it restarts on the next reload", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+                    if (!acme_manager_reaped(p))
+                        LOGW("master: certificate manager exited (%d); it restarts on the next reload", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
                     continue;
                 }
                 for (int i = 0; i < nworkers; i++) {
@@ -788,6 +789,7 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
                 break;
         }
     }
+    acme_manager_stop_wait();   /* told to stop with the workers; reap it before leaving */
     LOGI("master: all workers stopped");
     config_unref(cfg);
     if (prev_cfg)

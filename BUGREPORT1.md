@@ -4,9 +4,9 @@ Found while adding quillolang.org to the Limerfile on the RC Tuners VPS (104.207
 `/usr/local/bin/limer`, `limer 0.1.0 (tls)`, installed 2026-10-13 19:00 UTC). The production
 traffic moved to Caddy the same day; see "State of the server" at the end.
 
-Four problems. The first was fixed in the source (69a1ebb) but the fix never reached the server;
-the fourth was found while testing the fixes, and is in `main` (45b097b) too. The branch
-`reload-feedback` fixes 2, 3 and 4, with `tests/reload_test.py` (`make reload`).
+Five problems. The first was fixed in the source (69a1ebb) but the fix never reached the server;
+the fourth and fifth were found while testing the fixes. e80ae13 fixes 2, 3 and 4, the commit
+after it fixes 5, both with `tests/reload_test.py` (`make reload`).
 
 | # | Problem | Status |
 |---|---|---|
@@ -14,6 +14,7 @@ the fourth was found while testing the fixes, and is in `main` (45b097b) too. Th
 | 2 | `limer validate` run as root creates the access log files root-owned, and the next reload is refused | Fixed on `reload-feedback` |
 | 3 | `limer reload` / `systemctl reload limer` reports success when the master never acts on it | Fixed on `reload-feedback` |
 | 4 | Two reloads close together: the second one's SIGTERM is lost, and the master stalls 5–6 s | Fixed on `reload-feedback` |
+| 5 | A reload during a certificate order blocks the master until the order ends (up to 5 s) | Fixed after e80ae13 |
 
 ## 1. The master hangs in `acme_manager_stop()`
 
@@ -193,7 +194,7 @@ The production test also caught one bug in the new code, now fixed: `log_check_t
 "Success" for a log file it couldn't write, because `getpwuid()` (in an argument of the same
 `snprintf`) reset `errno` before `strerror(errno)` was evaluated.
 
-## 5. The master waits for a manager that is in the middle of an order (open)
+## 5. The master waits for a manager that is in the middle of an order
 
 Seen in production: a reload reached the master while the certificate manager was in the middle
 of an ACME order. The manager checks `manager_stop` only between steps, so it finished the order
@@ -203,19 +204,35 @@ of an ACME order. The manager checks `manager_stop` only between steps, so it fi
 Shortening the wait by SIGKILLing sooner isn't safe as the code stands: the order's result is
 written as `key.pem`, then `cert.pem` (each atomically, but not as a pair), so a kill between the
 two leaves a new key beside the old certificate. (The current 5 s SIGKILL has the same small
-window.) A fix that keeps the master free:
+window.) The fix (the commit after e80ae13):
 
-- `acme_manager_stop()` sends SIGTERM and returns; the master reaps the old manager on SIGCHLD;
-- every manager holds `flock(<storage>/acme/lock)` while it works, so a new one waits for the old
-  to exit (the kernel releases the lock even on SIGKILL), and only one ever writes certificates;
-- write a certificate's key and chain as a pair: both into a new directory renamed over the old
-  one, or a single file the loader reads both from;
-- check `manager_stop` after each ACME request, so an order in progress ends at the next step.
+- `acme_manager_stop()`, used by reloads, sends SIGTERM and returns. The master reaps the old
+  manager on SIGCHLD; `acme_manager_reaped()` tells it the exit was asked for, so it isn't
+  reported as a crash (and a manager that exits on its own is forgotten, so its pid is never
+  signalled again). Stopping, and an upgrade's re-exec, use `acme_manager_stop_wait()`: every
+  manager, 5 s at most, then SIGKILL, as before.
+- Every manager holds `flock(<storage>/acme/lock)` while it works, so a new one waits for the
+  old one to exit ("waiting for the previous certificate manager to finish"), and only one ever
+  orders or writes certificates. The kernel releases the lock even on SIGKILL.
+- `https_call()` returns at once when `manager_stop` is set, so an order in progress ends at its
+  next request ("order for X left unfinished: the certificate manager is stopping") instead of
+  running to the end; the connect and response errors such a stop causes are no longer logged.
+  A certificate obtained just before the stop still sends the master its SIGHUP.
+- The key and certificate are written to `.tmp` files in full, then renamed one right after
+  the other, so a kill can no longer land between writing them. A key that doesn't match its
+  certificate (`X509_check_private_key`) makes the renewal check treat the certificate as
+  missing, so a new one is ordered at once instead of at renewal time.
 
-Smaller, from the same run: a manager stopped during `connect()` logs "cannot connect to
-acme-v02.api.letsencrypt.org:443: Network is unreachable". That's the interrupted IPv4 attempt
-followed by the VPS's unreachable IPv6, not a network problem; with `manager_stop` set, it could
-log nothing. And `limer reload` loads every certificate (logging each) just to find the pidfile.
+Tests: `reload_test.py` stops the newest manager with SIGSTOP (busy, as in an order), then a
+reload must be answered at once (it took 6.0 s before the fix), the next manager must wait for
+the lock, and the stopped one, continued, must exit on its pending SIGTERM and be reaped without
+a warning. A planted key that isn't its certificate's must be ordered again. Against Pebble
+(Docker, Ubuntu 24.04), a reload during a real order: the master started the next manager in
+the same millisecond, the old one left its order, the new one got the certificate 5.6 s later,
+and both stored pairs matched.
+
+Still open, and small: `limer reload` loads every certificate (logging each) just to find the
+pidfile.
 
 ## Smaller things noticed
 

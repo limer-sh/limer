@@ -150,6 +150,44 @@ try:
     check("did not stop on SIGTERM" not in log_text(), "the certificate manager stopped on SIGTERM every time",
           "\n".join(l for l in log_text().splitlines() if "did not stop" in l))
 
+    print("# a reload while the manager is busy (stopped here, as if mid-order): the master doesn't wait")
+    busy = int(re.findall(r"certificate manager started \(pid (\d+)", log_text())[-1])
+    os.kill(busy, signal.SIGSTOP)
+    code, out, took = limer("reload", "-c", CFG)
+    check(code == 0 and took < 1.5, f"the reload is answered at once: exit {code} in {took:.1f}s", out)
+    check(wait_for(lambda: "waiting for the previous certificate manager" in log_text(), 3),
+          "the new manager waits for the busy one's lock")
+    try:
+        os.kill(busy, signal.SIGCONT)
+    except ProcessLookupError:
+        pass   # already killed (a master that waited 5 s for it, then SIGKILLed it)
+
+    def gone(pid):
+        try:
+            os.kill(pid, 0)
+            return False
+        except ProcessLookupError:
+            return True
+    check(wait_for(lambda: gone(busy), 5), "the busy manager exits on its pending SIGTERM, and is reaped")
+    check("certificate manager exited" not in log_text(), "a manager told to stop is reaped without a warning")
+    check("did not stop on SIGTERM" not in log_text(), "no manager was killed")
+
+    print("# a stored key that isn't its certificate's is ordered again")
+    certdir = os.path.join(TMP, "storage", "certs", "reload.example.com")
+    os.makedirs(certdir, exist_ok=True)
+    keys = [os.path.join(TMP, f"k{i}.pem") for i in (1, 2)]
+    for k in keys:
+        subprocess.run(["openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", k],
+                       check=True, capture_output=True)
+    subprocess.run(["openssl", "req", "-x509", "-key", keys[0], "-out", os.path.join(certdir, "cert.pem"), "-days", "90",
+                    "-subj", "/CN=reload.example.com", "-addext", "subjectAltName=DNS:reload.example.com"],
+                   check=True, capture_output=True)
+    shutil.copy(keys[1], os.path.join(certdir, "key.pem"))
+    code, out, _ = limer("reload", "-c", CFG)
+    check(wait_for(lambda: "does not hold the key of reload.example.com" in log_text(), 5),
+          "the mismatch is noticed, and a new certificate ordered")
+    shutil.rmtree(certdir)
+
     print("# a configuration the master refuses")
     with open(CFG, "a") as f:
         f.write("\nbroken.example.com {\n    reverse_proxy\n}\n")
