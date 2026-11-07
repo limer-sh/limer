@@ -301,3 +301,74 @@ void cache_free(cache_t *c)
     free(c->buckets);
     free(c);
 }
+
+/* Remove entries whose host matches `host` (any host when it is NULL or empty)
+ * and whose request path matches `path` (a prefix when is_prefix). The key is
+ * "listener\x1fmethod\x1fscheme\x1fhost\x1furi". Returns the number removed. */
+int cache_purge_match(cache_t *c, const char *host, const char *path, int is_prefix)
+{
+    if (!c || !path)
+        return 0;
+    size_t pl = strlen(path);
+    int removed = 0;
+    for (cache_entry_t *e = c->lru_head, *next; e; e = next) {
+        next = e->lru_next;
+        const char *k = e->key, *host_f = NULL, *uri_f = NULL;
+        int seps = 0;
+        for (const char *p = k; *p; p++)
+            if (*p == '\x1f') {
+                seps++;
+                if (seps == 3)
+                    host_f = p + 1;
+                else if (seps == 4) {
+                    uri_f = p + 1;
+                    break;
+                }
+            }
+        if (!host_f || !uri_f)
+            continue;
+        if (host && *host) {
+            size_t hl = (size_t)(uri_f - 1 - host_f);
+            if (strlen(host) != hl || strncasecmp(host_f, host, hl) != 0)
+                continue;
+        }
+        size_t ul = strcspn(uri_f, "?"); /* path, without any query string */
+        int match = is_prefix ? (ul >= pl && strncmp(uri_f, path, pl) == 0)
+                              : (ul == pl && strncmp(uri_f, path, pl) == 0);
+        if (match) {
+            cache_remove(c, e);
+            removed++;
+        }
+    }
+    return removed;
+}
+
+/* A purge issued on one worker reaches the others through this ring in shared
+ * memory: each worker applies the commands it has not seen yet on its tick. */
+size_t cache_purge_log_bytes(void) { return sizeof(cache_purge_log_t); }
+
+void cache_purge_submit(cache_purge_log_t *l, const char *host, const char *path, int prefix)
+{
+    if (!l)
+        return;
+    uint64_t n = __atomic_add_fetch(&l->head, 1, __ATOMIC_ACQ_REL);
+    purge_slot_t *s = &l->ring[(n - 1) % PURGE_RING];
+    snprintf(s->host, sizeof s->host, "%s", host ? host : "");
+    snprintf(s->path, sizeof s->path, "%s", path ? path : "");
+    s->prefix = prefix ? 1 : 0;
+    __atomic_store_n(&s->seq, n, __ATOMIC_RELEASE);
+}
+
+uint64_t cache_purge_apply(cache_purge_log_t *l, uint64_t last_applied, cache_t *c)
+{
+    if (!l || !c)
+        return last_applied;
+    uint64_t head = __atomic_load_n(&l->head, __ATOMIC_ACQUIRE);
+    for (uint64_t s = last_applied + 1; s <= head; s++) {
+        purge_slot_t *slot = &l->ring[(s - 1) % PURGE_RING];
+        if (__atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE) != s)
+            continue; /* overwritten by newer purges before we got to it */
+        cache_purge_match(c, slot->host, slot->path, slot->prefix);
+    }
+    return head;
+}

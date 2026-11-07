@@ -388,6 +388,13 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
         }
     }
     proxy_set_registry(registry);
+
+    /* Cross-worker cache purge log, shared across fork (see cache.c). */
+    cache_purge_log_t *purge = mmap(NULL, cache_purge_log_bytes(), PROT_READ | PROT_WRITE,
+                                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (purge == MAP_FAILED)
+        purge = NULL;
+    proxy_set_purge_log(purge);
     config_t *prev_cfg = NULL;              /* last-known-good config while a reload is on probation */
     int probation = 0;
     double probation_until = 0;
@@ -798,6 +805,8 @@ static int run_master(config_t *cfg, const char *cfg_path, const char *pidfile, 
         munmap(shared, SH_SLOTS * sizeof(uint64_t));
     if (registry)
         munmap(registry, registry_bytes());
+    if (purge)
+        munmap(purge, cache_purge_log_bytes());
     free(pids);
     free(spawned);
     if (pidfile && read_pidfile(pidfile) == getpid())

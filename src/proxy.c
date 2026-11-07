@@ -61,8 +61,10 @@ static int g_epfd = -1;
 static config_t *g_cfg;
 static ipguard_t *g_ipguard;    /* per-source-IP admission control (DoS mitigation) */
 static uint64_t *g_shared_stats; /* page shared with the master (SH_* slots) */
-static registry_t *g_registry;
-#define BROADCAST_MAX_BODY 65536   /* POST /broadcast: largest body fanned out to a pool */   /* self-registration table, shared with the master and all workers */
+static registry_t *g_registry;   /* self-registration table, shared with the master and all workers */
+static cache_purge_log_t *g_purge_log; /* cross-worker cache purge ring (shared) */
+static uint64_t g_purge_applied;       /* purge commands this worker has applied */
+#define BROADCAST_MAX_BODY 65536   /* POST /broadcast: largest body fanned out to a pool */
 static config_t *g_canary_old;   /* known-good config still served while a new one is on probation */
 static uint64_t g_canary_gen;    /* SH_CANARY_GEN of the probation g_canary_old belongs to */
 
@@ -360,6 +362,7 @@ static void conn_serve_cached(conn_t *c, cache_entry_t *e, double now, int x_cac
 #define TTL_EXPIRED (-2.0)   /* invalid or already-past freshness: do not cache */
 static double response_declared_ttl(http_resp_t *r);
 static double response_swr(http_resp_t *r, double cfg_swr);
+static int request_cacheable(conn_t *c);
 #ifdef LIMER_H2
 #define H2_SEND_HIGH (1024 * 1024)
 struct h2u_session;
@@ -1666,6 +1669,13 @@ static void build_upstream_request(conn_t *c, uconn_t *uc)
         }
         if (http_hdr_connection_has(conn_hdr, n))
             continue; /* header nominated as hop-by-hop */
+        /* For a cacheable request on a site that compresses, ask the upstream for an
+         * identity body: an origin-compressed answer cannot be cached (problem 1),
+         * so one plain copy is stored and compressed per client instead, and the
+         * client's Accept-Encoding string no longer splits the cache (problem 7). */
+        if (strcasecmp(n, "Accept-Encoding") == 0 && c->srv && c->srv->encode &&
+            c->cache_cfg && request_cacheable(c))
+            continue;
         hlist_add(&h, n, r->hdrs[i].value);
     }
     if (r->upgrade)
@@ -2896,6 +2906,10 @@ static void cache_vary_values(conn_t *c, const char *vary, buf_t *out)
     snprintf(tmp, sizeof tmp, "%s", vary);
     char *save = NULL;
     for (char *t = strtok_r(tmp, ", \t", &save); t; t = strtok_r(NULL, ", \t", &save)) {
+        /* limer stores one identity body and compresses it per client, so the
+         * client's Accept-Encoding does not select a stored variant (problem 7). */
+        if (strcasecmp(t, "Accept-Encoding") == 0)
+            continue;
         const char *v = http_hdr_get(c->req.hdrs, c->req.nhdr, t);
         buf_printf(out, "%s=%s;", t, v ? v : "");
     }
@@ -5612,6 +5626,37 @@ static void admin_handle(conn_t *c)
             g_stats.requests += (uint64_t)sent;
             buf_printf(&b, "{\"status\":\"sent\",\"service\":\"%s\",\"members\":%d}\n", svc, sent);
         }
+    } else if (strcmp(path, "/cache/purge") == 0) {
+        /* Remove cached entries by host and path (exact) or prefix. The cache is
+         * per worker, so this purges the local cache now and writes the command
+         * to a shared ring the other workers apply on their next tick. */
+        char host[PURGE_HOST_LEN] = "", pathq[PURGE_PATH_LEN] = "", prefixq[PURGE_PATH_LEN] = "";
+        admin_qparam(c->req.query, "host", host, sizeof host);
+        admin_qparam(c->req.query, "path", pathq, sizeof pathq);
+        admin_qparam(c->req.query, "prefix", prefixq, sizeof prefixq);
+        const char *pat = pathq[0] ? pathq : prefixq;
+        int is_prefix = pathq[0] ? 0 : 1;
+        if (strcmp(c->req.method, "POST") != 0) {
+            status = 405;
+            buf_puts(&b, "{\"error\":\"use POST\"}\n");
+        } else if (!g_cache) {
+            status = 404;
+            buf_puts(&b, "{\"error\":\"no cache is configured\"}\n");
+        } else if (!pat[0] && !host[0]) {
+            status = 400;
+            buf_puts(&b, "{\"error\":\"need ?host=<h> and/or ?path=<p> (or ?prefix=<p>)\"}\n");
+        } else {
+            if (!pat[0]) {
+                pat = "/";
+                is_prefix = 1; /* host given, no path: purge everything for that host */
+            }
+            int n = cache_purge_match(g_cache, host, pat, is_prefix);
+            if (g_purge_log)
+                cache_purge_submit(g_purge_log, host, pat, is_prefix);
+            LOGI("cache: purged %d entr%s (host=%s %s=%s)", n, n == 1 ? "y" : "ies",
+                 host[0] ? host : "*", is_prefix ? "prefix" : "path", pat);
+            buf_printf(&b, "{\"status\":\"purged\",\"removed\":%d}\n", n);
+        }
     } else if (strcmp(path, "/registry") == 0) {
         if (!g_registry) {
             buf_puts(&b, "{\"members\":[]}\n");
@@ -5631,7 +5676,7 @@ static void admin_handle(conn_t *c)
         }
     } else {
         status = 404;
-        buf_puts(&b, "{\"error\":\"not found\",\"endpoints\":[\"/health\",\"/upstreams\",\"/metrics\",\"/config\",\"/overrides\",\"/reload (POST)\",\"/drain|/undrain (POST, self)\",\"/scale_up (POST)\",\"/register|/deregister (POST, self)\",\"/registry\",\"/upstreams/<host:port>/drain|undrain|weight/<n> (POST)\"]}\n");
+        buf_puts(&b, "{\"error\":\"not found\",\"endpoints\":[\"/health\",\"/upstreams\",\"/metrics\",\"/config\",\"/overrides\",\"/reload (POST)\",\"/drain|/undrain (POST, self)\",\"/scale_up (POST)\",\"/register|/deregister (POST, self)\",\"/registry\",\"/cache/purge (POST)\",\"/upstreams/<host:port>/drain|undrain|weight/<n> (POST)\"]}\n");
     }
     c->route = NULL;
     conn_write_simple_response(c, status, ctype, b.data ? b.data : "", b.len, NULL, 0, extra[0] ? extra : NULL);
@@ -5949,6 +5994,10 @@ static void tick(void)
     if (!g_shutting_down)
         scale_check();
 
+    /* apply cache purges issued on any worker (cheap when none are pending) */
+    if (g_purge_log && g_cache)
+        g_purge_applied = cache_purge_apply(g_purge_log, g_purge_applied, g_cache);
+
     /* worker 0 owns registry maintenance: evict members whose heartbeat lapsed, and
      * persist the set (debounced) so a restart or upgrade starts populated. The
      * eviction bumps the generation, so every worker rebuilds its discover pools. */
@@ -6050,6 +6099,7 @@ static void on_sigterm(int sig) { (void)sig; g_shutdown_flag = 1; }
 
 void proxy_set_shared_stats(uint64_t *counters) { g_shared_stats = counters; }
 void proxy_set_registry(registry_t *r) { g_registry = r; }
+void proxy_set_purge_log(cache_purge_log_t *l) { g_purge_log = l; }
 void proxy_request_reload(void)   { g_reload_flag = 1; }
 void proxy_request_shutdown(void) { g_shutdown_flag = 1; }
 

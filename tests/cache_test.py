@@ -30,7 +30,7 @@ TMP = os.path.join("tests", "tmp", "cache")
 os.makedirs(TMP, exist_ok=True)
 
 BIN = sys.argv[1] if len(sys.argv) > 1 else "./limer"
-A, B = 9960, 9961          # two Limer sites
+A, B, C, ADMIN = 9960, 9961, 9965, 9964  # two sites, one encode site, admin
 O1, O2 = 9962, 9963        # two origins (for the two-site test)
 PASS = FAIL = 0
 HITS = {}
@@ -154,7 +154,7 @@ def main():
     cfg = os.path.join(TMP, "Limerfile")
     with open(cfg, "w") as f:
         f.write(f"""{{
-    admin off
+    admin 127.0.0.1:{ADMIN}
     log_level warn
     storage {TMP}/storage
 }}
@@ -170,6 +170,13 @@ http://127.0.0.1:{B} {{
         ttl 5m
     }}
     reverse_proxy 127.0.0.1:{O2}
+}}
+http://127.0.0.1:{C} {{
+    encode gzip
+    cache {{
+        ttl 5m
+    }}
+    reverse_proxy 127.0.0.1:{O1}
 }}
 """)
     log = open(os.path.join(TMP, "limer.log"), "w")
@@ -226,6 +233,45 @@ http://127.0.0.1:{B} {{
         time.sleep(1.4)
         head, _ = raw_get(A, "/mr")
         check("x-cache: stale" not in head.lower(), "must-revalidate is not served stale", head.split("\r\n")[0] + " ...")
+
+        print("problems 1b/7: a compressing origin is cached and compressed per client")
+        raw_get(C, "/gz", {"Accept-Encoding": "gzip"})  # fill (origin would compress; limer asks identity)
+        head, body = raw_get(C, "/gz", {"Accept-Encoding": "gzip"})
+        is_hit = "x-cache: hit" in head.lower()
+        is_gz = "content-encoding: gzip" in head.lower() and body[:2] == b"\x1f\x8b"
+        check(is_hit and is_gz, "a gzip client gets a cached, correctly-encoded answer", head.split(chr(13))[0])
+        check(gzip.decompress(body) == BIG, "the cached gzip body decodes to the original")
+        phead, pbody = raw_get(C, "/gz", {"Accept-Encoding": "identity"})
+        check("x-cache: hit" in phead.lower() and pbody == BIG, "a plain client is served the same entry, uncompressed")
+        before = HITS.get("/gz2", 0)
+        for e in ("gzip, deflate, br, zstd", "gzip, deflate, br", "gzip, deflate"):
+            raw_get(C, "/gz2", {"Accept-Encoding": e})
+        check(HITS.get("/gz2", 0) - before == 1, "varied Accept-Encoding strings do not thrash the cache",
+              f"origin hits={HITS.get('/gz2', 0) - before}")
+
+        print("problem 8: the cache can be purged")
+        import json as _json
+        def purge(q):
+            r = urllib.request.Request(f"http://127.0.0.1:{ADMIN}/cache/purge?{q}", method="POST")
+            try:
+                with urllib.request.urlopen(r, timeout=5) as resp:
+                    return resp.status, _json.loads(resp.read() or b"{}")
+            except urllib.error.HTTPError as e:
+                return e.code, {}
+        # warm a cacheable entry (max-age via /name), confirm HIT, purge, confirm MISS
+        raw_get(A, "/name")
+        h1, _ = raw_get(A, "/name")
+        check("x-cache: hit" in h1.lower(), "an entry is a HIT before purge", h1.split(chr(13))[0])
+        st, j = purge("path=/name")
+        check(st == 200 and j.get("removed") >= 1, "POST /cache/purge removes the entry", f"{st} {j}")
+        h2, _ = raw_get(A, "/name")
+        check("x-cache: miss" in h2.lower(), "the purged path is a MISS again", h2.split(chr(13))[0])
+        # prefix purge
+        raw_get(A, "/name")
+        st, j = purge("prefix=/na")
+        check(st == 200 and j.get("removed") >= 1, "a prefix purge removes matching entries", j)
+        st, _ = purge("")
+        check(st == 400, "a purge with no host or path is refused", f"{st}")
 
         text = open(os.path.join(TMP, "limer.log")).read()
         check("AddressSanitizer" not in text and "runtime error" not in text, "no sanitizer reports")

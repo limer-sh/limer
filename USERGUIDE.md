@@ -792,7 +792,12 @@ authorized request without `public`, or arrives already compressed
 (`Content-Encoding`) — an origin-compressed body cannot be reframed per client,
 so put compression on limer with `encode` and let the origin send identity.
 `Cache-Control` and `Vary` are read across all of their header lines.
-Each entry stores one body and frames it per client. Hits carry `Age` and
+To cache a site that compresses, put `encode` on the site: limer asks the
+origin for an identity body, stores it once, and compresses it per client, so
+one entry serves gzip, br and plain clients and the client's `Accept-Encoding`
+string does not split the cache. A wrong or stale entry can be dropped at
+runtime with `POST /cache/purge` (by host and path or prefix) on the admin
+API. Each entry stores one body and frames it per client. Hits carry `Age` and
 `X-Cache: HIT`; a client's `If-None-Match`/`If-Modified-Since` against a
 cached validator gets `304`. A stale entry is revalidated conditionally and a
 `304` refreshes it in place; within the `stale` window the stale copy is
@@ -895,6 +900,7 @@ Enable with `admin <addr>` in the global block.
 | `POST /register` | Self-register into a `discover` pool: `?service=<pool>&port=<n>&ttl=<s>&weight=<n>`; repeat as a heartbeat. |
 | `POST /deregister` | Leave a `discover` pool: `?service=<pool>&port=<n>`. |
 | `GET /registry` | List the currently registered members. |
+| `POST /cache/purge` | Remove cached entries by `?host=<h>` and `?path=<p>` (exact) or `?prefix=<p>`; reaches every worker. |
 | `POST /broadcast` | Send the request body to every member of a `discover` pool with a `broadcast` path: `?service=<pool>` (see Broadcasts). |
 | `POST /scale_up` | Run the `scale_up` hook now (`202`), or `429` with `Retry-After` inside its cooldown. |
 | `GET /overrides`, `DELETE /overrides` | List or clear the runtime overrides. |
@@ -1084,6 +1090,7 @@ GitHub Actions workflow in `.github/workflows/ci.yml` runs both on every push.
 | `make rollback` | `tests/rollback_test.py`: under continuous traffic, a healthy reload is committed after its canary probation, a reload to a dead backend is reverted with only the canary share affected, and the rejected (and an invalid) Limerfile is quarantined while the good one is restored. |
 | `make binrollback` | `tests/binrollback_test.py`: builds a deliberately broken limer, then upgrades under traffic — a good binary is committed, the broken one is rolled back with the same pid, and the previous binary is restored at its install path. |
 | `make h3` | `tests/h3_test.py`: HTTP/3 with the aioquic client — local and proxied responses, forwarded headers, path and query, small and 200 KB POST bodies, a 3 MiB response, 20 concurrent streams on one connection, a bodiless 204, `Alt-Svc` on HTTPS over TCP, HTTP/3 after a reload, and a graceful stop (skips when aioquic is not installed). |
+| `make cache` | `tests/cache_test.py`: the response cache in front of an origin that counts its hits and varies by request — origin-compressed answers, repeated Cache-Control/Vary lines, two sites on one host, invalid/absent freshness, no-cache revalidation, must-revalidate, per-client compression of a compressing origin, and purge. |
 | `make admin` | `tests/admin_test.py`: the admin secret (`401` without it, `/health` open), `POST /scale_up` and its cooldown, bans for wrong secrets and for webhook floods, ban expiry, self-drain with the secret, one hook run across two workers, and config validation (short secrets, the open-admin warning). |
 | `make discover` | `tests/discover_test.py`: a `discover` pool fills from self-registration — health- and settle-gated admission, heartbeat expiry, deregister, the allow-list, unknown-pool refusal, and that discovery never empties a pool. |
 | `make status` | `tests/status_test.py`: `retry_status` sends a request to the next upstream on 404 and 503 and replays a POST body, a 404 from every upstream passes through, and `redirect_on` turns it into a redirect. |

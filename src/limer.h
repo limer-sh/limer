@@ -468,6 +468,28 @@ int      cache_entry_state(const cache_entry_t *e, double now);   /* 0 fresh, 1 
 double   cache_entry_age(const cache_entry_t *e, double now);
 int      cache_entry_status(const cache_entry_t *e);
 double   cache_entry_ttl(const cache_entry_t *e);
+int      cache_purge_match(cache_t *c, const char *host, const char *path, int is_prefix);
+
+/* Cross-worker cache purge: a POST /cache/purge on one worker writes a command
+ * here (shared memory, created by the master before forking); every worker
+ * applies the commands it has not seen on its tick. */
+#define PURGE_RING     32
+#define PURGE_HOST_LEN 256
+#define PURGE_PATH_LEN 512
+typedef struct {
+    uint64_t seq;                   /* which command this slot holds (0 = empty) */
+    char     host[PURGE_HOST_LEN];
+    char     path[PURGE_PATH_LEN];
+    uint32_t prefix;
+} purge_slot_t;
+typedef struct cache_purge_log {
+    uint64_t head;                  /* total purges ever issued */
+    purge_slot_t ring[PURGE_RING];
+} cache_purge_log_t;
+size_t   cache_purge_log_bytes(void);
+void     cache_purge_submit(cache_purge_log_t *l, const char *host, const char *path, int prefix);
+uint64_t cache_purge_apply(cache_purge_log_t *l, uint64_t last_applied, cache_t *c);
+void     proxy_set_purge_log(cache_purge_log_t *l);
 const char *cache_entry_reason(const cache_entry_t *e);
 const char *cache_entry_body(const cache_entry_t *e, size_t *len);
 const char *cache_entry_etag(const cache_entry_t *e);
