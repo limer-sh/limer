@@ -180,6 +180,7 @@ int cache_entry_state(const cache_entry_t *e, double now)
 }
 
 int cache_entry_status(const cache_entry_t *e) { return e->status; }
+double cache_entry_ttl(const cache_entry_t *e) { return e->ttl; }
 const char *cache_entry_reason(const cache_entry_t *e) { return e->reason; }
 const char *cache_entry_body(const cache_entry_t *e, size_t *len) { *len = e->body_len; return e->body; }
 const char *cache_entry_etag(const cache_entry_t *e) { return e->etag; }

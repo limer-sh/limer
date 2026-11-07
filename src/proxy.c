@@ -355,7 +355,11 @@ static void conn_spawn_refresh(conn_t *parent);
 static void conn_sink_close(conn_t *c);
 static void cache_consider_response(conn_t *c, http_resp_t *r);
 static void conn_serve_cached(conn_t *c, cache_entry_t *e, double now, int x_cache_stale);
+/* response_declared_ttl sentinels (full definitions below) */
+#define TTL_NONE    (-1.0)   /* the response says nothing about freshness */
+#define TTL_EXPIRED (-2.0)   /* invalid or already-past freshness: do not cache */
 static double response_declared_ttl(http_resp_t *r);
+static double response_swr(http_resp_t *r, double cfg_swr);
 #ifdef LIMER_H2
 #define H2_SEND_HIGH (1024 * 1024)
 struct h2u_session;
@@ -1957,11 +1961,12 @@ static void build_client_response_head(conn_t *c, uconn_t *uc)
 
     /* compression: the body is re-framed as chunked (HTTP/1.1) or close-delimited */
     const char *encname = NULL;
+    char ccbuf[1024];
     if (c->resp_mode != RM_NONE)
         encname = conn_pick_encoding(c, http_hdr_get(r->hdrs, r->nhdr, "Content-Type"),
                                      c->resp_mode == RM_LENGTH ? r->content_length : -1, r->status,
                                      http_hdr_get(r->hdrs, r->nhdr, "Content-Encoding"),
-                                     http_hdr_get(r->hdrs, r->nhdr, "Cache-Control"));
+                                     http_hdr_get_joined(r->hdrs, r->nhdr, "Cache-Control", ccbuf, sizeof ccbuf));
     if (encname && (c->enc = encoder_new(encname)) != NULL) {
         c->body_sync = c->resp_mode != RM_LENGTH;
         if (c->resp_mode == RM_CHUNKED)
@@ -2255,12 +2260,17 @@ static void uconn_on_response_data(uconn_t *uc)
         }
         if (uc->resp.status == 304 && c->revalidating && c->reval_entry && g_cache) {
             /* the stored body is still valid: refresh its freshness and serve it */
+            /* A 304 with its own Cache-Control updates the stored freshness; one
+             * without keeps what the entry said (RFC 9111 4.3.4) — so a no-cache
+             * entry (ttl 0) keeps always-revalidating instead of being bumped to a
+             * reusable window (problem 5). */
             double nttl = response_declared_ttl(&uc->resp);
-            if (nttl < 0)
-                nttl = c->cache_cfg->ttl;
-            if (nttl <= 0)
-                nttl = 60; /* a validated entry stays usable for a short while */
-            cache_entry_refresh(g_cache, c->reval_entry, g_now, nttl, c->cache_cfg->swr);
+            if (nttl == TTL_EXPIRED)
+                nttl = 0;
+            else if (nttl == TTL_NONE)
+                nttl = cache_entry_ttl(c->reval_entry);
+            double nswr = response_swr(&uc->resp, c->cache_cfg->swr);
+            cache_entry_refresh(g_cache, c->reval_entry, g_now, nttl, nswr);
             uc->head_done = 1;
             if (c->cache_sink) {
                 upstream_t *u2 = c->up;
@@ -2869,8 +2879,11 @@ static void cache_build_key(conn_t *c, buf_t *out)
 {
     char host[256];
     host_only(http_hdr_get(c->req.hdrs, c->req.nhdr, "Host"), host, sizeof host);
-    buf_printf(out, "%s\x1f%s\x1f%s\x1f%s", c->req.method, c->ctx.tls ? "https" : "http",
-               host[0] ? host : "-", c->req.uri);
+    /* Key on the listener too: the cache is one per worker, shared by every site,
+     * so two sites on the same host name but different ports (or SNI) must not
+     * collide (problem 3). The listener address is the site's identity. */
+    buf_printf(out, "%s\x1f%s\x1f%s\x1f%s\x1f%s", c->listen_addr, c->req.method,
+               c->ctx.tls ? "https" : "http", host[0] ? host : "-", c->req.uri);
     buf_append(out, "", 1);
 }
 
@@ -2888,24 +2901,45 @@ static void cache_vary_values(conn_t *c, const char *vary, buf_t *out)
     }
 }
 
-/* freshness (seconds) a response declares for itself; -1 if none */
+/* Freshness a response declares for itself, in seconds:
+ *   >= 0        fresh for this long (0 = no-cache / max-age=0: store but revalidate)
+ *   TTL_NONE    the response says nothing about freshness
+ *   TTL_EXPIRED the response gives freshness that is invalid or already past
+ *               (max-age=-1, Expires: 0, an Expires in the past) — RFC 9111 5.3
+ * Cache-Control is read across all of its lines (RFC 9110 5.3). */
 static double response_declared_ttl(http_resp_t *r)
 {
-    const char *cc = http_hdr_get(r->hdrs, r->nhdr, "Cache-Control");
+    char ccbuf[1024];
+    const char *cc = http_hdr_get_joined(r->hdrs, r->nhdr, "Cache-Control", ccbuf, sizeof ccbuf);
     double num = 0;
     if (cc_directive(cc, "no-cache", NULL))
         return 0;
     if (cc_directive(cc, "s-maxage", &num) || cc_directive(cc, "max-age", &num))
-        return num;
+        return num >= 0 ? num : TTL_EXPIRED;
     const char *exp = http_hdr_get(r->hdrs, r->nhdr, "Expires");
     if (exp) {
-        const char *date = http_hdr_get(r->hdrs, r->nhdr, "Date");
         time_t e = http_date_parse(exp);
+        if (e <= 0)
+            return TTL_EXPIRED; /* an Expires that does not parse (e.g. "0") means already expired */
+        const char *date = http_hdr_get(r->hdrs, r->nhdr, "Date");
         time_t d = date ? http_date_parse(date) : (time_t)now_wall();
-        if (e > 0)
-            return (double)(e - (d > 0 ? d : (time_t)now_wall()));
+        double ttl = (double)(e - (d > 0 ? d : (time_t)now_wall()));
+        return ttl >= 0 ? ttl : TTL_EXPIRED;
     }
-    return -1;
+    return TTL_NONE;
+}
+
+/* stale-while-revalidate window a response allows: 0 when it forbids serving
+ * stale (no-cache, must-revalidate, proxy-revalidate, or s-maxage, which implies
+ * proxy-revalidate per RFC 9111 5.2.2.10), otherwise the configured window. */
+static double response_swr(http_resp_t *r, double cfg_swr)
+{
+    char ccbuf[1024];
+    const char *cc = http_hdr_get_joined(r->hdrs, r->nhdr, "Cache-Control", ccbuf, sizeof ccbuf);
+    if (cc_directive(cc, "no-cache", NULL) || cc_directive(cc, "must-revalidate", NULL) ||
+        cc_directive(cc, "proxy-revalidate", NULL) || cc_directive(cc, "s-maxage", NULL))
+        return 0;
+    return cfg_swr;
 }
 
 static int request_cacheable(conn_t *c)
@@ -3073,16 +3107,24 @@ static void conn_serve_cached(conn_t *c, cache_entry_t *e, double now, int x_cac
     }
 
     /* compression for this client */
-    const char *ctype = NULL, *cc = NULL;
+    const char *ctype = NULL;
+    char ccbuf[1024];
+    ccbuf[0] = 0;
     for (int i = 0; i < cache_entry_nhdr(e); i++) {
-        if (strcasecmp(cache_entry_hdr_name(e, i), "Content-Type") == 0)
+        const char *n = cache_entry_hdr_name(e, i);
+        if (strcasecmp(n, "Content-Type") == 0)
             ctype = cache_entry_hdr_value(e, i);
-        else if (strcasecmp(cache_entry_hdr_name(e, i), "Cache-Control") == 0)
-            cc = cache_entry_hdr_value(e, i);
+        else if (strcasecmp(n, "Cache-Control") == 0) {
+            const char *v = cache_entry_hdr_value(e, i);
+            if (ccbuf[0] && strlen(ccbuf) + 2 < sizeof ccbuf)
+                strcat(ccbuf, ", ");
+            if (v)
+                strncat(ccbuf, v, sizeof ccbuf - strlen(ccbuf) - 1);
+        }
     }
     buf_t packed;
     buf_init(&packed);
-    const char *encname = is_head ? NULL : conn_pick_encoding(c, ctype, (int64_t)blen, status, NULL, cc);
+    const char *encname = is_head ? NULL : conn_pick_encoding(c, ctype, (int64_t)blen, status, NULL, ccbuf[0] ? ccbuf : NULL);
     const char *out_body = body;
     size_t out_len = blen;
     if (encname) {
@@ -3184,41 +3226,44 @@ static void cache_consider_response(conn_t *c, http_resp_t *r)
     if (!(status == 200 || status == 203 || status == 204 || status == 300 ||
           status == 301 || status == 308 || status == 404 || status == 410))
         return;
-    const char *cc = http_hdr_get(r->hdrs, r->nhdr, "Cache-Control");
+    char ccbuf[1024];
+    const char *cc = http_hdr_get_joined(r->hdrs, r->nhdr, "Cache-Control", ccbuf, sizeof ccbuf);
     if (cc_directive(cc, "no-store", NULL) || cc_directive(cc, "private", NULL))
         return;
     if (http_hdr_get(r->hdrs, r->nhdr, "Set-Cookie"))
         return;
-    const char *vary = http_hdr_get(r->hdrs, r->nhdr, "Vary");
+    /* An already-compressed body cannot be stored and reframed per client:
+     * Content-Encoding is dropped when serving, so a kept gzip body would reach
+     * the next client as unreadable bytes. Do not cache it (problem 1). */
+    const char *ce = http_hdr_get(r->hdrs, r->nhdr, "Content-Encoding");
+    if (ce && *ce && strcasecmp(ce, "identity") != 0)
+        return;
+    char varybuf[512];
+    const char *vary = http_hdr_get_joined(r->hdrs, r->nhdr, "Vary", varybuf, sizeof varybuf);
+    if (!*vary)
+        vary = NULL;
     if (vary && strchr(vary, '*'))
         return;
     /* an Authorization'd request is only cacheable if the response is explicitly public */
     if (http_hdr_get(c->req.hdrs, c->req.nhdr, "Authorization") && !cc_directive(cc, "public", NULL))
         return;
-    /* freshness */
-    double ttl = -1, num = 0;
-    if (cc_directive(cc, "s-maxage", &num))
-        ttl = num;
-    else if (cc_directive(cc, "max-age", &num))
-        ttl = num;
-    else {
-        const char *exp = http_hdr_get(r->hdrs, r->nhdr, "Expires");
-        const char *date = http_hdr_get(r->hdrs, r->nhdr, "Date");
-        if (exp) {
-            time_t e = http_date_parse(exp);
-            time_t d = date ? http_date_parse(date) : (time_t)now_wall();
-            if (e > 0)
-                ttl = (double)(e - (d > 0 ? d : (time_t)now_wall()));
-        }
-    }
-    if (cc_directive(cc, "no-cache", NULL))
-        ttl = 0; /* store, but always revalidate */
-    if (ttl < 0)
+    /* freshness (problem 4: "said nothing" is not the same as "said something invalid") */
+    int no_cache = cc_directive(cc, "no-cache", NULL);
+    double ttl = response_declared_ttl(r);
+    if (ttl == TTL_EXPIRED)
+        return; /* already expired or an invalid lifetime (max-age=-1, Expires: 0): do not cache */
+    if (ttl == TTL_NONE) {
+        /* no freshness given: apply the configured default, but never to a request that
+         * carried a Cookie or Authorization — such a page is usually per-user */
+        if (http_hdr_get(c->req.hdrs, c->req.nhdr, "Cookie") ||
+            http_hdr_get(c->req.hdrs, c->req.nhdr, "Authorization"))
+            return;
         ttl = c->cache_cfg->ttl; /* configured default; 0 means do not cache */
-    if (ttl <= 0 && !cc_directive(cc, "no-cache", NULL))
-        return;
-    if (ttl < 0)
-        ttl = 0;
+        if (ttl <= 0)
+            return;
+    }
+    if (ttl == 0 && !no_cache)
+        return; /* max-age=0 / s-maxage=0: not cached */
 
     /* snapshot the end-to-end headers and validators */
     cache_clear_captured_headers(c);
@@ -3226,7 +3271,7 @@ static void cache_consider_response(conn_t *c, http_resp_t *r)
     free(c->cache_reason);
     c->cache_reason = r->reason && *r->reason ? xstrdup(r->reason) : NULL;
     c->cap_ttl = ttl;
-    c->cap_swr = c->cache_cfg->swr;
+    c->cap_swr = response_swr(r, c->cache_cfg->swr); /* 0 when the answer forbids serving stale (problem 6) */
     for (int i = 0; i < r->nhdr; i++) {
         const char *n = r->hdrs[i].name;
         if (http_hdr_is_hop_by_hop(n) || strcasecmp(n, "Content-Length") == 0 ||

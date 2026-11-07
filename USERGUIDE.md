@@ -765,7 +765,9 @@ copied. Mirrored routes buffer the request body.
 ### Response caching
 
 ```
-{ cache_capacity 256m }
+{
+    cache_capacity 256m
+}
 static.example.com {
     encode gzip zstd
     cache {
@@ -778,11 +780,19 @@ static.example.com {
 ```
 
 GET and HEAD responses are cached in memory per worker. Freshness comes from
-the response (`s-maxage`, `max-age`, `Expires`) or, failing that, the
-configured `ttl`; a response is not cached when it is `no-store`, `private`,
-carries `Set-Cookie` or `Vary: *`, or answers an authorized request without
-`public`. The identity body is stored once and framed and compressed per
-client, so one entry serves gzip, br and plain clients. Hits carry `Age` and
+the response (`s-maxage`, `max-age`, `Expires`); a response whose freshness is
+invalid or already past (`max-age=-1`, `Expires: 0`) is not cached. When the
+response says nothing about freshness, the configured `ttl` is assumed — but
+only for a request that carried no `Cookie` or `Authorization`, since a page
+built for one visitor must not be served to another. **`ttl` is a default for
+sites of static files; leave it off (or `0`) in front of pages that differ by
+visitor and let the origin set `Cache-Control`.** A response is also not cached
+when it is `no-store`, `private`, carries `Set-Cookie` or `Vary: *`, answers an
+authorized request without `public`, or arrives already compressed
+(`Content-Encoding`) — an origin-compressed body cannot be reframed per client,
+so put compression on limer with `encode` and let the origin send identity.
+`Cache-Control` and `Vary` are read across all of their header lines.
+Each entry stores one body and frames it per client. Hits carry `Age` and
 `X-Cache: HIT`; a client's `If-None-Match`/`If-Modified-Since` against a
 cached validator gets `304`. A stale entry is revalidated conditionally and a
 `304` refreshes it in place; within the `stale` window the stale copy is

@@ -44,6 +44,31 @@ const char *http_hdr_get(const hdr_t *h, int n, const char *name)
     return NULL;
 }
 
+/* Join every line of `name` with ", " into out, since repeated field lines are
+ * equivalent to one comma-separated line (RFC 9110, 5.3). Decisions on
+ * Cache-Control and Vary must use this, not http_hdr_get, which sees only the
+ * first line. Returns out (empty string when the header is absent). */
+const char *http_hdr_get_joined(const hdr_t *h, int n, const char *name, char *out, size_t outlen)
+{
+    size_t len = 0;
+    if (outlen)
+        out[0] = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcasecmp(h[i].name, name) != 0 || !h[i].value)
+            continue;
+        const char *v = h[i].value;
+        if (len && len + 2 < outlen) {
+            out[len++] = ',';
+            out[len++] = ' ';
+        }
+        for (const char *p = v; *p && len + 1 < outlen; p++)
+            out[len++] = *p;
+        if (outlen)
+            out[len] = 0;
+    }
+    return out;
+}
+
 int http_hdr_is_hop_by_hop(const char *name)
 {
     static const char *hop[] = {

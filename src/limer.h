@@ -164,6 +164,7 @@ void http_resp_free(http_resp_t *r);
 int  http_parse_request_head(http_req_t *r, const char *data, size_t len, size_t *consumed);
 int  http_parse_response_head(http_resp_t *r, const char *data, size_t len, size_t *consumed);
 const char *http_hdr_get(const hdr_t *h, int n, const char *name);
+const char *http_hdr_get_joined(const hdr_t *h, int n, const char *name, char *out, size_t outlen);
 int  http_hdr_is_hop_by_hop(const char *name);
 int  http_hdr_connection_has(const char *conn_value, const char *token);
 const char *http_status_reason(int status);
@@ -466,6 +467,7 @@ void     cache_touch_stats(cache_t *c, int hit);
 int      cache_entry_state(const cache_entry_t *e, double now);   /* 0 fresh, 1 serve-stale, 2 stale */
 double   cache_entry_age(const cache_entry_t *e, double now);
 int      cache_entry_status(const cache_entry_t *e);
+double   cache_entry_ttl(const cache_entry_t *e);
 const char *cache_entry_reason(const cache_entry_t *e);
 const char *cache_entry_body(const cache_entry_t *e, size_t *len);
 const char *cache_entry_etag(const cache_entry_t *e);
