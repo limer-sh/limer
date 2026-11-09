@@ -2172,13 +2172,21 @@ static void uconn_forward_body(uconn_t *uc)
 #else
     (void)before;
 #endif
-    conn_flush(c);
     if (c->dead || uc->dead)
         return; /* client went away */
+    /* The whole response is here: finished before it is flushed, which conn_next_request does
+     * (an HTTP/2 stream's end with it). Flushed first, an HTTP/2 stream whose body came chunked
+     * from the upstream and went as it came (not encoded here) ended with that flush, its last
+     * chunk read by the stream's decoder, and was taken for a client gone: the request was never
+     * logged nor counted, and its upstream connection never released to the pool (rctuners.com's
+     * HTTP/2 requests, 2026-11-09). */
     if (done) {
         conn_response_done(c);
         return;
     }
+    conn_flush(c);
+    if (c->dead || uc->dead)
+        return; /* client went away */
     if (buf_readable(&c->wbuf) > WBUF_HIGH_WATER && !c->upstream_paused) {
         c->upstream_paused = 1;
         if (uc->ev.fd >= 0)

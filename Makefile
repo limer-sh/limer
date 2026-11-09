@@ -139,6 +139,10 @@ reload: $(BIN)
 roll: $(BIN)
 	python3 tests/roll_test.py
 
+# The access log over HTTP/1.1 and HTTP/2, upstreams chunked or not (needs curl with HTTP/2).
+accesslog: $(BIN)
+	python3 tests/accesslog_test.py
+
 admin: $(BIN)
 	python3 tests/admin_test.py
 
@@ -152,7 +156,7 @@ acme: $(BIN)
 	./tests/run_acme.sh
 
 # Everything: unit tests, parser fuzzing, integration, feature, ACME, security and DoS-guard suites.
-check: unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status reload roll admin discover broadcast cache
+check: unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status reload roll accesslog admin discover broadcast cache
 
 # The same suites with sanitizers enabled (slower; rebuilds everything).
 check-asan:
@@ -167,4 +171,4 @@ install: $(BIN)
 clean:
 	rm -rf build $(BIN) tests/tmp
 
-.PHONY: all unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status reload roll admin discover broadcast cache check check-asan install clean
+.PHONY: all unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status reload roll accesslog admin discover broadcast cache check check-asan install clean
