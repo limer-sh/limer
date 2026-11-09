@@ -385,8 +385,26 @@ static void roll_cleanup(const char *path, int keep, double keep_for, int local)
     rolled_t *all = NULL;
     size_t n = 0, cap = 0;
     struct dirent *e;
+    double now = now_wall();
     while ((e = readdir(d))) {
         double when;
+        /* a compression cut off (the worker exited in it) leaves <rolled>.gz.tmp: removed once it
+         * is ten minutes old, which no compression still running is */
+        size_t len = strlen(e->d_name);
+        if (len > 4 && strcmp(e->d_name + len - 4, ".tmp") == 0) {
+            char base[512];
+            if (len - 4 < sizeof base) {
+                memcpy(base, e->d_name, len - 4);
+                base[len - 4] = 0;
+                struct stat st;
+                char full[1700];
+                snprintf(full, sizeof full, "%s/%s", dir, e->d_name);
+                if (len > 7 && strcmp(base + len - 7, ".gz") == 0 && roll_is_rolled(base, name, ext, local, &when) &&
+                    stat(full, &st) == 0 && now - (double)st.st_mtime > 600)
+                    (void)unlink(full);
+            }
+            continue;
+        }
         if (!roll_is_rolled(e->d_name, name, ext, local, &when))
             continue;
         if (n == cap) {
@@ -400,7 +418,6 @@ static void roll_cleanup(const char *path, int keep, double keep_for, int local)
     closedir(d);
     if (n)
         qsort(all, n, sizeof *all, rolled_newest_first);
-    double now = now_wall();
     for (size_t i = 0; i < n; i++) {
         if ((keep > 0 && i >= (size_t)keep) || (keep_for > 0 && now - all[i].when > keep_for)) {
             char full[1700];
@@ -438,7 +455,8 @@ static void *roll_work(void *arg)
     roll_job_t *j = arg;
     if (j->gzip)
         roll_wait_still(j->rolled);
-    if (j->gzip && roll_gzip(j->rolled) < 0)
+    /* gone meanwhile: removed by another roll's cleanup, as past roll_keep, while this one waited */
+    if (j->gzip && roll_gzip(j->rolled) < 0 && errno != ENOENT)
         LOGW("cannot compress the rolled access log %s: %s", j->rolled, strerror(errno));
     roll_cleanup(j->path, j->keep, j->keep_for, j->local);
     free(j->rolled);

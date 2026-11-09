@@ -250,6 +250,34 @@ try:
 finally:
     stop(p)
 
+print("# roll_keep 1 with steady traffic: a file removed while its compression waited is no failure; a stale .gz.tmp goes")
+d = os.path.join(TMP, "keep1")
+write_config(d, "            roll_size 4KiB\n            roll_keep 1")
+stale = os.path.join(d, "access-2020-01-01T00-00-00.000.log.gz.tmp")
+fresh = os.path.join(d, "access-2020-01-01T00-00-01.000.log.gz.tmp")
+other = os.path.join(d, "other.log.gz.tmp")
+for f in (stale, fresh, other):
+    open(f, "w").write("cut off")
+hour_ago = time.time() - 3600
+os.utime(stale, (hour_ago, hour_ago))
+os.utime(other, (hour_ago, hour_ago))
+p = start()
+try:
+    until = time.time() + 4
+    ts = [threading.Thread(target=steady, args=(t, until)) for t in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    check(wait_for(lambda: not glob.glob(f"{d}/access-2026*.gz.tmp") and all(f.endswith(".gz") for f in rolled(d)) and len(rolled(d)) <= 1, 30),
+          f"one rolled file is kept, compressed: {rolled(d)}")
+    text = open(LOG).read()
+    check(text.count("rolled to") >= 3 and "cannot" not in text, "it rolled, and says no failure", text[-600:])
+    check(not os.path.exists(stale), "a rolled file's .gz.tmp an hour old is removed")
+    check(os.path.exists(fresh) and os.path.exists(other), "a fresh one, and a file of another name, are left")
+finally:
+    stop(p)
+
 print("# roll_keep_for removes older ones; roll_uncompressed leaves them plain")
 d = os.path.join(TMP, "old")
 os.makedirs(d)
