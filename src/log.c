@@ -332,13 +332,22 @@ static int roll_gzip(const char *from)
     char buf[65536];
     ssize_t k;
     int bad = 0;
-    while ((k = read(in, buf, sizeof buf)) > 0)
-        if (gzwrite(g, buf, (unsigned)k) != (int)k) {
-            bad = 1;
-            break;
+    off_t total = 0;
+    /* to its end, and again if lines came while it was read (a worker yet to look at the path) */
+    for (;;) {
+        while ((k = read(in, buf, sizeof buf)) > 0) {
+            if (gzwrite(g, buf, (unsigned)k) != (int)k) {
+                bad = 1;
+                break;
+            }
+            total += k;
         }
-    if (k < 0)
-        bad = 1;
+        if (k < 0)
+            bad = 1;
+        struct stat st;
+        if (bad || fstat(in, &st) < 0 || st.st_size <= total)
+            break;
+    }
     close(in);
     if (gzclose(g) != Z_OK)
         bad = 1;
@@ -404,9 +413,31 @@ static void roll_cleanup(const char *path, int keep, double keep_for, int local)
     free(all);
 }
 
+/* The other workers go on adding lines to a file just rolled until they next look at its path,
+ * which each does at most once a second, as it writes (log_roll_tick): compressed, and removed,
+ * only once nothing has been added for two seconds, a minute at most. Compressed at once, it had
+ * taken with it every line they wrote meanwhile (tests/roll_test.py's steady traffic: 4,498 lines
+ * for 38,703 requests; 2026-11-09). */
+static void roll_wait_still(const char *f)
+{
+    struct stat a, b;
+    if (stat(f, &a) < 0)
+        return;
+    for (int i = 0; i < 30; i++) {
+        struct timespec ts = { 2, 0 };
+        while (nanosleep(&ts, &ts) < 0 && errno == EINTR)
+            ;
+        if (stat(f, &b) < 0 || (b.st_size == a.st_size && b.st_mtime == a.st_mtime))
+            return;
+        a = b;
+    }
+}
+
 static void *roll_work(void *arg)
 {
     roll_job_t *j = arg;
+    if (j->gzip)
+        roll_wait_still(j->rolled);
     if (j->gzip && roll_gzip(j->rolled) < 0)
         LOGW("cannot compress the rolled access log %s: %s", j->rolled, strerror(errno));
     roll_cleanup(j->path, j->keep, j->keep_for, j->local);

@@ -215,6 +215,41 @@ try:
 finally:
     stop(p)
 
+print("# no line is lost with steady traffic: the other workers write to a rolled file until they look")
+d = os.path.join(TMP, "steady")
+write_config(d, "            roll_size 4KiB\n            roll_keep 0\n            roll_keep_for 0")
+p = start()
+try:
+    import threading
+    sent, errors = [], []
+    def steady(t, until):
+        i = 0
+        while time.time() < until:
+            u = f"/s{t}/{i}"
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{PORT}{u}", timeout=5).read()
+                sent.append(u)
+            except Exception as e:
+                errors.append(repr(e))
+            i += 1
+    until = time.time() + 5
+    ts = [threading.Thread(target=steady, args=(t, until)) for t in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    check(not errors, "every request answered", errors[:3])
+    check(wait_for(lambda: not glob.glob(f"{d}/*.gz.tmp") and all(f.endswith(".gz") for f in rolled(d)), 20), "all compressed")
+    every = lines(os.path.join(d, "access.log"))
+    for f in rolled(d):
+        every += lines(os.path.join(d, f))
+    uris = [json.loads(l.split(" ", 1)[1])["uri"] for l in every]
+    check(len(rolled(d)) >= 3, f"it rolled while the requests came: {len(rolled(d))} files")
+    check(sorted(uris) == sorted(sent), f"every request is in one file once: {len(uris)} lines for {len(sent)} requests",
+          sorted(set(sent) - set(uris))[:5])
+finally:
+    stop(p)
+
 print("# roll_keep_for removes older ones; roll_uncompressed leaves them plain")
 d = os.path.join(TMP, "old")
 os.makedirs(d)

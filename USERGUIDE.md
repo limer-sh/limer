@@ -223,8 +223,9 @@ example.com {
   on a thread of its own, so no request waits for it. The size is looked at once a second,
   so a file may pass it by a second's lines.
 - The workers write one file. The first to see it past the size rolls it, under
-  `<file>.lock`; the others find the path on a new file within a second and write there. No
-  line is lost or written twice.
+  `<file>.lock`; the others find the path on a new file within a second and write there.
+  The rolled file is gzipped once nothing has been added to it for two seconds, so the lines
+  they wrote meanwhile go with it. No line is lost or written twice.
 - A file moved away from under the server is followed the same way: within a second of
   its next line, the path is opened again (created if gone). So `logrotate` works without
   `copytruncate` and without a reload, `roll_disabled` too.
