@@ -154,6 +154,7 @@ enum conn_state {
     CS_LOCAL,        /* locally generated response in wbuf     */
     CS_TUNNEL,       /* bidirectional copy after 101           */
     CS_CLOSING,      /* flushing wbuf, then close              */
+    CS_LINGER,       /* answered and shut for writing; what the client still sends is read and dropped */
     CS_H2,           /* HTTP/2 session (streams are virtual conns) */
 };
 
@@ -224,6 +225,7 @@ typedef struct conn {
     double deadline;
     int rd_eof;
     int close_after_write;
+    int linger;                 /* closed while the client still sends its body: linger first */
     int got_request_bytes;
     int ip_tracked;             /* counted against the per-IP connection guard */
     uint64_t requests;
@@ -958,6 +960,10 @@ static void conn_update_mask(conn_t *c)
     case CS_LOCAL:
     case CS_CLOSING:
         break;
+    case CS_LINGER:
+        if (!c->rd_eof)
+            m |= EPOLLIN;
+        break;
     case CS_H2:
         if (!c->rd_eof && buf_readable(&c->rbuf) < RBUF_PIPELINE_CAP)
             m |= EPOLLIN;
@@ -1089,13 +1095,55 @@ static void conn_close(conn_t *c)
     ev_retire(&c->ev);
 }
 
+/* How long a connection answered before its client finished sending lingers, at most. */
+#define LINGER_SECONDS 5.0
+
+/* Answered while the client is still sending its request's body (an upstream's early answer, a
+ * 413 past max_body): closed at once, the bytes it goes on sending, unread, make the kernel reset
+ * the connection, and the reset can reach the client before it has read the answer, which it then
+ * never sees (tests/run_features.sh's early upstream response: 4 to 6 of 30 uploads lost the 413).
+ * So, as nginx's lingering close: the answer flushed, the sending side shut (TLS's close_notify
+ * first), and what still comes read and dropped until the client closes, or for LINGER_SECONDS. */
+static void conn_linger(conn_t *c)
+{
+#ifdef LIMER_TLS
+    if (c->ssl)
+        (void)SSL_shutdown(c->ssl);
+#endif
+    if (c->ev.fd < 0 || shutdown(c->ev.fd, SHUT_WR) < 0) {
+        conn_close(c);
+        return;
+    }
+    c->state = CS_LINGER;
+    c->deadline = g_now + LINGER_SECONDS;
+    conn_update_mask(c);
+}
+
+/* Lingering: the client's bytes read and dropped; closed at its end, or on an error. */
+static void conn_linger_read(conn_t *c)
+{
+    char tmp[16384];
+    for (int i = 0; i < 64; i++) {
+        ssize_t r = conn_read_raw(c, tmp, sizeof tmp);
+        if (r > 0)
+            continue;
+        if (r == -1)
+            return;
+        conn_close(c);
+        return;
+    }
+}
+
 /* Begin closing: flush remaining output first. */
 static void conn_finish(conn_t *c)
 {
     c->close_after_write = 1;
     c->state = CS_CLOSING;
     if (buf_readable(&c->wbuf) == 0) {
-        conn_close(c);
+        if (c->linger)
+            conn_linger(c);
+        else
+            conn_close(c);
         return;
     }
     conn_flush(c);
@@ -1150,7 +1198,10 @@ static void conn_flush(conn_t *c)
         return;
     }
     if (buf_readable(&c->wbuf) == 0 && c->state == CS_CLOSING) {
-        conn_close(c);
+        if (c->linger)
+            conn_linger(c);
+        else
+            conn_close(c);
         return;
     }
     if (buf_readable(&c->wbuf) == 0 && c->state == CS_HEAD && c->wbuf.cap > 4096)
@@ -1327,8 +1378,10 @@ static void conn_next_request(conn_t *c)
 {
     conn_log_access(c);
     c->requests++;
-    if (c->body_stream && !c->body_done)
+    if (c->body_stream && !c->body_done) {
         c->close_after_write = 1; /* the rest of the request body is still in flight */
+        c->linger = 1;
+    }
     if (c->resp_status >= 100 && c->resp_status < 600) {
         g_stats.resp_class[c->resp_status / 100]++;
         if (g_shared_stats && !c->srv->is_admin) {
@@ -2816,6 +2869,7 @@ static void conn_pump_body(conn_t *c)
         c->body_seen += forwarded;
         if (c->body_seen > c->srv->max_body) {
             buf_reset(&c->dechunk);
+            c->linger = 1;
             conn_send_error(c, 413, "request body exceeds max_body", 1);
             return;
         }
@@ -3540,6 +3594,7 @@ static void conn_process(conn_t *c)
             }
             if (c->req.content_length > (int64_t)c->srv->max_body) {
                 c->in_process = 0;
+                c->linger = 1;
                 conn_send_error(c, 413, "request body exceeds max_body", 1);
                 return;
             }
@@ -3587,6 +3642,7 @@ static void conn_process(conn_t *c)
                 buf_consume(&c->rbuf, consumed);
                 if (buf_readable(&r->body) > c->srv->max_body) {
                     c->in_process = 0;
+                    c->linger = 1;
                     conn_send_error(c, 413, "request body exceeds max_body", 1);
                     return;
                 }
@@ -3826,6 +3882,10 @@ static void conn_cb(ev_t *e, uint32_t events)
         }
     }
     if (events & (EPOLLIN | EPOLLHUP | EPOLLRDHUP)) {
+        if (c->state == CS_LINGER) {
+            conn_linger_read(c);
+            return;
+        }
         if (c->state == CS_LOCAL || c->state == CS_CLOSING) {
             /* drain and detect EOF so we don't spin on a dead socket */
             char tmp[1024];

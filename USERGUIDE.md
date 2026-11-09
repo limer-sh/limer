@@ -610,6 +610,13 @@ of those, a rate-limit key or a header placeholder that reads the body all
 force buffering (bounded by `max_body`). `request_body { mode buffer }`
 forces buffering for a whole site; `mode stream` is the default.
 
+An answer given before the upload is all in (the upstream's early `413`, or
+Limer's own past `max_body`) closes the connection, as the rest of the body is
+not read. It closes the way nginx's lingering close does: the answer sent, the
+sending side shut, and what the client still sends read and dropped until it
+stops, for 5 seconds at most. Closed at once, the bytes still coming made the
+connection reset, and the reset could reach the client before the answer.
+
 ### Dynamic upstreams
 
 ```

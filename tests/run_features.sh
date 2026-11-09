@@ -719,6 +719,31 @@ expect_eq "small bodies still fine" "$r" "200"
 r=$(curl -s -D - --data-binary @"$TMP/upload.bin" http://127.0.0.1:9798/early)
 expect_contains "early upstream response delivered" "$r" "HTTP/1.1 413"
 expect_contains "early response closes the client connection" "$r" "Connection: close"
+# answered while the client is still sending: the connection lingers, reading what still comes, so
+# the answer is read every time (closed at once, the reset could overtake it: 4 to 6 of 30 lost)
+n=0; for i in $(seq 1 20); do case "$(curl -s -D - -o /dev/null --data-binary @"$TMP/upload.bin" http://127.0.0.1:9798/early)" in *"HTTP/1.1 413"*) n=$((n+1));; esac; done
+expect_eq "an upstream's early answer arrives each time while the upload goes on (of 20)" "$n" "20"
+n=0; for i in $(seq 1 20); do [ "$(H --data-binary @"$TMP/upload.bin" http://127.0.0.1:9800/upload)" = 413 ] && n=$((n+1)); done
+expect_eq "max_body's 413 arrives each time while the upload goes on (of 20)" "$n" "20"
+n=0; for i in $(seq 1 10); do case "$(curl -sk --http1.1 -D - -o /dev/null --data-binary @"$TMP/upload.bin" https://localhost:9801/early)" in *"HTTP/1.1 413"*) n=$((n+1));; esac; done
+expect_eq "and over TLS (of 10)" "$n" "10"
+# a client that never stops sending is cut off once the linger is over (5 s)
+r=$(python3 - <<'PY'
+import socket, time
+s = socket.create_connection(("127.0.0.1", 9800))
+s.sendall(b"POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 100000000\r\n\r\n")
+t = time.time()
+head = s.recv(4096)
+try:
+    while time.time() - t < 15:
+        s.sendall(b"x" * 1024)
+        time.sleep(0.05)
+    print("still open after 15 s")
+except OSError:
+    print("413" if b" 413 " in head else head[:40], "cut off after %d s" % round(time.time() - t))
+PY
+)
+case "$r" in "413 cut off after "[4567]" s") ok "a lingering client that never stops is cut off after the linger ($r)";; *) fail "a lingering client that never stops is cut off after the linger" "$r";; esac
 expect_eq "proxy healthy after early response" "$(H http://127.0.0.1:9798/get)" "200"
 # the upstream answers before the body has all been sent, and keeps the connection: with bytes still to
 # send, that connection must not be pooled (the upstream would take the next request for the rest of the body)
