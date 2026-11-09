@@ -136,6 +136,9 @@ status: $(BIN)
 reload: $(BIN)
 	python3 tests/reload_test.py
 
+roll: $(BIN)
+	python3 tests/roll_test.py
+
 admin: $(BIN)
 	python3 tests/admin_test.py
 
@@ -149,7 +152,7 @@ acme: $(BIN)
 	./tests/run_acme.sh
 
 # Everything: unit tests, parser fuzzing, integration, feature, ACME, security and DoS-guard suites.
-check: unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status reload admin discover broadcast cache
+check: unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status reload roll admin discover broadcast cache
 
 # The same suites with sanitizers enabled (slower; rebuilds everything).
 check-asan:
@@ -164,4 +167,4 @@ install: $(BIN)
 clean:
 	rm -rf build $(BIN) tests/tmp
 
-.PHONY: all unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status reload admin discover broadcast cache check check-asan install clean
+.PHONY: all unit fuzz integration features acme security ddos scale drain rollback binrollback h3 status reload roll admin discover broadcast cache check check-asan install clean

@@ -39,6 +39,32 @@ int  log_open_target(const char *spec, char *err, size_t errlen);
 int  log_check_target(const char *spec, char *err, size_t errlen);
 void log_json_escape(buf_t *b, const char *s);
 
+/* An access log file that rolls, as Caddy's does: `output file <path> { roll_size 100MiB;
+ * roll_keep 10; roll_keep_for 90d; roll_uncompressed; roll_disabled }`. Past `size` bytes
+ * the worker that sees it first (under <path>.lock) renames the file to
+ * <name>-<UTC time>.<ext> and opens a new one; the others, and any worker after an outside
+ * rotation (logrotate), find the path on another file within a second and reopen it. The
+ * rolled file is gzipped and the old ones removed on a thread of their own. */
+typedef struct log_roll {
+    char    *path;
+    size_t   size;       /* roll past this many bytes; 0 never (reopen only) */
+    int      keep;       /* rolled files kept, newest first; 0 all */
+    double   keep_for;   /* rolled files older than this many seconds removed; 0 never */
+    int      gzip;       /* compress rolled files */
+    int      local;      /* rolled files named in local time (roll_local_time), else UTC */
+    uint64_t dev, ino;   /* the file the fd is open on */
+    double   next_check;
+} log_roll_t;
+
+log_roll_t *log_roll_new(const char *path);
+void log_roll_free(log_roll_t *r);
+/* before a line is written: at most once a second, roll the file or follow it to its new
+ * one; *fd may be replaced (kept at its number) */
+void log_roll_tick(int *fd, log_roll_t *r, double now);
+/* the name a file rolled at `when` (seconds) gets: dir/name-2006-01-02T15-04-05.000.ext, in
+ * UTC unless `local` */
+void log_roll_name(const char *path, double when, int local, char *out, size_t n);
+
 #define LOGD(...) do { if (log_level <= LOG_DEBUG) log_msg(LOG_DEBUG, __VA_ARGS__); } while (0)
 #define LOGI(...) do { if (log_level <= LOG_INFO)  log_msg(LOG_INFO,  __VA_ARGS__); } while (0)
 #define LOGW(...) do { if (log_level <= LOG_WARN)  log_msg(LOG_WARN,  __VA_ARGS__); } while (0)
@@ -552,6 +578,7 @@ typedef struct server {
     double  idle_timeout;
     int     access_log;
     int     log_fd;      /* -1 none; 1 stdout; 2 stderr; else an opened file */
+    log_roll_t *log_roll; /* the file's rolling, for `output file` (NULL: none) */
     int     log_json;
     int     is_admin;
     int     tls_mode;    /* enum tls_mode */

@@ -1013,6 +1013,7 @@ static void conn_log_access(conn_t *c)
                    up[0] ? up : "-",
                    c->lb_why[0] ? " via=" : "", c->lb_why);
     }
+    log_roll_tick(&srv->log_fd, srv->log_roll, g_now);
     log_access_to(srv->log_fd, b.data, b.len);
     buf_free(&b);
 }

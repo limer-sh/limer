@@ -702,6 +702,7 @@ static void server_free(server_t *s)
     free(s->encode);
     if (s->log_fd > 2)
         close(s->log_fd);
+    log_roll_free(s->log_roll);
     tls_free_server(s);
     free(s);
 }
@@ -2357,6 +2358,41 @@ static server_t *server_new(void)
     return s;
 }
 
+/* output file <path> { roll_size 100MiB; roll_keep 10; roll_keep_for 90d; roll_uncompressed;
+ * roll_local_time; roll_disabled }, as Caddy's: a file's log rolls unless roll_disabled, and
+ * is followed to the path's new file when moved away either way. */
+static int parse_roll(log_roll_t *r, node_t *o, int *disabled, char *err, size_t errlen)
+{
+    for (int i = 0; i < o->nkids; i++) {
+        node_t *k = o->kids[i];
+        const char *opt = k->args[0];
+        if (strcaseeq(opt, "roll_disabled") || strcaseeq(opt, "roll_uncompressed") || strcaseeq(opt, "roll_local_time")) {
+            if (want_args(k, 0, 0, err, errlen) < 0)
+                return -1;
+            if (strcaseeq(opt, "roll_disabled"))
+                *disabled = 1;
+            else if (strcaseeq(opt, "roll_uncompressed"))
+                r->gzip = 0;
+            else
+                r->local = 1;
+        } else if (strcaseeq(opt, "roll_size")) {
+            if (want_args(k, 1, 1, err, errlen) < 0)
+                return -1;
+            if (parse_size(k->args[1], &r->size) < 0 || r->size == 0)
+                FAIL("line %d: roll_size must be a size such as 100MiB, got '%s'", k->line, k->args[1]);
+        } else if (strcaseeq(opt, "roll_keep")) {
+            if (want_args(k, 1, 1, err, errlen) < 0 || arg_int(k, 1, &r->keep, 0, 100000, err, errlen) < 0)
+                return -1;
+        } else if (strcaseeq(opt, "roll_keep_for")) {
+            if (want_args(k, 1, 1, err, errlen) < 0 || arg_duration(k, 1, &r->keep_for, err, errlen) < 0)
+                return -1;
+        } else {
+            FAIL("line %d: unknown option '%s' of 'output file' (roll_size, roll_keep, roll_keep_for, roll_uncompressed, roll_local_time, roll_disabled)", k->line, opt);
+        }
+    }
+    return 0;
+}
+
 static int parse_log(server_t *s, node_t *d, char *err, size_t errlen)
 {
     /* log [off] { output stdout|stderr|<file>; format json|common } */
@@ -2384,9 +2420,28 @@ static int parse_log(server_t *s, node_t *d, char *err, size_t errlen)
                 snprintf(fspec, sizeof fspec, "%s", k->args[2]);
                 spec = fspec;
             }
+            /* a file rolls, as Caddy's does (roll_disabled not to) */
+            int to_file = !(strcaseeq(spec, "stdout") || strcaseeq(spec, "stderr") || strcaseeq(spec, "off") ||
+                            strcaseeq(spec, "discard") || strcaseeq(spec, "none"));
+            if (k->nkids && !to_file)
+                FAIL("line %d: the roll_ options are for 'output file'", k->line);
+            log_roll_t *roll = NULL;
+            if (to_file) {
+                int disabled = 0;
+                roll = log_roll_new(str_has_prefix(spec, "file ") ? spec + 5 : spec);
+                if (parse_roll(roll, k, &disabled, err, errlen) < 0) {
+                    log_roll_free(roll);
+                    return -1;
+                }
+                /* roll_disabled: never renamed, but still followed when moved away, as by
+                 * logrotate (which renames the file and has no copytruncate then) */
+                if (disabled)
+                    roll->size = 0;
+            }
             if (config_check_only) {
                 /* validate and the signalling commands often run as root: opening the
                  * file here would create it root-owned, and the server could not write it */
+                log_roll_free(roll);
                 if (log_check_target(spec, err, errlen) < 0)
                     return -1;
                 continue;
@@ -2394,6 +2449,8 @@ static int parse_log(server_t *s, node_t *d, char *err, size_t errlen)
             if (s->log_fd > 2)
                 close(s->log_fd);
             s->log_fd = log_open_target(spec, err, errlen);
+            log_roll_free(s->log_roll);
+            s->log_roll = s->log_fd > 2 ? roll : (log_roll_free(roll), NULL);
             if (s->log_fd < 0 && !(strcaseeq(spec, "off") || strcaseeq(spec, "discard") || strcaseeq(spec, "none")))
                 return -1;
         } else if (strcaseeq(k->args[0], "format")) {

@@ -103,7 +103,8 @@ HTTPS with HTTP/2 and HTTP/1.1, and redirects plain HTTP to HTTPS.
   `header`, `request_header`, `basic_auth` (bcrypt), `request_body`.
 - **Config conveniences**: `{$ENV}` substitution, `import` of files and
   globs, snippets `(name) { }` with `{args.N}`, per-site `log { output;
-  format json|common }`.
+  format json|common }`, with log files that roll as Caddy's do (`roll_size`,
+  `roll_keep`, `roll_keep_for`, gzipped).
 - **Operations**: `limer validate`, hot reload on `SIGHUP` / `limer reload` /
   `POST /reload` (bad configs are rejected and the old one keeps running;
   a reload keeps DNS-resolved upstreams and tolerates a name that is briefly
@@ -195,6 +196,41 @@ limer version
 stdout by default), which is what you want under systemd, Docker, or a
 supervisor.
 
+### Log files that roll
+
+An access log written to a file rolls, as Caddy's does, so it never fills the disk:
+
+```
+example.com {
+    log {
+        output file /var/log/limer/example-access.log {
+            roll_size 100MiB      # roll past this size (the default)
+            roll_keep 10          # rolled files kept, newest first; 0 keeps them all (default 10)
+            roll_keep_for 90d     # rolled files older than this removed; 0 never (default 90d)
+            # roll_uncompressed   # leave rolled files plain (they are gzipped otherwise)
+            # roll_local_time     # name them in local time (UTC otherwise)
+            # roll_disabled       # never roll
+        }
+        format json
+    }
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+- Past `roll_size` the file is renamed to `example-access-2026-11-09T08-48-00.123.log`
+  (its name, the time it rolled, its extension) and a new one opened; the rolled one is
+  gzipped (`.log.gz`) and the files past `roll_keep` or older than `roll_keep_for` removed,
+  on a thread of its own, so no request waits for it. The size is looked at once a second,
+  so a file may pass it by a second's lines.
+- The workers write one file. The first to see it past the size rolls it, under
+  `<file>.lock`; the others find the path on a new file within a second and write there. No
+  line is lost or written twice.
+- A file moved away from under the server is followed the same way: within a second of
+  its next line, the path is opened again (created if gone). So `logrotate` works without
+  `copytruncate` and without a reload, `roll_disabled` too.
+- Only the log's own rolled files are counted and removed: names of the form
+  `<name>-<time>[-n].<ext>[.gz]` beside it.
+
 Try it locally with the bundled test backend:
 
 ```
@@ -278,7 +314,7 @@ exact match, then wildcard, then the site without a hostname.
 | `tls internal` | Self-signed certificate for the site's names. |
 | `tls <email>` | Automatic certificate with this account email. |
 | `tls ... { client_auth { mode <m>; trusted_ca_cert_file <pem> } }` | Require or request client certificates (mutual TLS). |
-| `log [{ output stdout|stderr|<file>; format json|common }]` | Access log for this site. |
+| `log [{ output stdout|stderr|<file>; format json|common }]` | Access log for this site. A file rolls (see [Log files that roll](#log-files-that-roll)). |
 | `header [+|-]Name [value]` or `header { ... }` | Set, add or delete response headers on every response. |
 | `request_header [+|-]Name [value]` | Same for requests sent upstream. |
 | `basic_auth [realm] { user <bcrypt-hash> ... }` | Protect the whole site (`htpasswd -nbB user pass`). |
