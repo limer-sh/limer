@@ -148,6 +148,7 @@ int registry_put(registry_t *r, const char *pool, const struct sockaddr *sa, soc
     sl->salen = salen;
     sl->weight = weight;
     sl->expires = expires;
+    sl->restored = 0;   /* a registration of its own: registry_load marks those it restores */
     __atomic_store_n(&sl->state, REG_LIVE, __ATOMIC_RELEASE);
     __atomic_add_fetch(&r->gen, 1, __ATOMIC_RELAXED);
     return 1;
@@ -281,8 +282,18 @@ int registry_load(registry_t *r, const char *path, double now)
             sl = sizeof *s;
         }
         double expires = remaining > 0 ? now + remaining : 0;
-        if (registry_put(r, pool, (struct sockaddr *)&ss, sl, weight, expires) >= 0)
+        if (registry_put(r, pool, (struct sockaddr *)&ss, sl, weight, expires) >= 0) {
+            /* it was serving when the registry was saved: back in rotation at once (its
+             * health checked now, as a static upstream's is), not held out as a newcomer */
+            char text[REG_ADDR_LEN];
+            addr_text((struct sockaddr *)&ss, text, sizeof text);
+            for (int i = 0; i < REG_MAX_SLOTS; i++) {
+                reg_slot_t *s = &r->slots[i];
+                if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == REG_LIVE && strcmp(s->pool, pool) == 0 && strcmp(s->addr, text) == 0)
+                    s->restored = 1;
+            }
             loaded++;
+        }
     }
     fclose(f);
     return loaded;

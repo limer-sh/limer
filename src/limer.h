@@ -308,6 +308,7 @@ typedef struct upstream {
     /* runtime state */
     int   drained;            /* runtime: take no new requests */
     double admit_at;          /* not eligible until now >= this (discovery settle; 0 = immediately) */
+    int    restored;          /* a discovered member restored from the saved registry (reg_slot.restored) */
     char  sticky_id[20];      /* value used in sticky cookies */
     int   active;             /* in-flight requests */
     uint64_t requests;
@@ -672,6 +673,8 @@ typedef struct reg_slot {
     uint32_t salen;
     int32_t  weight;
     double   expires;             /* CLOCK_MONOTONIC seconds; 0 means never */
+    uint32_t restored;            /* loaded from <storage>/registry.json as this limer started: it was in
+                                     rotation before (a restart, an upgrade), so it is not held out again */
 } reg_slot_t;
 
 typedef struct registry {

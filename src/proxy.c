@@ -4295,9 +4295,11 @@ static void hc_finish(hc_conn_t *h, int ok, const char *detail)
     snprintf(u->hc_detail, sizeof u->hc_detail, "%s", detail);
     if (prev != u->hc_status) {
         if (ok) {
-            /* settle a discovered member after it becomes healthy, so a flapping node does
-             * not keep moving hashed keys on and off itself (p->settle is 0 for other pools) */
-            if (p->settle > 0 && u->admit_at < g_now + p->settle)
+            /* settle a discovered member after it comes back up, so a flapping node does not
+             * keep moving hashed keys on and off itself (p->settle is 0 for other pools). Not
+             * one whose health was only unknown (0): restored from the registry, it was in
+             * rotation already; a newcomer waits from -1, and settles. */
+            if (prev < 0 && p->settle > 0 && u->admit_at < g_now + p->settle)
                 u->admit_at = g_now + p->settle;
             LOGI("health check: upstream %s is up (%s)%s", u->hostport, detail,
                  u->admit_at > g_now ? ", settling before it takes traffic" : "");
@@ -4497,12 +4499,14 @@ static void pool_sync_members(pool_t *p, upstream_t **fresh, int nfresh, double 
             upstream_free(u);
             continue;
         }
-        if (settle > 0)
+        /* A newcomer settles and waits for its first health check; one restored from the saved
+         * registry was in rotation before this limer started, and goes back at once. */
+        if (settle > 0 && !u->restored)
             u->admit_at = g_now + settle;
-        if (health_gate)
+        if (health_gate && !u->restored)
             u->hc_status = -1;   /* hold out of rotation until the first health check passes */
         LOGI("pool %s: upstream %s added (weight %d)%s", p->name, u->hostport, u->weight,
-             health_gate ? ", pending health check" : (settle > 0 ? ", settling" : ""));
+             u->restored ? ", restored" : health_gate ? ", pending health check" : (settle > 0 ? ", settling" : ""));
         added++;
     }
     if (changed)
@@ -4533,6 +4537,7 @@ static void pool_apply_registry(pool_t *p)
                                                   ? ntohs(((struct sockaddr_in6 *)&sl->sa)->sin6_port)
                                                   : ntohs(((struct sockaddr_in *)&sl->sa)->sin_port),
                                               sl->weight);
+        u->restored = (int)sl->restored;
         int dup = 0;
         for (int k = 0; k < nfresh && !dup; k++)
             dup = strcmp(fresh[k]->hostport, u->hostport) == 0;
@@ -5785,6 +5790,38 @@ static void retire_config(config_t *old)
     config_unref(old);
 }
 
+/* The old configuration's upstream a new one takes its runtime state from: the same address in
+ * the pool of the same name, else in any pool that checks it alike (the same health URI, or
+ * none in both). An unnamed pool's name is its place in its site (reverse_proxy<N>), which a
+ * route added before it changes; an address's health is the same in any pool checking it so. */
+static upstream_t *old_twin(config_t *old, const pool_t *p, const upstream_t *u)
+{
+    upstream_t *alike = NULL;
+    for (int oi = 0; oi < old->nservers; oi++) {
+        server_t *os = old->servers[oi];
+        for (int orr = 0; orr < os->nroutes; orr++) {
+            pool_t *op = os->routes[orr]->pool;
+            if (!op)
+                continue;
+            int same_name = strcmp(op->name, p->name) == 0;
+            int same_check = (op->health_uri == NULL) == (p->health_uri == NULL) &&
+                             (!op->health_uri || strcmp(op->health_uri, p->health_uri) == 0);
+            if (!same_name && !same_check)
+                continue;
+            for (int ok = 0; ok < op->nups; ok++) {
+                upstream_t *ou = op->ups[ok];
+                if (strcmp(ou->hostport, u->hostport) != 0)
+                    continue;
+                if (same_name)
+                    return ou;
+                if (!alike)
+                    alike = ou;
+            }
+        }
+    }
+    return alike;
+}
+
 /* Carry runtime health state over to upstreams with the same address. */
 static void inherit_state(config_t *old, config_t *cfg)
 {
@@ -5800,8 +5837,10 @@ static void inherit_state(config_t *old, config_t *cfg)
                     server_t *os = old->servers[oi];
                     for (int orr = 0; orr < os->nroutes; orr++) {
                         pool_t *op = os->routes[orr]->pool;
+                        /* (Any pool with the same source, whatever its name: an unnamed pool's
+                         * name is its place in its site, which a route added before it changes.) */
                         if (!op || !op->dyn_kind || op->dyn_kind != p->dyn_kind || strcmp(op->dyn_name, p->dyn_name) != 0 ||
-                            op->dyn_port != p->dyn_port || strcmp(op->name, p->name) != 0)
+                            op->dyn_port != p->dyn_port)
                             continue;
                         for (int ok = 0; ok < op->nups; ok++) {
                             upstream_t *ou = op->ups[ok];
@@ -5823,31 +5862,23 @@ static void inherit_state(config_t *old, config_t *cfg)
             }
             for (int k = 0; k < p->nups; k++) {
                 upstream_t *u = p->ups[k];
-                for (int oi = 0; oi < old->nservers; oi++) {
-                    server_t *os = old->servers[oi];
-                    for (int orr = 0; orr < os->nroutes; orr++) {
-                        pool_t *op = os->routes[orr]->pool;
-                        if (!op || strcmp(op->name, p->name) != 0)
-                            continue;
-                        for (int ok = 0; ok < op->nups; ok++) {
-                            upstream_t *ou = op->ups[ok];
-                            if (strcmp(ou->hostport, u->hostport) == 0) {
-                                u->hc_status = p->health_uri ? ou->hc_status : 0;
-                                u->hc_last = ou->hc_last;
-                                u->hc_next = ou->hc_next;
-                                u->fails = ou->fails;
-                                u->fail_until = ou->fail_until;
-                                u->resolve_next = ou->resolve_next;
-                                memcpy(u->hc_detail, ou->hc_detail, sizeof u->hc_detail);
-                                if (!u->dynamic && !is_ip_literal(u->host) && ou->addrlen) {
-                                    /* keep the address the old config had re-resolved to */
-                                    memcpy(&u->addr, &ou->addr, ou->addrlen);
-                                    u->addrlen = ou->addrlen;
-                                    u->resolved = 1;
-                                }
-                            }
-                        }
-                    }
+                upstream_t *ou = old_twin(old, p, u);
+                if (!ou)
+                    continue;
+                u->hc_status = p->health_uri ? ou->hc_status : 0;
+                u->hc_last = ou->hc_last;
+                u->hc_next = ou->hc_next;
+                u->fails = ou->fails;
+                u->fail_until = ou->fail_until;
+                u->resolve_next = ou->resolve_next;
+                u->admit_at = ou->admit_at;   /* one still settling goes on settling */
+                u->restored = ou->restored;
+                memcpy(u->hc_detail, ou->hc_detail, sizeof u->hc_detail);
+                if (!u->dynamic && !is_ip_literal(u->host) && ou->addrlen) {
+                    /* keep the address the old config had re-resolved to */
+                    memcpy(&u->addr, &ou->addr, ou->addrlen);
+                    u->addrlen = ou->addrlen;
+                    u->resolved = 1;
                 }
             }
         }
@@ -6258,6 +6289,11 @@ int proxy_run(config_t *cfg, int worker_id)
     g_resolver_ev.fd = rfd;
     g_resolver_ev.cb = resolver_cb;
     ev_add(&g_resolver_ev, EPOLLIN);
+
+    /* The discover pools' members as the registry has them, before the first connection is
+     * handled: a fresh worker (a start, an upgrade) would answer 503 until its first tick. */
+    g_now = now_mono();
+    resolve_tick();
 
     LOGI("limer.sh %s worker %d ready (%d server block%s)", LIMER_VERSION, worker_id, cfg->nservers, cfg->nservers == 1 ? "" : "s");
 

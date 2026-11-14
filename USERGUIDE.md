@@ -698,15 +698,24 @@ How it behaves, and why:
 - **`settle` steadies hashing.** Rendezvous hashing only moves the keys a
   joining node takes over; a flapping node would move them back and forth.
   A member must be present and healthy for `settle` before it joins the ring,
-  and it re-settles after any health flap.
+  and it re-settles after a health flap (down, then up again).
 - **Discovery never empties a pool.** If every member deregisters or lapses at
   once, the last known set is kept (unhealthy ones stop getting traffic via
   their health check regardless) — a momentary discovery gap never causes an
   outage.
 - **It survives restarts.** The live set is held in memory shared by every
-  worker and persisted to `<storage>/registry.json`, so a restart or a
-  `limer upgrade` comes up populated; stale members time out, live ones
-  re-heartbeat. `GET /registry` lists the current members.
+  worker and persisted to `<storage>/registry.json` (the `storage` directory
+  must exist), so a restart or a `limer upgrade` comes up populated; stale
+  members time out, live ones re-heartbeat. The members it restores were in
+  rotation, so they serve at once (their health checked straight away, as a
+  static upstream's is), not held out again for a health check and `settle`;
+  a fresh worker fills its pools from the registry before it takes a
+  connection. `GET /registry` lists the current members.
+- **A reload keeps a pool's members and their health,** whatever the pool is
+  called now: from the old pool of the same name, and else from any old pool
+  with the same `discover` source, or checking the same address alike (the
+  same `health_uri`). An unnamed `reverse_proxy` pool is named after its place
+  in its site (`reverse_proxy<N>`), so a route added before it renames it.
 
 Registration is bounded without rate-limiting the heartbeats: at most
 `REG_MAX_PER_IP` (64) entries per source address and 1024 in all. Keep
