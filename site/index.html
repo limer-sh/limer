@@ -222,6 +222,15 @@
   .nolist li{position:relative;padding-left:20px;color:var(--muted);font-size:15px;line-height:1.6}
   .nolist li::before{content:"";position:absolute;left:0;top:.62em;width:7px;height:7px;border-radius:2px;background:var(--lime-dim)}
   .nolist b{color:var(--fg);font-weight:600}
+  .changes{list-style:none;padding:0;margin:0;border-top:1px solid var(--line)}
+  .changes li{display:grid;grid-template-columns:116px 1fr;gap:20px;padding:20px 0;border-bottom:1px solid var(--line)}
+  .changes time{font-family:var(--mono);font-size:12.5px;color:var(--lime-dim);padding-top:3px}
+  .changes h3{margin:0 0 6px;font-size:1.03rem;letter-spacing:-.01em}
+  .changes p{margin:0;color:var(--muted);font-size:14.5px;line-height:1.6}
+  .changes .sha{font-family:var(--mono);font-size:12px;color:var(--muted);text-decoration:none;border-bottom:1px dotted var(--line)}
+  .changes .sha:hover{color:var(--lime-soft)}
+  .changes .shas{display:block;margin-top:8px}
+  @media(max-width:560px){.changes li{grid-template-columns:1fr;gap:6px}}
   .noplug{margin-top:64px;align-items:start}
   .noplug .codecard{margin-top:0}
   .noplug h3{font-size:1.45rem;letter-spacing:-.015em;margin:0 0 12px;line-height:1.25}
@@ -269,6 +278,7 @@
       <a class="nav-hide" href="#usecases">Use cases</a>
       <a class="nav-hide" href="#security">Security</a>
       <a class="nav-hide" href="#performance">Performance</a>
+      <a class="nav-hide" href="#changes">What&rsquo;s new</a>
       <a class="nav-hide" href="#start">Quickstart</a>
       <a class="gh" href="https://github.com/limer-sh/limer">GitHub ↗</a>
     </div>
@@ -381,19 +391,19 @@
         <h3>Smart load balancing</h3><p>Round robin, least-conn, random, IP/URI hash, sticky cookies — with weights, active health checks and passive ejection. A 404 or 503 can ask the next backend, then fall back to a redirect.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg></div>
-        <h3>Caching &amp; rate limits</h3><p>In-memory LRU cache honouring Cache-Control, ETag and stale-while-revalidate. Token-bucket rate limits keyed by any placeholder.</p></div>
+        <h3>Caching &amp; rate limits</h3><p>In-memory LRU cache honouring Cache-Control, Vary, ETag and stale-while-revalidate: one stored body, compressed per client, purged by path or prefix over the admin API. Token-bucket rate limits keyed by any placeholder.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></div>
         <h3>Static files &amp; compression</h3><p><code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">file_server</code> with ranges, try_files and directory browsing. gzip, zstd and brotli, streamed and negotiated.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M21 2v6h-6M3 22v-6h6"/><path d="M21 8A9 9 0 0 0 6 5M3 16a9 9 0 0 0 15 3"/></svg></div>
-        <h3>Safe deploys</h3><p>Reloads and <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">limer upgrade</code> with no downtime and the same pid. New configs and binaries run as a 5% canary and roll back on their own if they cause 5xx &mdash; the bad file is moved aside so a restart can&rsquo;t bring it back.</p></div>
+        <h3>Safe deploys</h3><p>Reloads and <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">limer upgrade</code> with no downtime and the same pid, every server in rotation staying in rotation. New configs and binaries run as a 5% canary and roll back on their own if they cause 5xx &mdash; the bad file is moved aside so a restart can&rsquo;t bring it back.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M12 6v6l4 2"/></svg></div>
-        <h3>Dynamic upstreams</h3><p>Pools from DNS A/AAAA or SRV records, or backends that self-register over the admin API &mdash; health- and settle-gated, no external registry. Members can broadcast to each other (cache busts, live updates) with no message broker. Mutual TLS, mirroring and canary splitting built in.</p></div>
+        <h3>Dynamic upstreams</h3><p>Pools from DNS A/AAAA or SRV records, or backends that self-register over the admin API &mdash; health- and settle-gated, no external registry, and back in rotation at once after a restart or an upgrade. Members can broadcast to each other (cache busts, live updates) with no message broker. Mutual TLS, mirroring and canary splitting built in.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M4 4h16v6H4zM4 14h16v6H4z"/><path d="M8 7h.01M8 17h.01"/></svg></div>
-        <h3>Ops you can see</h3><p>Prometheus metrics, JSON upstream status, runtime drain and weight overrides that survive reloads, multi-process workers with SO_REUSEPORT.</p></div>
+        <h3>Ops you can see</h3><p>Prometheus metrics, JSON upstream status, access logs that roll (by size, count and age, gzipped), runtime drain and weight overrides that survive reloads, multi-process workers with SO_REUSEPORT.</p></div>
 
       <div class="card fade"><div class="ic"><svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.5 8-8 10-4.5-2-8-5-8-10V6z"/></svg></div>
         <h3>DoS mitigation</h3><p>Cap concurrent connections and the new-connection rate per source IP at accept time, and auto-ban repeat offenders. <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">trusted_proxies</code> keys it on the real client behind a CDN.</p></div>
@@ -591,6 +601,27 @@ encode gzip zstd br</code>
       </table>
     </div>
     <p class="perf-note">~5 KB per active connection · one worker can hold ~500,000 connections in ~2.5 GB · reproduce it all with <span style="color:var(--lime-soft)">bench/run.sh</span>, <span style="color:var(--lime-soft)">bench/compare.sh</span> and <span style="color:var(--lime-soft)">bench/protocols.sh</span></p>
+  </div>
+</section>
+
+<div class="wrap"><div class="divider"></div></div>
+
+<!-- WHAT'S NEW -->
+<section id="changes">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="kicker">What&rsquo;s new</div>
+      <h2>Found in production, fixed, then tested.</h2>
+      <p>Each of these turned up running limer in front of real sites, and each came with a test that failed before its fix.</p>
+    </div>
+    <ul class="changes">
+      <li class="fade"><time datetime="2026-11-14">2026-11-14</time><div><h3>No 503s through a reload, a restart or an upgrade</h3><p>A reload keeps every server&rsquo;s health, even when a route added before a pool renames it, and the servers restored from the saved registry go straight back into rotation after a restart or <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">limer upgrade</code>. Only a server that registers anew still waits for its health check and <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">settle</code>.<span class="shas"><a class="sha" href="https://github.com/limer-sh/limer/commit/52b0fa0">52b0fa0</a></span></p></div></li>
+      <li class="fade"><time datetime="2026-11-10">2026-11-10</time><div><h3>Early answers reach the client</h3><p>An upstream that answers while the upload is still coming (a 413 at its own limit), or limer&rsquo;s own 413 past <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">max_body</code>, now closes as nginx&rsquo;s lingering close does: the client reads the answer, not a reset.<span class="shas"><a class="sha" href="https://github.com/limer-sh/limer/commit/8854694">8854694</a></span></p></div></li>
+      <li class="fade"><time datetime="2026-11-09">2026-11-09</time><div><h3>Access logs that roll</h3><p><code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">output file &lt;path&gt; { roll_size &hellip; roll_keep &hellip; roll_keep_for &hellip; }</code>, on by default with Caddy&rsquo;s defaults (100 MiB, 10 files, 90 days, gzipped), and no line lost or written twice across rolls while every worker writes.<span class="shas"><a class="sha" href="https://github.com/limer-sh/limer/commit/d7b5fc4">d7b5fc4</a> · <a class="sha" href="https://github.com/limer-sh/limer/commit/d97f0dc">d97f0dc</a> · <a class="sha" href="https://github.com/limer-sh/limer/commit/f399ade">f399ade</a></span></p></div></li>
+      <li class="fade"><time datetime="2026-11-09">2026-11-09</time><div><h3>HTTP/2 pass-through answers logged again</h3><p>A chunked answer streamed over HTTP/2 as it came is logged and counted once more, and its upstream connection goes back to the pool.<span class="shas"><a class="sha" href="https://github.com/limer-sh/limer/commit/acf38aa">acf38aa</a></span></p></div></li>
+      <li class="fade"><time datetime="2026-11-07">2026-11-07</time><div><h3>A response cache to trust in front of a compressing app</h3><p>Six correctness fixes (no compressed body served as plain, every Cache-Control and Vary line read, a cache key per port, a request with a cookie or credentials never answered from another visitor&rsquo;s entry, <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">no-cache</code> revalidated), one stored body compressed per client, and <code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">POST /cache/purge</code> by path or prefix on every worker.<span class="shas"><a class="sha" href="https://github.com/limer-sh/limer/commit/8bab3f4">8bab3f4</a> · <a class="sha" href="https://github.com/limer-sh/limer/commit/e6be0be">e6be0be</a></span></p></div></li>
+      <li class="fade"><time datetime="2026-10-28">2026-10-28</time><div><h3>Reloads that answer</h3><p><code style="font-size:.82em;color:var(--lime-soft);font-family:var(--mono)">limer reload</code> waits for the master&rsquo;s answer and exits 1 with the reason; checks run as root leave no log file behind; a reload no longer waits for a certificate order; a key and its certificate are written together.<span class="shas"><a class="sha" href="https://github.com/limer-sh/limer/commit/e80ae13">e80ae13</a> · <a class="sha" href="https://github.com/limer-sh/limer/commit/4f80ddb">4f80ddb</a></span></p></div></li>
+    </ul>
   </div>
 </section>
 
